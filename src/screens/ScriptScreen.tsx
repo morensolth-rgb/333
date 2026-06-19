@@ -11,6 +11,7 @@ import {
   FlatList,
   NativeEventEmitter,
   NativeModules,
+  Clipboard,
 } from 'react-native';
 import {useFocusEffect} from '@react-navigation/native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -384,9 +385,16 @@ export default function ScriptScreen() {
             </Text>
           ) : (
             filteredOutput.map((l, i) => (
-              <Text key={i} style={[s.outLine, l.includes('✗') && s.outErr]}>
-                {l}
-              </Text>
+              <TouchableOpacity
+                key={i}
+                onLongPress={() => {
+                  Clipboard.setString(l);
+                  Alert.alert('Copied', 'Line copied to clipboard');
+                }}
+                activeOpacity={0.7}
+              >
+                <Text style={[s.outLine, l.includes('✗') && s.outErr]}>{l}</Text>
+              </TouchableOpacity>
             ))
           )}
         </ScrollView>

@@ -12,6 +12,7 @@ import {
   KeyboardAvoidingView,
   Platform,
   ActivityIndicator,
+  Clipboard,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import {useFocusEffect} from '@react-navigation/native';
@@ -180,11 +181,33 @@ function ChatTab() {
         )}
         {msgs.map(msg => {
           const mine = msg.sender === myEmail.split('@')[0];
+          const hasCode = msg.body.includes('```');
+          const onLongPress = () => {
+            const codeMatch = msg.body.match(/```\n?([\s\S]*?)```/);
+            const options = mine
+              ? ['Copy', ...(hasCode ? ['Save Script'] : []), 'Delete', 'Cancel']
+              : ['Copy', ...(hasCode ? ['Save Script'] : []), 'Cancel'];
+            Alert.alert('Message', undefined, [
+              {text: 'Copy', onPress: () => { Clipboard.setString(msg.body); }},
+              ...(hasCode ? [{text: 'Save Script', onPress: async () => {
+                const code = codeMatch?.[1]?.trim() ?? msg.body;
+                const titleMatch = msg.body.match(/📜 Script: (.+)/);
+                const name = titleMatch?.[1]?.trim() ?? `Script from ${msg.sender}`;
+                const raw = await AsyncStorage.getItem('scriptsList');
+                const list = raw ? JSON.parse(raw) : [];
+                list.unshift({id: Date.now().toString(), name, code});
+                await AsyncStorage.setItem('scriptsList', JSON.stringify(list));
+                Alert.alert('Saved', `"${name}" saved to local scripts`);
+              }}] : []),
+              ...(mine ? [{text: 'Delete', style: 'destructive' as const, onPress: () => deleteMsg(msg.id)}] : []),
+              {text: 'Cancel', style: 'cancel' as const},
+            ]);
+          };
           return (
             <TouchableOpacity
               key={msg.id}
-              activeOpacity={mine ? 0.6 : 1}
-              onLongPress={mine ? () => deleteMsg(msg.id) : undefined}
+              activeOpacity={0.75}
+              onLongPress={onLongPress}
               style={[c.bubble, mine && c.bubbleMine]}>
               {!mine && (
                 <Text style={c.bubbleAuthor}>{msg.sender}</Text>
@@ -708,12 +731,34 @@ function DMsTab() {
           )}
           {messages.map(msg => {
             const mine = msg.from === myUsername;
+            const hasCode = msg.body.includes('```');
+            const onLongPress = () => {
+              const codeMatch = msg.body.match(/```\n?([\s\S]*?)```/);
+              Alert.alert('Message', undefined, [
+                {text: 'Copy', onPress: () => { Clipboard.setString(msg.body); }},
+                ...(hasCode ? [{text: 'Save Script', onPress: async () => {
+                  const code = codeMatch?.[1]?.trim() ?? msg.body;
+                  const titleMatch = msg.body.match(/📜 Script: (.+)/);
+                  const name = titleMatch?.[1]?.trim() ?? `Script from ${msg.from}`;
+                  const raw = await AsyncStorage.getItem('scriptsList');
+                  const list = raw ? JSON.parse(raw) : [];
+                  list.unshift({id: Date.now().toString(), name, code});
+                  await AsyncStorage.setItem('scriptsList', JSON.stringify(list));
+                  Alert.alert('Saved', `"${name}" saved to local scripts`);
+                }}] : []),
+                {text: 'Cancel', style: 'cancel' as const},
+              ]);
+            };
             return (
-              <View key={msg.id} style={[c.bubble, mine && c.bubbleMine]}>
+              <TouchableOpacity
+                key={msg.id}
+                activeOpacity={0.75}
+                onLongPress={onLongPress}
+                style={[c.bubble, mine && c.bubbleMine]}>
                 {!mine && <Text style={c.bubbleAuthor}>{msg.from}</Text>}
                 <Text style={[c.bubbleText, mine && c.bubbleTextMine]}>{msg.body}</Text>
                 <Text style={c.bubbleTime}>{fmtShort(msg.ts)}</Text>
-              </View>
+              </TouchableOpacity>
             );
           })}
         </ScrollView>
