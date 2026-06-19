@@ -358,7 +358,15 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                     if (pkg.isBlank()) continue
                     try {
                         val appInfo = pm.getApplicationInfo(pkg, 0)
-                        val appName = pm.getApplicationLabel(appInfo).toString()
+                        // Try launch intent label first (matches what user sees on launcher)
+                        val appName = try {
+                            val intent = pm.getLaunchIntentForPackage(pkg)
+                            val act = if (intent != null) pm.resolveActivity(intent, 0) else null
+                            act?.loadLabel(pm)?.toString()?.takeIf { it.isNotBlank() }
+                                ?: pm.getApplicationLabel(appInfo).toString()
+                        } catch (_: Exception) {
+                            pm.getApplicationLabel(appInfo).toString()
+                        }
                         val isSystem = (appInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0
                                     && (appInfo.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) == 0
                                     && !thirdParty.contains(pkg)
@@ -369,13 +377,19 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                         map.putBoolean("isSystemApp", isSystem)
                         arr.pushMap(map)
                     } catch (_: Exception) {
-                        // PM can't resolve it but it exists in /data/data
-                        // Show it anyway with raw package name
+                        // PM can't resolve — try dumpsys for the real label
                         if (pkg.count { it == '.' } >= 1) {
+                            val label = try {
+                                val dump = Shell.cmd("dumpsys package $pkg 2>/dev/null | grep -i 'nonLocalizedLabel\\|labelRes' | head -3").exec().out
+                                // Try to extract a readable name from dumpsys
+                                val labelLine = dump.firstOrNull { it.contains("nonLocalizedLabel=") }
+                                labelLine?.substringAfter("nonLocalizedLabel=")?.trim()?.takeIf { it.isNotBlank() && it != "null" }
+                                    ?: smartFallbackName(pkg)
+                            } catch (_: Exception) { smartFallbackName(pkg) }
+
                             val map = WritableNativeMap()
                             map.putString("packageName", pkg)
-                            map.putString("appName", pkg.split(".").last()
-                                .replaceFirstChar { it.uppercase() })
+                            map.putString("appName", label)
                             map.putBoolean("isSystemApp", !thirdParty.contains(pkg))
                             arr.pushMap(map)
                         }
@@ -387,6 +401,28 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                 promise.reject("APPS_ERROR", e.message)
             }
         }.start()
+    }
+
+    // ─────────────────────────────────────────────
+    // smartFallbackName — pick the most meaningful segment from a package name
+    // avoids generic words like "game", "app", "android", "mobile", "puzzle", etc.
+    // e.g. games.burny.associations.word.puzzle → "Associations"
+    // ─────────────────────────────────────────────
+    private fun smartFallbackName(pkg: String): String {
+        val noise = setOf(
+            "com", "org", "net", "io", "co", "app", "apps", "game", "games",
+            "android", "mobile", "studio", "studios", "interactive", "entertainment",
+            "puzzle", "word", "color", "sort", "match", "idle", "tycoon", "clicker",
+            "free", "lite", "pro", "hd", "plus", "official", "inc", "llc", "ltd",
+            "software", "digital", "media", "tech", "group", "labs", "dev", "team"
+        )
+        val parts = pkg.split(".")
+        // Pick longest non-noise segment — most likely the actual app name
+        val best = parts
+            .filter { it.length > 2 && !noise.contains(it.lowercase()) }
+            .maxByOrNull { it.length }
+            ?: parts.last()
+        return best.replaceFirstChar { it.uppercase() }
     }
 
     // ─────────────────────────────────────────────
