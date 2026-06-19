@@ -352,6 +352,10 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                     .map { it.removePrefix("package:").trim() }
                     .toSet()
 
+                // ── SDK bulk scan: one shell command for ALL packages ──
+                // Format per line: "<pkg>:<filename>"
+                val sdkMap = buildSdkMap(thirdParty)
+
                 val arr = WritableNativeArray()
 
                 for (pkg in dataPackages) {
@@ -363,8 +367,7 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                                     && (appInfo.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) == 0
                                     && !thirdParty.contains(pkg)
 
-                        // SDK detection via shared_prefs filenames — only for user apps
-                        val sdkLabel = if (!isSystem) detectSdkByPrefs(pkg) else ""
+                        val sdkLabel = if (!isSystem) sdkMap[pkg] ?: "" else ""
 
                         val map = WritableNativeMap()
                         map.putString("packageName", pkg)
@@ -395,28 +398,50 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
     }
 
     // ─────────────────────────────────────────────
-    // detectSdkByPrefs — check /data/data/<pkg>/shared_prefs/ filenames
-    // Returns comma-separated SDK names found, or "" if none
+    // buildSdkMap — ONE shell command scans ALL user apps at once
+    // returns map of pkg → "AppsFlyer · Adjust" etc.
     // ─────────────────────────────────────────────
-    private fun detectSdkByPrefs(pkg: String): String {
-        val sdks = mutableListOf<String>()
+    private fun buildSdkMap(userPkgs: Set<String>): Map<String, String> {
+        val result = mutableMapOf<String, String>()
         try {
-            val result = Shell.cmd("ls /data/data/$pkg/shared_prefs/ 2>/dev/null").exec()
-            val files = result.out.flatMap { it.trim().split("\\s+".toRegex()) }
-            val lower = files.map { it.lowercase() }
+            // Single command: for each user package, print "pkg:filename" for every file in shared_prefs
+            // Then we parse it all in Kotlin — zero per-app shell calls
+            val out = Shell.cmd(
+                "for d in /data/data/*/shared_prefs; do " +
+                "pkg=\$(echo \$d | cut -d/ -f4); " +
+                "ls \$d 2>/dev/null | while read f; do echo \"\$pkg:\$f\"; done; " +
+                "done 2>/dev/null"
+            ).exec().out
 
-            if (lower.any { it.contains("appsflyer") })  sdks.add("AppsFlyer")
-            if (lower.any { it.contains("adjust") })     sdks.add("Adjust")
-            if (lower.any { it.contains("singular") })   sdks.add("Singular")
-            if (lower.any { it.contains("branch") })     sdks.add("Branch")
-            if (lower.any { it.contains("kochava") })    sdks.add("Kochava")
-            if (lower.any { it.contains("tenjin") })     sdks.add("Tenjin")
-            if (lower.any { it.contains("amplitude") })  sdks.add("Amplitude")
-            if (lower.any { it.contains("mixpanel") })   sdks.add("Mixpanel")
-            if (lower.any { it.contains("onesignal") })  sdks.add("OneSignal")
-            if (lower.any { it.contains("segment") })    sdks.add("Segment")
+            // Group filenames by package
+            val filesByPkg = mutableMapOf<String, MutableList<String>>()
+            for (line in out) {
+                val colon = line.indexOf(':')
+                if (colon < 1) continue
+                val pkg = line.substring(0, colon).trim()
+                val file = line.substring(colon + 1).trim().lowercase()
+                if (pkg.isBlank() || file.isBlank()) continue
+                filesByPkg.getOrPut(pkg) { mutableListOf() }.add(file)
+            }
+
+            // Classify each package
+            for ((pkg, files) in filesByPkg) {
+                if (!userPkgs.contains(pkg)) continue // skip system apps
+                val sdks = mutableListOf<String>()
+                if (files.any { it.contains("appsflyer") }) sdks.add("AppsFlyer")
+                if (files.any { it.contains("adjust") })    sdks.add("Adjust")
+                if (files.any { it.contains("singular") })  sdks.add("Singular")
+                if (files.any { it.contains("branch") })    sdks.add("Branch")
+                if (files.any { it.contains("kochava") })   sdks.add("Kochava")
+                if (files.any { it.contains("tenjin") })    sdks.add("Tenjin")
+                if (files.any { it.contains("amplitude") }) sdks.add("Amplitude")
+                if (files.any { it.contains("mixpanel") })  sdks.add("Mixpanel")
+                if (files.any { it.contains("onesignal") }) sdks.add("OneSignal")
+                if (files.any { it.contains("segment") })   sdks.add("Segment")
+                if (sdks.isNotEmpty()) result[pkg] = sdks.joinToString(" · ")
+            }
         } catch (_: Exception) {}
-        return sdks.joinToString(" · ")
+        return result
     }
 
     // ─────────────────────────────────────────────
