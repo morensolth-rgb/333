@@ -7,6 +7,7 @@ export interface AppInfo {
   packageName: string;
   appName: string;
   isSystemApp: boolean;
+  sdks: string[]; // detected tracking/analytics SDKs
 }
 
 export interface BinaryStatus {

@@ -363,11 +363,17 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                                     && (appInfo.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) == 0
                                     && !thirdParty.contains(pkg)
 
+                        // ── SDK Detection via APK binary scan ──
+                        val apkPath = appInfo.publicSourceDir ?: ""
+                        val sdks = detectSdksInApk(apkPath)
+                        val sdkArray = WritableNativeArray()
+                        sdks.forEach { sdkArray.pushString(it) }
+
                         val map = WritableNativeMap()
                         map.putString("packageName", pkg)
                         map.putString("appName", appName)
                         map.putBoolean("isSystemApp", isSystem)
-                        arr.pushMap(map)
+                        map.putArray("sdks", sdkArray)
                     } catch (_: Exception) {
                         // PM can't resolve it but it exists in /data/data
                         // Show it anyway with raw package name
@@ -377,6 +383,8 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                             map.putString("appName", pkg.split(".").last()
                                 .replaceFirstChar { it.uppercase() })
                             map.putBoolean("isSystemApp", !thirdParty.contains(pkg))
+                            val emptyArr = WritableNativeArray()
+                            map.putArray("sdks", emptyArr)
                             arr.pushMap(map)
                         }
                     }
@@ -387,6 +395,62 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                 promise.reject("APPS_ERROR", e.message)
             }
         }.start()
+    }
+
+    // ─────────────────────────────────────────────
+    // detectSdksInApk — scan APK binary for known SDK signatures
+    // Uses grep on the APK directly (ZIP/DEX format keeps class paths as strings)
+    // Fast: grep stops at first match per pattern
+    // ─────────────────────────────────────────────
+    private fun detectSdksInApk(apkPath: String): List<String> {
+        if (apkPath.isBlank()) return emptyList()
+
+        // Map: display name → list of binary signatures to search
+        val sdkSignatures = listOf(
+            "AppsFlyer"   to listOf("com/appsflyer"),
+            "Adjust"      to listOf("com/adjust/sdk"),
+            "Singular"    to listOf("com/singular/sdk"),
+            "Branch"      to listOf("io/branch/referral"),
+            "Kochava"     to listOf("com/kochava/tracker", "com/kochava"),
+            "Tenjin"      to listOf("com/tenjin/android"),
+            "Firebase"    to listOf("com/google/firebase/analytics"),
+            "Amplitude"   to listOf("com/amplitude/api", "com/amplitude/android"),
+            "Mixpanel"    to listOf("com/mixpanel/android"),
+            "Braze"       to listOf("com/braze", "com/appboy"),
+            "Segment"     to listOf("com/segment/analytics"),
+            "OneSignal"   to listOf("com/onesignal"),
+            "IronSource"  to listOf("com/ironsource/mediationsdk"),
+            "AppLovin"    to listOf("com/applovin/sdk", "com/applovin"),
+            "UnityAds"    to listOf("com/unity3d/ads"),
+            "Chartboost"  to listOf("com/chartboost/sdk"),
+            "Vungle"      to listOf("com/vungle/warren", "com/vungle/ads"),
+            "MoPub"       to listOf("com/mopub/mobileads"),
+            "AdMob"       to listOf("com/google/android/gms/ads"),
+            "Facebook Ads" to listOf("com/facebook/ads"),
+        )
+
+        val detected = mutableListOf<String>()
+        try {
+            val apkFile = java.io.File(apkPath)
+            if (!apkFile.exists()) return emptyList()
+
+            // Read APK as raw bytes once — APK is ZIP so class paths are stored as plain UTF-8 strings in the DEX
+            // We use a shell grep for speed (avoids loading entire APK into JVM heap)
+            val signatures = sdkSignatures.joinToString("|") { (_, sigs) -> sigs.joinToString("|") }
+            val allSigs = sdkSignatures.flatMap { it.second }
+
+            for ((sdkName, sigs) in sdkSignatures) {
+                val found = sigs.any { sig ->
+                    try {
+                        val result = Shell.cmd("grep -qla '$sig' '$apkPath' 2>/dev/null; echo \$?").exec()
+                        result.out.firstOrNull()?.trim() == "0"
+                    } catch (_: Exception) { false }
+                }
+                if (found) detected.add(sdkName)
+            }
+        } catch (_: Exception) {}
+
+        return detected
     }
 
     // ─────────────────────────────────────────────

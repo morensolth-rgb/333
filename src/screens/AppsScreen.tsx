@@ -138,6 +138,13 @@ export default function AppsScreen({navigation}: {navigation: any}) {
                   {selected === item.packageName && <Text style={s.targetTag}>TARGET</Text>}
                 </View>
                 <Text style={s.pkg} numberOfLines={1}>{item.packageName}</Text>
+                {item.sdks && item.sdks.length > 0 && (
+                  <View style={s.sdkRow}>
+                    {item.sdks.map(sdk => (
+                      <Text key={sdk} style={s.sdkTag}>{sdk}</Text>
+                    ))}
+                  </View>
+                )}
               </TouchableOpacity>
               <TouchableOpacity
                 style={s.browseBtn}
@@ -156,7 +163,6 @@ export default function AppsScreen({navigation}: {navigation: any}) {
               {search ? 'No results for "' + search + '"' : 'No apps found'}
             </Text>
           }
-          getItemLayout={(_, index) => ({length: 58, offset: 58 * index, index})}
           initialNumToRender={30}
           maxToRenderPerBatch={30}
           windowSize={10}
@@ -206,7 +212,8 @@ const s = StyleSheet.create({
     alignItems: 'center',
     borderBottomWidth: 1,
     borderBottomColor: '#151515',
-    height: 58,
+    minHeight: 58,
+    paddingVertical: 2,
   },
   itemMain: {
     flex: 1,
@@ -237,6 +244,18 @@ const s = StyleSheet.create({
     paddingHorizontal: 4, paddingVertical: 1, borderRadius: 3,
   },
   pkg: {color: '#3a3a3a', fontFamily: 'monospace', fontSize: 10},
+  sdkRow: {flexDirection: 'row', flexWrap: 'wrap', gap: 4, marginTop: 4},
+  sdkTag: {
+    color: '#00aaff',
+    fontFamily: 'monospace',
+    fontSize: 8,
+    borderWidth: 1,
+    borderColor: '#003355',
+    backgroundColor: '#001a2e',
+    paddingHorizontal: 5,
+    paddingVertical: 1,
+    borderRadius: 3,
+  },
   center: {flex: 1, alignItems: 'center', justifyContent: 'center', gap: 12},
   loadingText: {color: '#333', fontFamily: 'monospace', fontSize: 12},
   empty: {color: '#2a2a2a', textAlign: 'center', marginTop: 60, fontFamily: 'monospace', fontSize: 13},
