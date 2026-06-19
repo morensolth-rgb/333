@@ -363,10 +363,14 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                                     && (appInfo.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) == 0
                                     && !thirdParty.contains(pkg)
 
+                        // SDK detection via shared_prefs filenames — only for user apps
+                        val sdkLabel = if (!isSystem) detectSdkByPrefs(pkg) else ""
+
                         val map = WritableNativeMap()
                         map.putString("packageName", pkg)
                         map.putString("appName", appName)
                         map.putBoolean("isSystemApp", isSystem)
+                        map.putString("sdkLabel", sdkLabel)
                         arr.pushMap(map)
                     } catch (_: Exception) {
                         // PM can't resolve it but it exists in /data/data
@@ -377,6 +381,7 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                             map.putString("appName", pkg.split(".").last()
                                 .replaceFirstChar { it.uppercase() })
                             map.putBoolean("isSystemApp", !thirdParty.contains(pkg))
+                            map.putString("sdkLabel", "")
                             arr.pushMap(map)
                         }
                     }
@@ -387,6 +392,31 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                 promise.reject("APPS_ERROR", e.message)
             }
         }.start()
+    }
+
+    // ─────────────────────────────────────────────
+    // detectSdkByPrefs — check /data/data/<pkg>/shared_prefs/ filenames
+    // Returns comma-separated SDK names found, or "" if none
+    // ─────────────────────────────────────────────
+    private fun detectSdkByPrefs(pkg: String): String {
+        val sdks = mutableListOf<String>()
+        try {
+            val result = Shell.cmd("ls /data/data/$pkg/shared_prefs/ 2>/dev/null").exec()
+            val files = result.out.flatMap { it.trim().split("\\s+".toRegex()) }
+            val lower = files.map { it.lowercase() }
+
+            if (lower.any { it.contains("appsflyer") })  sdks.add("AppsFlyer")
+            if (lower.any { it.contains("adjust") })     sdks.add("Adjust")
+            if (lower.any { it.contains("singular") })   sdks.add("Singular")
+            if (lower.any { it.contains("branch") })     sdks.add("Branch")
+            if (lower.any { it.contains("kochava") })    sdks.add("Kochava")
+            if (lower.any { it.contains("tenjin") })     sdks.add("Tenjin")
+            if (lower.any { it.contains("amplitude") })  sdks.add("Amplitude")
+            if (lower.any { it.contains("mixpanel") })   sdks.add("Mixpanel")
+            if (lower.any { it.contains("onesignal") })  sdks.add("OneSignal")
+            if (lower.any { it.contains("segment") })    sdks.add("Segment")
+        } catch (_: Exception) {}
+        return sdks.joinToString(" · ")
     }
 
     // ─────────────────────────────────────────────

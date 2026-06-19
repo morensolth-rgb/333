@@ -7,6 +7,7 @@ export interface AppInfo {
   packageName: string;
   appName: string;
   isSystemApp: boolean;
+  sdkLabel: string; // e.g. "AppsFlyer · Adjust" or ""
 }
 
 export interface BinaryStatus {
