@@ -23,10 +23,11 @@ import {LICENSE_KEY_STORAGE, LICENSE_EMAIL_STORAGE} from './LicenseScreen';
 const COMMUNITY_SERVER = 'https://fridact-6mzysus-preview-4200.runable.site/api';
 
 const DEFAULT_SCRIPT = `Java.perform(function() {
-  // Hook a method
+  // Use send() for real-time logs in the overlay while the game runs.
+  // console.log() goes to logcat — also visible, but send() is instant.
   var Activity = Java.use("android.app.Activity");
   Activity.onResume.implementation = function() {
-    console.log("[*] onResume called");
+    send("[*] onResume called");
     this.onResume();
   };
 });`;

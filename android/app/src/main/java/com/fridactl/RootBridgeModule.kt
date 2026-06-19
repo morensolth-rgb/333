@@ -672,13 +672,34 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
 
         var promiseResolved = false
 
+        val noiseRx = Regex("tcgetattr|isatty|not a tty|inappropriate ioctl", RegexOption.IGNORE_CASE)
+
+        // ── Stream outLog in real-time (stdout from frida-inject — console.log + send() output) ──
+        Thread {
+            try {
+                val tailProc = ProcessBuilder("su", "-c", "tail -f '$outLog' 2>/dev/null")
+                    .redirectErrorStream(true).start()
+                try {
+                    tailProc.inputStream.bufferedReader().use { r ->
+                        var l: String?
+                        while (fridaScriptPid != null || proc.isAlive) {
+                            l = r.readLine() ?: break
+                            if (l.isBlank()) continue
+                            if (l.startsWith("EXIT:")) continue
+                            if (noiseRx.containsMatchIn(l)) continue
+                            emitScriptLog(l)
+                        }
+                    }
+                } catch (_: Exception) {}
+                try { tailProc.destroy() } catch (_: Exception) {}
+            } catch (_: Exception) {}
+        }.start()
+
         // ── Stream errLog in real-time (stderr from frida-inject — shows errors immediately) ──
         Thread {
             try {
-                // Tail -f the errLog so errors appear live, not only after process exits
                 val tailProc = ProcessBuilder("su", "-c", "tail -f '$errLog' 2>/dev/null")
                     .redirectErrorStream(true).start()
-                val noiseRx = Regex("tcgetattr|isatty|not a tty|inappropriate ioctl", RegexOption.IGNORE_CASE)
                 try {
                     tailProc.inputStream.bufferedReader().use { r ->
                         var l: String?
