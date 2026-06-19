@@ -377,14 +377,17 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                         map.putBoolean("isSystemApp", isSystem)
                         arr.pushMap(map)
                     } catch (_: Exception) {
-                        // PM can't resolve — try dumpsys for the real label
+                        // PM can't resolve — read APK directly via pm path
                         if (pkg.count { it == '.' } >= 1) {
                             val label = try {
-                                val dump = Shell.cmd("dumpsys package $pkg 2>/dev/null | grep -i 'nonLocalizedLabel\\|labelRes' | head -3").exec().out
-                                // Try to extract a readable name from dumpsys
-                                val labelLine = dump.firstOrNull { it.contains("nonLocalizedLabel=") }
-                                labelLine?.substringAfter("nonLocalizedLabel=")?.trim()?.takeIf { it.isNotBlank() && it != "null" }
-                                    ?: smartFallbackName(pkg)
+                                val apkPath = Shell.cmd("pm path $pkg 2>/dev/null").exec().out
+                                    .firstOrNull { it.startsWith("package:") }
+                                    ?.removePrefix("package:")?.trim()
+                                if (apkPath != null) {
+                                    readLabelFromApk(apkPath) ?: smartFallbackName(pkg)
+                                } else {
+                                    smartFallbackName(pkg)
+                                }
                             } catch (_: Exception) { smartFallbackName(pkg) }
 
                             val map = WritableNativeMap()
@@ -401,6 +404,34 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                 promise.reject("APPS_ERROR", e.message)
             }
         }.start()
+    }
+
+    // ─────────────────────────────────────────────
+    // readLabelFromApk — extract app_name from strings.xml inside APK
+    // Uses unzip + grep — works on any rooted device without aapt
+    // ─────────────────────────────────────────────
+    private fun readLabelFromApk(apkPath: String): String? {
+        return try {
+            // Extract res/values/strings.xml (or localized variant) and grep for app_name
+            // strings.xml is plain text inside the APK zip
+            val result = Shell.cmd(
+                "unzip -p '$apkPath' res/values/strings.xml 2>/dev/null | grep -o 'name=\"app_name\">[^<]*' | head -1"
+            ).exec().out.firstOrNull()?.trim()
+
+            val name = result?.substringAfter(">")?.trim()?.takeIf { it.isNotBlank() && it.length > 1 }
+
+            // Fallback: try other common string keys
+            if (name != null) return name
+
+            val fallbackKeys = listOf("app_name", "application_name", "title", "game_name", "APP_NAME")
+            for (key in fallbackKeys) {
+                val r = Shell.cmd(
+                    "unzip -p '$apkPath' res/values/strings.xml 2>/dev/null | grep -o 'name=\"$key\">[^<]*' | head -1"
+                ).exec().out.firstOrNull()?.substringAfter(">")?.trim()
+                if (!r.isNullOrBlank() && r.length > 1) return r
+            }
+            null
+        } catch (_: Exception) { null }
     }
 
     // ─────────────────────────────────────────────
