@@ -336,55 +336,75 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
     fun getInstalledApps(promise: Promise) {
         Thread {
             try {
-                val pm = reactApplicationContext.packageManager
-
-                // Step 1: root scan — sees ALL packages including virtual env ones
-                val dataPackages = Shell.cmd("ls /data/data 2>/dev/null").exec().out
-                    .flatMap { it.trim().split("\\s+".toRegex()) }
-                    .filter { it.contains(".") && !it.startsWith(".") }
-                    .toMutableSet()
-
-                // Step 2: pm list packages as extra safety net
-                Shell.cmd("pm list packages 2>/dev/null").exec().out
-                    .filter { it.startsWith("package:") }
-                    .map { it.removePrefix("package:").trim() }
-                    .forEach { dataPackages.add(it) }
-
-                // third-party set for isSystemApp flag
+                // third-party set (works on host)
                 val thirdParty = Shell.cmd("pm list packages -3 2>/dev/null").exec().out
                     .filter { it.startsWith("package:") }
                     .map { it.removePrefix("package:").trim() }
                     .toSet()
 
+                // get label from pm dump — works even inside vPhoneOS
+                fun getLabelFromDump(pkg: String): String? {
+                    val lines = Shell.cmd("pm dump $pkg 2>/dev/null").exec().out
+                    for (line in lines) {
+                        val m = Regex("""label="([^"]+)"""").find(line)
+                        if (m != null) {
+                            val v = m.groupValues[1].trim()
+                            if (v.isNotEmpty() && v != "null" && !v.startsWith("0x")) return v
+                        }
+                    }
+                    return null
+                }
+
+                // collect all packages via root + pm
+                val dataPackages = Shell.cmd("ls /data/data 2>/dev/null").exec().out
+                    .flatMap { it.trim().split("\\s+".toRegex()) }
+                    .filter { it.contains(".") && !it.startsWith(".") }
+                    .toMutableSet()
+
+                Shell.cmd("pm list packages 2>/dev/null").exec().out
+                    .filter { it.startsWith("package:") }
+                    .map { it.removePrefix("package:").trim() }
+                    .forEach { dataPackages.add(it) }
+
+                val pm = reactApplicationContext.packageManager
                 val arr = WritableNativeArray()
 
                 for (pkg in dataPackages) {
                     if (pkg.isBlank()) continue
+
+                    var appName: String? = null
+                    var isSystem = !thirdParty.contains(pkg)
+
+                    // Try PM first
                     try {
                         val appInfo = pm.getApplicationInfo(pkg, 0)
-                        val appName = pm.getApplicationLabel(appInfo).toString()
-                        val isSystem = (appInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0
+                        val label = pm.getApplicationLabel(appInfo).toString()
+                        // reject wrong labels vPhoneOS returns for unknown packages
+                        if (label.isNotEmpty() && label != "Android" && label != pkg) {
+                            appName = label
+                            isSystem = (appInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0
                                     && (appInfo.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) == 0
                                     && !thirdParty.contains(pkg)
-
-                        val map = WritableNativeMap()
-                        map.putString("packageName", pkg)
-                        map.putString("appName", appName)
-                        map.putBoolean("isSystemApp", isSystem)
-                        arr.pushMap(map)
-                    } catch (_: Exception) {
-                        // PM doesn't know this pkg (virtual env / isolated app)
-                        // Apps in /data/data that PM can't resolve are user-installed, not system
-                        if (pkg.count { it == '.' } >= 1) {
-                            val map = WritableNativeMap()
-                            map.putString("packageName", pkg)
-                            map.putString("appName", pkg.split(".")
-                                .maxByOrNull { it.length }
-                                ?.replaceFirstChar { it.uppercase() } ?: pkg)
-                            map.putBoolean("isSystemApp", false) // in /data/data = user app
-                            arr.pushMap(map)
                         }
+                    } catch (_: Exception) {}
+
+                    // Fallback: pm dump (handles vPhoneOS isolated apps)
+                    if (appName == null) {
+                        appName = getLabelFromDump(pkg)
                     }
+
+                    // Last resort: prettify package name, treat as user app
+                    if (appName == null) {
+                        appName = pkg.split(".").maxByOrNull { it.length }
+                            ?.replaceFirstChar { it.uppercase() } ?: pkg
+                        isSystem = false
+                    }
+
+                    val map = WritableNativeMap()
+                    map.putString("packageName", pkg)
+                    map.putString("appName", appName!!)
+                    map.putBoolean("isSystemApp", isSystem)
+                    arr.pushMap(map)
                 }
 
                 promise.resolve(arr)
@@ -395,21 +415,57 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
     }
 
     // ─────────────────────────────────────────────
-    // getAppIcon — returns base64 PNG icon for a package
+    // getAppIcon — extracts icon from APK directly (works on vPhoneOS)
     // ─────────────────────────────────────────────
     @ReactMethod
     fun getAppIcon(packageName: String, promise: Promise) {
         Thread {
             try {
                 val pm = reactApplicationContext.packageManager
-                val drawable = pm.getApplicationIcon(packageName)
-                val bitmap = drawableToBitmap(drawable)
-                val stream = ByteArrayOutputStream()
-                bitmap.compress(Bitmap.CompressFormat.PNG, 90, stream)
-                val b64 = Base64.encodeToString(stream.toByteArray(), Base64.NO_WRAP)
-                promise.resolve("data:image/png;base64,$b64")
+
+                // Method 1: PM drawable (works on real devices)
+                try {
+                    val appInfo = pm.getApplicationInfo(packageName, 0)
+                    // only trust PM icon if it knows the package (sourceDir exists + not system fallback)
+                    val drawable = pm.getApplicationIcon(appInfo)
+                    // PM returns generic Android icon for unknown packages — check sourceDir
+                    if (appInfo.sourceDir != null && !appInfo.sourceDir.contains("framework")) {
+                        val bitmap = drawableToBitmap(drawable)
+                        val stream = ByteArrayOutputStream()
+                        bitmap.compress(Bitmap.CompressFormat.PNG, 90, stream)
+                        val b64 = Base64.encodeToString(stream.toByteArray(), Base64.NO_WRAP)
+                        promise.resolve("data:image/png;base64,$b64")
+                        return@Thread
+                    }
+                } catch (_: Exception) {}
+
+                // Method 2: find APK via pm path, extract icon via unzip
+                val apkPath = Shell.cmd("pm path $packageName 2>/dev/null").exec().out
+                    .firstOrNull { it.startsWith("package:") }
+                    ?.removePrefix("package:")?.trim()
+
+                if (apkPath != null) {
+                    // get icon entry name from aapt dump or try common paths
+                    val iconEntry = Shell.cmd("unzip -l $apkPath 2>/dev/null | grep -E 'res/.*(ic_launcher|icon).*\.png' | grep -v nodpi | tail -1 | awk '{print $4}'").exec().out
+                        .firstOrNull()?.trim()
+
+                    if (!iconEntry.isNullOrBlank()) {
+                        val tmpFile = java.io.File(reactApplicationContext.cacheDir, "${packageName}_icon.png")
+                        Shell.cmd("unzip -p $apkPath '$iconEntry' > ${tmpFile.absolutePath} 2>/dev/null").exec()
+                        if (tmpFile.exists() && tmpFile.length() > 0) {
+                            val bytes = tmpFile.readBytes()
+                            tmpFile.delete()
+                            val b64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
+                            promise.resolve("data:image/png;base64,$b64")
+                            return@Thread
+                        }
+                        tmpFile.delete()
+                    }
+                }
+
+                promise.resolve(null)
             } catch (e: Exception) {
-                promise.resolve(null) // no icon = null, never reject
+                promise.resolve(null)
             }
         }.start()
     }
