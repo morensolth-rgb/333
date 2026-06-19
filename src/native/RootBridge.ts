@@ -32,6 +32,7 @@ export const rootBridge = {
   readFile:              (path: string): Promise<string>       => RootBridge.readFile(path),
   writeFile:             (path: string, content: string): Promise<string> => RootBridge.writeFile(path, content),
   detectSdks:            (): Promise<Record<string, string>> => RootBridge.detectSdks(),
+  getAppIcon:            (packageName: string): Promise<string | null> => RootBridge.getAppIcon(packageName),
   showFloatingLog:       (): Promise<string>   => RootBridge.showFloatingLog(),
   hideFloatingLog:       (): Promise<void>     => RootBridge.hideFloatingLog(),
   flushPendingLogs:      (): Promise<string[]> => RootBridge.flushPendingLogs(),

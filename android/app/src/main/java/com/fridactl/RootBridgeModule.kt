@@ -6,10 +6,16 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.drawable.BitmapDrawable
+import android.graphics.drawable.Drawable
 import android.os.Build
+import android.util.Base64
 import com.facebook.react.bridge.*
 import com.facebook.react.modules.core.DeviceEventManagerModule
 import com.topjohnwu.superuser.Shell
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.io.BufferedInputStream
@@ -386,6 +392,39 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                 promise.reject("APPS_ERROR", e.message)
             }
         }.start()
+    }
+
+    // ─────────────────────────────────────────────
+    // getAppIcon — returns base64 PNG icon for a package
+    // ─────────────────────────────────────────────
+    @ReactMethod
+    fun getAppIcon(packageName: String, promise: Promise) {
+        Thread {
+            try {
+                val pm = reactApplicationContext.packageManager
+                val drawable = pm.getApplicationIcon(packageName)
+                val bitmap = drawableToBitmap(drawable)
+                val stream = ByteArrayOutputStream()
+                bitmap.compress(Bitmap.CompressFormat.PNG, 90, stream)
+                val b64 = Base64.encodeToString(stream.toByteArray(), Base64.NO_WRAP)
+                promise.resolve("data:image/png;base64,$b64")
+            } catch (e: Exception) {
+                promise.resolve(null) // no icon = null, never reject
+            }
+        }.start()
+    }
+
+    private fun drawableToBitmap(drawable: Drawable): Bitmap {
+        if (drawable is BitmapDrawable && drawable.bitmap != null) {
+            return drawable.bitmap
+        }
+        val w = drawable.intrinsicWidth.takeIf { it > 0 } ?: 96
+        val h = drawable.intrinsicHeight.takeIf { it > 0 } ?: 96
+        val bitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bitmap)
+        drawable.setBounds(0, 0, canvas.width, canvas.height)
+        drawable.draw(canvas)
+        return bitmap
     }
 
     // ─────────────────────────────────────────────

@@ -7,12 +7,49 @@ import {
   StyleSheet,
   TextInput,
   ActivityIndicator,
+  Image,
   RefreshControl,
+  Dimensions,
 } from 'react-native';
 import {rootBridge, AppInfo} from '../native/RootBridge';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
 type FilterMode = 'user' | 'all' | 'system';
+
+const COLS = 3;
+const SCREEN_W = Dimensions.get('window').width;
+const CELL_W = Math.floor((SCREEN_W - 24) / COLS); // 8px padding each side + gaps
+const ICON_SIZE = CELL_W - 28;
+
+function AppIcon({packageName}: {packageName: string}) {
+  const [uri, setUri] = useState<string | null>(null);
+  const mounted = useRef(true);
+
+  useEffect(() => {
+    mounted.current = true;
+    rootBridge.getAppIcon(packageName).then(b64 => {
+      if (mounted.current) setUri(b64);
+    }).catch(() => {});
+    return () => { mounted.current = false; };
+  }, [packageName]);
+
+  if (!uri) {
+    return (
+      <View style={[styles.iconPlaceholder, {width: ICON_SIZE, height: ICON_SIZE}]}>
+        <Text style={styles.iconPlaceholderText}>
+          {packageName.split('.').pop()?.slice(0, 2).toUpperCase() ?? '??'}
+        </Text>
+      </View>
+    );
+  }
+  return (
+    <Image
+      source={{uri}}
+      style={{width: ICON_SIZE, height: ICON_SIZE, borderRadius: 14}}
+      resizeMode="contain"
+    />
+  );
+}
 
 export default function AppsScreen({navigation}: {navigation: any}) {
   const [apps, setApps] = useState<AppInfo[]>([]);
@@ -21,7 +58,6 @@ export default function AppsScreen({navigation}: {navigation: any}) {
   const [loading, setLoading] = useState(false);
   const [selected, setSelected] = useState<string>('');
   const [filter, setFilter] = useState<FilterMode>('user');
-  // SDK labels loaded separately after list renders
   const [sdkMap, setSdkMap] = useState<Record<string, string>>({});
 
   useEffect(() => {
@@ -38,21 +74,15 @@ export default function AppsScreen({navigation}: {navigation: any}) {
     const q = search.toLowerCase().trim();
     let list = [...apps];
 
-    if (filter === 'user') {
-      list = list.filter(a => !a.isSystemApp);
-    } else if (filter === 'system') {
-      list = list.filter(a => a.isSystemApp);
-    }
+    if (filter === 'user')   list = list.filter(a => !a.isSystemApp);
+    else if (filter === 'system') list = list.filter(a => a.isSystemApp);
 
     if (q) {
       list = list.filter(
-        a =>
-          a.appName.toLowerCase().includes(q) ||
-          a.packageName.toLowerCase().includes(q),
+        a => a.appName.toLowerCase().includes(q) || a.packageName.toLowerCase().includes(q),
       );
     }
 
-    // Sort: selected first → alphabetical
     list.sort((a, b) => {
       if (a.packageName === selected) return -1;
       if (b.packageName === selected) return 1;
@@ -73,15 +103,14 @@ export default function AppsScreen({navigation}: {navigation: any}) {
     try {
       const list = await rootBridge.getInstalledApps();
       setApps(list);
-      // Load SDK labels after list is rendered — non-blocking
-      loadSdkLabels(list);
+      loadSdkLabels();
     } catch (e: any) {
       console.error('getInstalledApps error:', e);
     }
     setLoading(false);
   };
 
-  const loadSdkLabels = async (list: AppInfo[]) => {
+  const loadSdkLabels = async () => {
     try {
       const map = await rootBridge.detectSdks();
       setSdkMap(map);
@@ -102,79 +131,74 @@ export default function AppsScreen({navigation}: {navigation: any}) {
     {label: 'System', value: 'system', count: systemCount},
   ];
 
+  const renderItem = ({item}: {item: AppInfo}) => {
+    const sdk = sdkMap[item.packageName];
+    const isSelected = selected === item.packageName;
+    return (
+      <TouchableOpacity
+        style={[styles.cell, isSelected && styles.cellSelected]}
+        onPress={() => selectApp(item.packageName)}
+        onLongPress={() =>
+          navigation.navigate('FileBrowser', {
+            path:  `/data/data/${item.packageName}/shared_prefs`,
+            title: item.packageName.split('.').pop() ?? item.packageName,
+          })
+        }>
+        <AppIcon packageName={item.packageName} />
+        <Text style={styles.cellName} numberOfLines={2}>{item.appName}</Text>
+        {!!sdk && <Text style={styles.sdkLabel}>{sdk}</Text>}
+        {isSelected && <View style={styles.targetDot} />}
+      </TouchableOpacity>
+    );
+  };
+
   return (
-    <View style={s.container}>
+    <View style={styles.container}>
       {/* Filter tabs */}
-      <View style={s.tabs}>
+      <View style={styles.tabs}>
         {tabs.map(t => (
           <TouchableOpacity
             key={t.value}
-            style={[s.tab, filter === t.value && s.tabActive]}
+            style={[styles.tab, filter === t.value && styles.tabActive]}
             onPress={() => setFilter(t.value)}>
-            <Text style={[s.tabText, filter === t.value && s.tabTextActive]}>
+            <Text style={[styles.tabText, filter === t.value && styles.tabTextActive]}>
               {t.label}
-              <Text style={s.tabCount}> {t.count}</Text>
+              <Text style={styles.tabCount}> {t.count}</Text>
             </Text>
           </TouchableOpacity>
         ))}
       </View>
 
       <TextInput
-        style={s.search}
-        placeholder="Search by name or package..."
-        placeholderTextColor="#333"
+        style={styles.search}
+        placeholder="Search games..."
+        placeholderTextColor="#444"
         value={search}
         onChangeText={setSearch}
       />
 
       {loading ? (
-        <View style={s.center}>
+        <View style={styles.center}>
           <ActivityIndicator color="#00ff88" size="large" />
-          <Text style={s.loadingText}>Loading via root shell...</Text>
+          <Text style={styles.loadingText}>Loading...</Text>
         </View>
       ) : (
         <FlatList
           data={filtered}
           keyExtractor={item => item.packageName}
+          numColumns={COLS}
           refreshControl={
             <RefreshControl refreshing={loading} onRefresh={loadApps} tintColor="#00ff88" />
           }
-          renderItem={({item}) => {
-            const sdk = sdkMap[item.packageName];
-            return (
-              <View style={[s.item, selected === item.packageName && s.itemSelected]}>
-                <TouchableOpacity
-                  style={s.itemMain}
-                  onPress={() => selectApp(item.packageName)}>
-                  <View style={s.itemRow}>
-                    <Text style={s.appName} numberOfLines={1}>{item.appName}</Text>
-                    {item.isSystemApp && <Text style={s.sysTag}>SYS</Text>}
-                    {selected === item.packageName && <Text style={s.targetTag}>TARGET</Text>}
-                  </View>
-                  <Text style={s.pkg} numberOfLines={1}>{item.packageName}</Text>
-                  {!!sdk && <Text style={s.sdkLabel}>{sdk}</Text>}
-                </TouchableOpacity>
-                <TouchableOpacity
-                  style={s.browseBtn}
-                  onPress={() =>
-                    navigation.navigate('FileBrowser', {
-                      path:  `/data/data/${item.packageName}/shared_prefs`,
-                      title: item.packageName.split('.').pop() ?? item.packageName,
-                    })
-                  }>
-                  <Text style={s.browseBtnText}>📁</Text>
-                </TouchableOpacity>
-              </View>
-            );
-          }}
+          renderItem={renderItem}
           ListEmptyComponent={
-            <Text style={s.empty}>
-              {search ? 'No results for "' + search + '"' : 'No apps found'}
+            <Text style={styles.empty}>
+              {search ? `No results for "${search}"` : 'No apps found'}
             </Text>
           }
-          getItemLayout={(_, index) => ({length: 58, offset: 58 * index, index})}
-          initialNumToRender={30}
-          maxToRenderPerBatch={30}
+          contentContainerStyle={styles.grid}
+          initialNumToRender={24}
+          maxToRenderPerBatch={12}
           windowSize={10}
         />
       )}
@@ -182,8 +206,9 @@ export default function AppsScreen({navigation}: {navigation: any}) {
   );
 }
 
-const s = StyleSheet.create({
+const styles = StyleSheet.create({
   container: {flex: 1, backgroundColor: '#0d0d0d'},
+
   tabs: {
     flexDirection: 'row',
     gap: 6,
@@ -200,62 +225,90 @@ const s = StyleSheet.create({
     borderColor: '#1e1e1e',
     alignItems: 'center',
   },
-  tabActive: {backgroundColor: '#0a2a15', borderColor: '#00ff88'},
-  tabText: {color: '#444', fontFamily: 'monospace', fontSize: 12},
+  tabActive: {
+    backgroundColor: '#001a0d',
+    borderColor: '#00ff88',
+  },
+  tabText:       {color: '#555', fontSize: 12, fontFamily: 'monospace'},
   tabTextActive: {color: '#00ff88'},
-  tabCount: {color: '#333', fontSize: 10},
+  tabCount:      {color: '#333', fontSize: 11},
+
   search: {
-    margin: 10,
-    marginTop: 6,
+    marginHorizontal: 10,
+    marginVertical: 6,
     backgroundColor: '#111',
     borderRadius: 8,
     paddingHorizontal: 12,
-    paddingVertical: 9,
+    paddingVertical: 8,
     color: '#00ff88',
-    fontFamily: 'monospace',
     fontSize: 13,
+    fontFamily: 'monospace',
     borderWidth: 1,
     borderColor: '#1e1e1e',
   },
-  item: {
-    flexDirection: 'row',
+
+  grid: {
+    paddingHorizontal: 8,
+    paddingBottom: 20,
+  },
+
+  cell: {
+    width: CELL_W,
     alignItems: 'center',
-    borderBottomWidth: 1,
-    borderBottomColor: '#151515',
-    height: 58,
+    paddingVertical: 12,
+    paddingHorizontal: 4,
+    margin: 4,
+    borderRadius: 10,
+    backgroundColor: '#111',
+    borderWidth: 1,
+    borderColor: '#1a1a1a',
+    position: 'relative',
   },
-  itemMain: {
-    flex: 1,
-    paddingHorizontal: 14,
-    paddingVertical: 10,
+  cellSelected: {
+    borderColor: '#00ff88',
+    backgroundColor: '#001a0d',
+  },
+  cellName: {
+    color: '#e0e0e0',
+    fontSize: 11,
+    fontFamily: 'monospace',
+    marginTop: 6,
+    textAlign: 'center',
+    lineHeight: 15,
+  },
+  sdkLabel: {
+    color: '#0af',
+    fontSize: 9,
+    fontFamily: 'monospace',
+    marginTop: 2,
+    textAlign: 'center',
+  },
+  targetDot: {
+    position: 'absolute',
+    top: 6,
+    right: 6,
+    width: 7,
+    height: 7,
+    borderRadius: 4,
+    backgroundColor: '#00ff88',
+  },
+
+  iconPlaceholder: {
+    borderRadius: 14,
+    backgroundColor: '#1a1a1a',
     justifyContent: 'center',
-    height: 58,
-    overflow: 'hidden',
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#252525',
   },
-  itemSelected: {backgroundColor: '#091a0e'},
-  itemRow: {flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 2},
-  browseBtn: {
-    paddingHorizontal: 14,
-    alignSelf: 'stretch',
-    justifyContent: 'center',
-    borderLeftWidth: 1,
-    borderLeftColor: '#1a1a1a',
+  iconPlaceholderText: {
+    color: '#00ff88',
+    fontSize: 18,
+    fontFamily: 'monospace',
+    fontWeight: 'bold',
   },
-  browseBtnText: {fontSize: 18},
-  appName: {color: '#ddd', fontFamily: 'monospace', fontSize: 13, flex: 1},
-  sysTag: {
-    color: '#333', fontFamily: 'monospace', fontSize: 9,
-    borderWidth: 1, borderColor: '#2a2a2a',
-    paddingHorizontal: 4, paddingVertical: 1, borderRadius: 3,
-  },
-  targetTag: {
-    color: '#00ff88', fontFamily: 'monospace', fontSize: 9,
-    borderWidth: 1, borderColor: '#00ff88',
-    paddingHorizontal: 4, paddingVertical: 1, borderRadius: 3,
-  },
-  pkg: {color: '#3a3a3a', fontFamily: 'monospace', fontSize: 10},
-  sdkLabel: {color: '#00aaff', fontFamily: 'monospace', fontSize: 9, marginTop: 1},
-  center: {flex: 1, alignItems: 'center', justifyContent: 'center', gap: 12},
-  loadingText: {color: '#333', fontFamily: 'monospace', fontSize: 12},
-  empty: {color: '#2a2a2a', textAlign: 'center', marginTop: 60, fontFamily: 'monospace', fontSize: 13},
+
+  center:      {flex: 1, justifyContent: 'center', alignItems: 'center', paddingTop: 60},
+  loadingText: {color: '#00ff88', marginTop: 12, fontFamily: 'monospace', fontSize: 12},
+  empty:       {color: '#444', textAlign: 'center', marginTop: 60, fontFamily: 'monospace'},
 });
