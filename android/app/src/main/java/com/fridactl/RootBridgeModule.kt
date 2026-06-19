@@ -352,10 +352,6 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                     .map { it.removePrefix("package:").trim() }
                     .toSet()
 
-                // ── SDK bulk scan: one shell command for ALL packages ──
-                // Format per line: "<pkg>:<filename>"
-                val sdkMap = buildSdkMap(thirdParty)
-
                 val arr = WritableNativeArray()
 
                 for (pkg in dataPackages) {
@@ -367,13 +363,10 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                                     && (appInfo.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) == 0
                                     && !thirdParty.contains(pkg)
 
-                        val sdkLabel = if (!isSystem) sdkMap[pkg] ?: "" else ""
-
                         val map = WritableNativeMap()
                         map.putString("packageName", pkg)
                         map.putString("appName", appName)
                         map.putBoolean("isSystemApp", isSystem)
-                        map.putString("sdkLabel", sdkLabel)
                         arr.pushMap(map)
                     } catch (_: Exception) {
                         // PM can't resolve it but it exists in /data/data
@@ -384,7 +377,6 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                             map.putString("appName", pkg.split(".").last()
                                 .replaceFirstChar { it.uppercase() })
                             map.putBoolean("isSystemApp", !thirdParty.contains(pkg))
-                            map.putString("sdkLabel", "")
                             arr.pushMap(map)
                         }
                     }
@@ -393,6 +385,29 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                 promise.resolve(arr)
             } catch (e: Exception) {
                 promise.reject("APPS_ERROR", e.message)
+            }
+        }.start()
+    }
+
+    // ─────────────────────────────────────────────
+    // detectSdks — exposed to JS, runs buildSdkMap and returns as ReadableMap
+    // ─────────────────────────────────────────────
+    @ReactMethod
+    fun detectSdks(promise: Promise) {
+        Thread {
+            try {
+                val thirdParty = Shell.cmd("pm list packages -3 2>/dev/null").exec().out
+                    .filter { it.startsWith("package:") }
+                    .map { it.removePrefix("package:").trim() }
+                    .toSet()
+                val sdkMap = buildSdkMap(thirdParty)
+                val result = WritableNativeMap()
+                for ((pkg, label) in sdkMap) {
+                    result.putString(pkg, label)
+                }
+                promise.resolve(result)
+            } catch (e: Exception) {
+                promise.resolve(WritableNativeMap()) // never reject — just return empty
             }
         }.start()
     }

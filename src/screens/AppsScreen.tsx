@@ -1,4 +1,4 @@
-import React, {useEffect, useState, useCallback} from 'react';
+import React, {useEffect, useState, useCallback, useRef} from 'react';
 import {
   View,
   Text,
@@ -21,6 +21,8 @@ export default function AppsScreen({navigation}: {navigation: any}) {
   const [loading, setLoading] = useState(false);
   const [selected, setSelected] = useState<string>('');
   const [filter, setFilter] = useState<FilterMode>('user');
+  // SDK labels loaded separately after list renders
+  const [sdkMap, setSdkMap] = useState<Record<string, string>>({});
 
   useEffect(() => {
     loadSelected();
@@ -67,13 +69,23 @@ export default function AppsScreen({navigation}: {navigation: any}) {
 
   const loadApps = async () => {
     setLoading(true);
+    setSdkMap({});
     try {
       const list = await rootBridge.getInstalledApps();
       setApps(list);
+      // Load SDK labels after list is rendered — non-blocking
+      loadSdkLabels(list);
     } catch (e: any) {
       console.error('getInstalledApps error:', e);
     }
     setLoading(false);
+  };
+
+  const loadSdkLabels = async (list: AppInfo[]) => {
+    try {
+      const map = await rootBridge.detectSdks();
+      setSdkMap(map);
+    } catch (_) {}
   };
 
   const selectApp = async (pkg: string) => {
@@ -127,38 +139,40 @@ export default function AppsScreen({navigation}: {navigation: any}) {
           refreshControl={
             <RefreshControl refreshing={loading} onRefresh={loadApps} tintColor="#00ff88" />
           }
-          renderItem={({item}) => (
-            <View style={[s.item, selected === item.packageName && s.itemSelected]}>
-              <TouchableOpacity
-                style={s.itemMain}
-                onPress={() => selectApp(item.packageName)}>
-                <View style={s.itemRow}>
-                  <Text style={s.appName} numberOfLines={1}>{item.appName}</Text>
-                  {item.isSystemApp && <Text style={s.sysTag}>SYS</Text>}
-                  {selected === item.packageName && <Text style={s.targetTag}>TARGET</Text>}
-                </View>
-                <Text style={s.pkg} numberOfLines={1}>{item.packageName}</Text>
-                {!!item.sdkLabel && (
-                  <Text style={s.sdkLabel}>{item.sdkLabel}</Text>
-                )}
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={s.browseBtn}
-                onPress={() =>
-                  navigation.navigate('FileBrowser', {
-                    path:  `/data/data/${item.packageName}/shared_prefs`,
-                    title: item.packageName.split('.').pop() ?? item.packageName,
-                  })
-                }>
-                <Text style={s.browseBtnText}>📁</Text>
-              </TouchableOpacity>
-            </View>
-          )}
+          renderItem={({item}) => {
+            const sdk = sdkMap[item.packageName];
+            return (
+              <View style={[s.item, selected === item.packageName && s.itemSelected]}>
+                <TouchableOpacity
+                  style={s.itemMain}
+                  onPress={() => selectApp(item.packageName)}>
+                  <View style={s.itemRow}>
+                    <Text style={s.appName} numberOfLines={1}>{item.appName}</Text>
+                    {item.isSystemApp && <Text style={s.sysTag}>SYS</Text>}
+                    {selected === item.packageName && <Text style={s.targetTag}>TARGET</Text>}
+                  </View>
+                  <Text style={s.pkg} numberOfLines={1}>{item.packageName}</Text>
+                  {!!sdk && <Text style={s.sdkLabel}>{sdk}</Text>}
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={s.browseBtn}
+                  onPress={() =>
+                    navigation.navigate('FileBrowser', {
+                      path:  `/data/data/${item.packageName}/shared_prefs`,
+                      title: item.packageName.split('.').pop() ?? item.packageName,
+                    })
+                  }>
+                  <Text style={s.browseBtnText}>📁</Text>
+                </TouchableOpacity>
+              </View>
+            );
+          }}
           ListEmptyComponent={
             <Text style={s.empty}>
               {search ? 'No results for "' + search + '"' : 'No apps found'}
             </Text>
           }
+          getItemLayout={(_, index) => ({length: 58, offset: 58 * index, index})}
           initialNumToRender={30}
           maxToRenderPerBatch={30}
           windowSize={10}
@@ -208,20 +222,21 @@ const s = StyleSheet.create({
     alignItems: 'center',
     borderBottomWidth: 1,
     borderBottomColor: '#151515',
-    minHeight: 58,
+    height: 58,
   },
   itemMain: {
     flex: 1,
     paddingHorizontal: 14,
     paddingVertical: 10,
     justifyContent: 'center',
+    height: 58,
+    overflow: 'hidden',
   },
   itemSelected: {backgroundColor: '#091a0e'},
   itemRow: {flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 2},
   browseBtn: {
     paddingHorizontal: 14,
-    paddingVertical: 10,
-    height: '100%',
+    alignSelf: 'stretch',
     justifyContent: 'center',
     borderLeftWidth: 1,
     borderLeftColor: '#1a1a1a',
@@ -239,7 +254,7 @@ const s = StyleSheet.create({
     paddingHorizontal: 4, paddingVertical: 1, borderRadius: 3,
   },
   pkg: {color: '#3a3a3a', fontFamily: 'monospace', fontSize: 10},
-  sdkLabel: {color: '#00aaff', fontFamily: 'monospace', fontSize: 9, marginTop: 2},
+  sdkLabel: {color: '#00aaff', fontFamily: 'monospace', fontSize: 9, marginTop: 1},
   center: {flex: 1, alignItems: 'center', justifyContent: 'center', gap: 12},
   loadingText: {color: '#333', fontFamily: 'monospace', fontSize: 12},
   empty: {color: '#2a2a2a', textAlign: 'center', marginTop: 60, fontFamily: 'monospace', fontSize: 13},

@@ -7,7 +7,6 @@ export interface AppInfo {
   packageName: string;
   appName: string;
   isSystemApp: boolean;
-  sdkLabel: string; // e.g. "AppsFlyer · Adjust" or ""
 }
 
 export interface BinaryStatus {
@@ -32,6 +31,7 @@ export const rootBridge = {
   readDir:               (path: string): Promise<FileEntry[]>  => RootBridge.readDir(path),
   readFile:              (path: string): Promise<string>       => RootBridge.readFile(path),
   writeFile:             (path: string, content: string): Promise<string> => RootBridge.writeFile(path, content),
+  detectSdks:            (): Promise<Record<string, string>> => RootBridge.detectSdks(),
   showFloatingLog:       (): Promise<string>   => RootBridge.showFloatingLog(),
   hideFloatingLog:       (): Promise<void>     => RootBridge.hideFloatingLog(),
   flushPendingLogs:      (): Promise<string[]> => RootBridge.flushPendingLogs(),
