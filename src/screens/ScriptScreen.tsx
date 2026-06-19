@@ -257,6 +257,9 @@ export default function ScriptScreen() {
     runningRef.current = false;
     setRunning(false);
     addOut('⏹ Stopped');
+    // Auto-hide overlay when script stops
+    try { await rootBridge.hideFloatingLog(); } catch (_) {}
+    setOverlayActive(false);
   };
 
   const toggleOverlay = async () => {
@@ -292,6 +295,12 @@ export default function ScriptScreen() {
     setSearchQuery('');
     addOut(`▶ Targeting ${target}...`);
 
+    // Auto-show overlay so logs appear above the game without needing the app open
+    try {
+      await rootBridge.showFloatingLog();
+      setOverlayActive(true);
+    } catch (_) {}
+
     try {
       const result = await rootBridge.runScript(target, script, injectMode);
       if (result.startsWith('running:')) {
@@ -301,11 +310,13 @@ export default function ScriptScreen() {
         addOut(`✓ Injected — logcat streaming (press STOP to end)`);
       } else {
         addOut(result);
-        // Non-streaming result — clean up immediately
+        // Non-streaming result — clean up + hide overlay
         runningRef.current = false;
         setRunning(false);
         listenerRef.current?.remove();
         listenerRef.current = null;
+        try { await rootBridge.hideFloatingLog(); } catch (_) {}
+        setOverlayActive(false);
       }
     } catch (e: any) {
       addOut('✗ ' + (e.message ?? String(e)));
@@ -313,6 +324,8 @@ export default function ScriptScreen() {
       setRunning(false);
       listenerRef.current?.remove();
       listenerRef.current = null;
+      try { await rootBridge.hideFloatingLog(); } catch (_) {}
+      setOverlayActive(false);
     }
   };
 
@@ -323,6 +336,8 @@ export default function ScriptScreen() {
       setRunning(false);
       listenerRef.current?.remove();
       listenerRef.current = null;
+      rootBridge.hideFloatingLog().catch(() => {});
+      setOverlayActive(false);
     }
   }, [output, running]);
 
