@@ -367,14 +367,15 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                         map.putBoolean("isSystemApp", isSystem)
                         arr.pushMap(map)
                     } catch (_: Exception) {
-                        // PM doesn't know this pkg (virtual env app) — show with best-effort name
+                        // PM doesn't know this pkg (virtual env / isolated app)
+                        // Apps in /data/data that PM can't resolve are user-installed, not system
                         if (pkg.count { it == '.' } >= 1) {
                             val map = WritableNativeMap()
                             map.putString("packageName", pkg)
                             map.putString("appName", pkg.split(".")
                                 .maxByOrNull { it.length }
                                 ?.replaceFirstChar { it.uppercase() } ?: pkg)
-                            map.putBoolean("isSystemApp", !thirdParty.contains(pkg))
+                            map.putBoolean("isSystemApp", false) // in /data/data = user app
                             arr.pushMap(map)
                         }
                     }
