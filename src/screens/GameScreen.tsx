@@ -910,13 +910,42 @@ ${sc.code}` : '';
     const location = US_LOCATIONS[selectedLocation];
     addLog(`▶ Injecting device spoof: ${device.label}`);
     addLog(`   Carrier: ${carrier.label}  GPS: ${location.label}`);
+
+    // ── Step 1: resetprop — system-wide, affects all apps + browser ──────────
+    addLog('⚙ Applying resetprop (system-wide)...');
+    try {
+      const resetCmds = [
+        `resetprop ro.product.model "${device.model}"`,
+        `resetprop ro.product.manufacturer "${device.manufacturer}"`,
+        `resetprop ro.product.brand "${device.brand}"`,
+        `resetprop ro.product.device "${device.device}"`,
+        `resetprop ro.product.name "${device.product}"`,
+        `resetprop ro.hardware "${device.hardware}"`,
+        `resetprop ro.build.fingerprint "${device.fingerprint}"`,
+        `resetprop ro.build.tags "release-keys"`,
+        `resetprop ro.build.type "user"`,
+        // system_ext / odm variants (some apps check these too)
+        `resetprop ro.product.system.model "${device.model}"`,
+        `resetprop ro.product.system.manufacturer "${device.manufacturer}"`,
+        `resetprop ro.product.system.brand "${device.brand}"`,
+        `resetprop ro.product.odm.model "${device.model}"`,
+        `resetprop ro.product.odm.manufacturer "${device.manufacturer}"`,
+      ].join(' && ');
+      const propResult = await rootBridge.execShell(`su -c '${resetCmds}'`);
+      addLog(`✓ resetprop done — ${device.label} system-wide`);
+    } catch(e: any) {
+      addLog(`⚠ resetprop failed: ${e.message} — continuing with Frida only`);
+    }
+
+    // ── Step 2: Frida hook — per-app, catches runtime Java calls ─────────────
+    addLog('⚙ Injecting Frida hooks into target app...');
     try {
       const script = buildSpoofScript(device, carrier, location);
       const result = await rootBridge.runScript(pkg.trim(), script, 'pid');
       addLog('✓ Hooks injected — tap VERIFY to confirm values');
       setVerifyResults([]);
     } catch(e: any) {
-      addLog('✗ ' + e.message);
+      addLog('✗ Frida inject failed: ' + e.message);
     } finally {
       setBusy(null);
     }
