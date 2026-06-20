@@ -1266,12 +1266,21 @@ function buildSpoofScript(
 });`;
 }
 
+interface VerifyResult {
+  key: string;
+  expected: string;
+  actual: string;
+  ok: boolean;
+}
+
 function AntiDetTab() {
   const navigation = useNavigation<any>();
   const [pkg, setPkg] = useState('');
   const [busy, setBusy] = useState<string|null>(null);
   const [log, setLog] = useState<string[]>([]);
   const [activeProfile, setActiveProfile] = useState<string|null>(null);
+  const [verifyResults, setVerifyResults] = useState<VerifyResult[]>([]);
+  const [showVerify, setShowVerify] = useState(false);
 
   // Spoofer state
   const [selectedDevice, setSelectedDevice] = useState(0);
@@ -1320,7 +1329,107 @@ ${sc.code}` : '';
     try {
       const script = buildSpoofScript(device, carrier, location);
       const result = await rootBridge.runScript(pkg.trim(), script, 'pid');
-      addLog('✓ ' + result);
+      addLog('✓ Hooks injected — tap VERIFY to confirm values');
+      setVerifyResults([]);
+    } catch(e: any) {
+      addLog('✗ ' + e.message);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const verifySpoof = async () => {
+    if (!pkg.trim()) { Alert.alert('Enter target package name'); return; }
+    setBusy('verify');
+    setShowVerify(true);
+    setVerifyResults([]);
+    addLog('▶ Reading actual values from process...');
+    const device   = REAL_DEVICES[selectedDevice];
+    const carrier  = US_CARRIERS[selectedCarrier];
+    const location = US_LOCATIONS[selectedLocation];
+
+    const verifyScript = `Java.perform(function () {
+  var out = {};
+
+  // Build props
+  try {
+    var Build = Java.use('android.os.Build');
+    out.MODEL        = Build.MODEL.value;
+    out.MANUFACTURER = Build.MANUFACTURER.value;
+    out.BRAND        = Build.BRAND.value;
+    out.FINGERPRINT  = Build.FINGERPRINT.value;
+    out.TAGS         = Build.TAGS.value;
+  } catch(e) { out.Build_err = String(e); }
+
+  // TelephonyManager
+  try {
+    var ctx = Java.use('android.app.ActivityThread').currentApplication().getApplicationContext();
+    var TM  = ctx.getSystemService('phone');
+    out.IMEI             = TM.getDeviceId();
+    out.SIM_SERIAL       = TM.getSimSerialNumber();
+    out.NETWORK_OPERATOR = TM.getNetworkOperator();
+    out.NETWORK_NAME     = TM.getNetworkOperatorName();
+    out.SIM_OPERATOR     = TM.getSimOperator();
+    out.SIM_COUNTRY      = TM.getSimCountryIso();
+    out.NET_COUNTRY      = TM.getNetworkCountryIso();
+  } catch(e) { out.TM_err = String(e); }
+
+  // ANDROID_ID
+  try {
+    var Secure = Java.use('android.provider.Settings$Secure');
+    out.ANDROID_ID = Secure.getString(ctx.getContentResolver(), 'android_id');
+  } catch(e) { out.SecureErr = String(e); }
+
+  // GPS via LocationManager
+  try {
+    var LM  = ctx.getSystemService('location');
+    var loc = LM.getLastKnownLocation('gps');
+    if (loc) {
+      out.GPS_LAT = String(loc.getLatitude());
+      out.GPS_LON = String(loc.getLongitude());
+    } else {
+      out.GPS_LAT = 'null (no fix yet)';
+      out.GPS_LON = 'null (no fix yet)';
+    }
+  } catch(e) { out.GPS_err = String(e); }
+
+  send({type:'verify', data: out});
+});`;
+
+    try {
+      const raw = await rootBridge.runScript(pkg.trim(), verifyScript, 'pid');
+      // parse send() output
+      const match = raw.match(/\{[^}]*"data"\s*:\s*\{[\s\S]*?\}\s*\}/);
+      if (!match) {
+        addLog('✗ Could not parse verify output — process may have rejected the script');
+        setBusy(null);
+        return;
+      }
+      const obj: Record<string, string> = JSON.parse(match[0]).data || {};
+
+      const checks: VerifyResult[] = [
+        { key: 'MODEL',        expected: device.model,           actual: obj.MODEL        || '?' },
+        { key: 'MANUFACTURER', expected: device.manufacturer,    actual: obj.MANUFACTURER || '?' },
+        { key: 'BRAND',        expected: device.brand,           actual: obj.BRAND        || '?' },
+        { key: 'TAGS',         expected: 'release-keys',         actual: obj.TAGS         || '?' },
+        { key: 'IMEI',         expected: device.imei,            actual: obj.IMEI         || '?' },
+        { key: 'SIM_SERIAL',   expected: carrier.simSerial,      actual: obj.SIM_SERIAL   || '?' },
+        { key: 'NET_OPERATOR', expected: carrier.operator,       actual: obj.NETWORK_OPERATOR || '?' },
+        { key: 'NET_NAME',     expected: carrier.operatorName,   actual: obj.NETWORK_NAME || '?' },
+        { key: 'SIM_COUNTRY',  expected: 'us',                   actual: obj.SIM_COUNTRY  || '?' },
+        { key: 'GPS_LAT',      expected: String(location.lat),   actual: obj.GPS_LAT      || '?' },
+        { key: 'GPS_LON',      expected: String(location.lon),   actual: obj.GPS_LON      || '?' },
+      ].map(r => ({
+        ...r,
+        ok: r.actual.startsWith(r.expected) || r.actual === r.expected,
+      }));
+
+      setVerifyResults(checks);
+      const passed = checks.filter(c => c.ok).length;
+      addLog(`✓ Verify done: ${passed}/${checks.length} values confirmed`);
+      if (passed < checks.length) {
+        addLog('ℹ Failed items = hooks not yet seen by the app (re-inject or restart app)');
+      }
     } catch(e: any) {
       addLog('✗ ' + e.message);
     } finally {
@@ -1461,17 +1570,86 @@ ${sc.code}` : '';
           <Text style={{color:C.dim, marginLeft:6}}>▼</Text>
         </TouchableOpacity>
 
-        <TouchableOpacity
-          style={[s.btn, busy==='spoof' && {borderColor:C.dim}]}
-          onPress={injectSpoof}
-          disabled={!!busy}
-        >
-          {busy==='spoof'
-            ? <ActivityIndicator color={C.green} size="small"/>
-            : <Text style={s.btnTxt}>▶ INJECT DEVICE SPOOF</Text>
-          }
-        </TouchableOpacity>
+        {/* INJECT + VERIFY buttons */}
+        <View style={{flexDirection:'row', gap:8}}>
+          <TouchableOpacity
+            style={[s.btn, {flex:2}, busy==='spoof' && {borderColor:C.dim}]}
+            onPress={injectSpoof}
+            disabled={!!busy}
+          >
+            {busy==='spoof'
+              ? <ActivityIndicator color={C.green} size="small"/>
+              : <Text style={s.btnTxt}>▶ INJECT DEVICE SPOOF</Text>
+            }
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[s.btn, {flex:1, borderColor:C.yellow}, busy==='verify' && {borderColor:C.dim}]}
+            onPress={verifySpoof}
+            disabled={!!busy}
+          >
+            {busy==='verify'
+              ? <ActivityIndicator color={C.yellow} size="small"/>
+              : <Text style={[s.btnTxt, {color:C.yellow, fontSize:11}]}>🔍 VERIFY</Text>
+            }
+          </TouchableOpacity>
+        </View>
       </View>
+
+      {/* ── VERIFY RESULTS CARD ── */}
+      {showVerify && (
+        <View style={[s.card, {borderColor: C.yellow}]}>
+          <View style={[s.row, {marginBottom:8}]}>
+            <Text style={[s.cardTitle, {flex:1, marginBottom:0, color:C.yellow}]}>
+              🔍 Spoof Verification
+            </Text>
+            <TouchableOpacity onPress={() => setShowVerify(false)}>
+              <Text style={{color:C.dim}}>✕</Text>
+            </TouchableOpacity>
+          </View>
+          {verifyResults.length === 0 && busy === 'verify' && (
+            <ActivityIndicator color={C.yellow} style={{marginVertical:10}}/>
+          )}
+          {verifyResults.map((r, i) => (
+            <View key={i} style={{
+              flexDirection:'row', alignItems:'flex-start',
+              paddingVertical:5, borderBottomWidth:1, borderBottomColor:C.border,
+            }}>
+              {/* status dot */}
+              <Text style={{
+                fontSize:13, marginRight:6, marginTop:1,
+                color: r.ok ? C.green : C.red,
+              }}>
+                {r.ok ? '✓' : '✗'}
+              </Text>
+              <View style={{flex:1}}>
+                <Text style={[s.mono, {color:C.dim, fontSize:10}]}>{r.key}</Text>
+                {r.ok ? (
+                  <Text style={[s.mono, {color:C.green, fontSize:11}]}>{r.actual}</Text>
+                ) : (
+                  <>
+                    <Text style={[s.mono, {color:C.red, fontSize:11}]}>
+                      got:  {r.actual}
+                    </Text>
+                    <Text style={[s.mono, {color:C.dim, fontSize:10}]}>
+                      want: {r.expected}
+                    </Text>
+                  </>
+                )}
+              </View>
+            </View>
+          ))}
+          {verifyResults.length > 0 && (
+            <View style={{marginTop:8, padding:6, backgroundColor:'#0a0a0a', borderRadius:4}}>
+              <Text style={[s.mono, {color:C.dim, fontSize:10}]}>
+                {verifyResults.filter(r=>r.ok).length === verifyResults.length
+                  ? '✓ All hooks active — the app sees the spoofed values'
+                  : `⚠ ${verifyResults.filter(r=>!r.ok).length} value(s) not hooked yet.\n  → Re-inject while app is running, or restart the app then inject.`
+                }
+              </Text>
+            </View>
+          )}
+        </View>
+      )}
 
       {/* Quick actions */}
       <View style={s.card}>
