@@ -41,18 +41,19 @@ const BUILTIN_SCRIPTS: BuiltinScript[] = [
   {
     id: 'builtin_appsflyer',
     name: 'AppsFlyer Bypass',
-    tag: 'Analytics',
-    code: `// AppsFlyer Event Monitor & Rename
+    tag: 'Tracking',
+    code: `// ── AppsFlyer Event Monitor & Rename ──────────────────────────────
 // Hooks logEvent — intercepts event name + params in real time.
-// Edit AF_RENAME_MAP below to rename events before they fire:
+// Edit AF_RENAME_MAP to rename events before they fire:
 //   e.g. { "af_purchase": "af_view_item" }
+// Set AF_BLOCK = ["af_purchase"] to silently drop specific events.
 var AF_RENAME_MAP = {};
+var AF_BLOCK     = [];
 
 Java.perform(function () {
   try {
     var AFL = Java.use("com.appsflyer.AppsFlyerLib");
 
-    // logEvent(Context, String eventName, Map eventValues)
     AFL.logEvent.overload(
       "android.content.Context",
       "java.lang.String",
@@ -60,23 +61,267 @@ Java.perform(function () {
     ).implementation = function (ctx, eventName, eventValues) {
       var params = "{}";
       try { params = JSON.stringify(eventValues); } catch (_) {}
+      send("[AF] event=" + eventName + " | " + params);
 
-      send("[AF] event=" + eventName + " params=" + params);
-
-      var renamed = AF_RENAME_MAP[eventName] !== undefined
-        ? AF_RENAME_MAP[eventName]
-        : eventName;
-
-      if (renamed !== eventName) {
-        send("[AF] renamed => " + renamed);
+      if (AF_BLOCK.indexOf(eventName) !== -1) {
+        send("[AF] BLOCKED: " + eventName);
+        return;
       }
 
+      var renamed = AF_RENAME_MAP[eventName] !== undefined
+        ? AF_RENAME_MAP[eventName] : eventName;
+
+      if (renamed !== eventName) send("[AF] renamed => " + renamed);
       this.logEvent(ctx, renamed, eventValues);
     };
 
-    send("[AF] logEvent hook active");
-  } catch (e) {
-    send("[AF] ERROR: " + e.message);
+    send("[AF] hook active");
+  } catch (e) { send("[AF] ERROR: " + e.message); }
+});`,
+  },
+  {
+    id: 'builtin_adjust',
+    name: 'Adjust Bypass',
+    tag: 'Tracking',
+    code: `// ── Adjust Event Monitor & Rename ─────────────────────────────────
+// Hooks AdjustEvent constructor + Adjust.trackEvent()
+// Edit ADJUST_TOKEN_MAP to swap event tokens before tracking:
+//   e.g. { "abc123": "xyz789" }
+// Set ADJUST_BLOCK = ["abc123"] to drop specific tokens.
+var ADJUST_TOKEN_MAP = {};
+var ADJUST_BLOCK    = [];
+
+Java.perform(function () {
+  try {
+    // Hook AdjustEvent constructor to see event token at creation time
+    var AdjustEvent = Java.use("com.adjust.sdk.AdjustEvent");
+    AdjustEvent.$init.overload("java.lang.String")
+      .implementation = function (token) {
+        send("[ADJ] new AdjustEvent token=" + token);
+        var mapped = ADJUST_TOKEN_MAP[token] !== undefined
+          ? ADJUST_TOKEN_MAP[token] : token;
+        return this.$init(mapped);
+      };
+
+    // Hook trackEvent to see it fire
+    var Adjust = Java.use("com.adjust.sdk.Adjust");
+    Adjust.trackEvent.overload("com.adjust.sdk.AdjustEvent")
+      .implementation = function (event) {
+        var token = "";
+        try { token = event.eventToken.value; } catch (_) {}
+        send("[ADJ] trackEvent token=" + token);
+
+        if (ADJUST_BLOCK.indexOf(token) !== -1) {
+          send("[ADJ] BLOCKED: " + token);
+          return;
+        }
+        this.trackEvent(event);
+      };
+
+    send("[ADJ] hooks active");
+  } catch (e) { send("[ADJ] ERROR: " + e.message); }
+});`,
+  },
+  {
+    id: 'builtin_singular',
+    name: 'Singular Bypass',
+    tag: 'Tracking',
+    code: `// ── Singular Event Monitor & Rename ───────────────────────────────
+// Hooks Singular.event() and Singular.eventWithArgs()
+// Edit SINGULAR_RENAME to rename events before they fire.
+// Set SINGULAR_BLOCK = ["Purchase"] to drop specific events.
+var SINGULAR_RENAME = {};
+var SINGULAR_BLOCK  = [];
+
+Java.perform(function () {
+  try {
+    var Singular = Java.use("com.singular.sdk.Singular");
+
+    // event(String name)
+    Singular.event.overload("java.lang.String")
+      .implementation = function (name) {
+        send("[SNG] event=" + name);
+        if (SINGULAR_BLOCK.indexOf(name) !== -1) {
+          send("[SNG] BLOCKED: " + name); return;
+        }
+        var r = SINGULAR_RENAME[name] || name;
+        if (r !== name) send("[SNG] renamed => " + r);
+        this.event(r);
+      };
+
+    // eventWithArgs(String name, JSONObject args)  — older SDK
+    try {
+      Singular.eventWithArgs.overload(
+        "java.lang.String", "org.json.JSONObject"
+      ).implementation = function (name, args) {
+        var a = "{}";
+        try { a = args.toString(); } catch (_) {}
+        send("[SNG] eventWithArgs name=" + name + " args=" + a);
+        if (SINGULAR_BLOCK.indexOf(name) !== -1) {
+          send("[SNG] BLOCKED: " + name); return;
+        }
+        var r = SINGULAR_RENAME[name] || name;
+        this.eventWithArgs(r, args);
+      };
+    } catch (_) { send("[SNG] eventWithArgs not found — skipping"); }
+
+    // revenue(String eventName, String currency, double amount)
+    try {
+      Singular.revenue.overload(
+        "java.lang.String","java.lang.String","double"
+      ).implementation = function (name, currency, amount) {
+        send("[SNG] revenue event=" + name +
+             " currency=" + currency + " amount=" + amount);
+        this.revenue(name, currency, amount);
+      };
+    } catch (_) {}
+
+    send("[SNG] hooks active");
+  } catch (e) { send("[SNG] ERROR: " + e.message); }
+});`,
+  },
+  {
+    id: 'builtin_branch',
+    name: 'Branch Bypass',
+    tag: 'Tracking',
+    code: `// ── Branch.io Event Monitor ────────────────────────────────────────
+// Hooks BranchEvent.logEvent() — captures all standard + custom events.
+// Edit BRANCH_RENAME to rename custom events before they fire.
+// Set BRANCH_BLOCK = ["PURCHASE"] to drop specific events.
+var BRANCH_RENAME = {};
+var BRANCH_BLOCK  = [];
+
+Java.perform(function () {
+  try {
+    var BranchEvent = Java.use("io.branch.referral.util.BranchEvent");
+
+    // logEvent(Context) — final fire point
+    BranchEvent.logEvent.overload("android.content.Context")
+      .implementation = function (ctx) {
+        var name = "";
+        try { name = this.getEventName(); } catch (_) {}
+        send("[BRN] logEvent name=" + name);
+
+        if (BRANCH_BLOCK.indexOf(name) !== -1) {
+          send("[BRN] BLOCKED: " + name); return;
+        }
+        this.logEvent(ctx);
+      };
+
+    // Also hook constructor to catch event name at creation
+    BranchEvent.$init.overload("java.lang.String")
+      .implementation = function (eventName) {
+        var r = BRANCH_RENAME[eventName] || eventName;
+        if (r !== eventName) send("[BRN] renamed " + eventName + " => " + r);
+        return this.$init(r);
+      };
+
+    send("[BRN] hooks active");
+  } catch (e) { send("[BRN] ERROR: " + e.message); }
+});`,
+  },
+  {
+    id: 'builtin_firebase_analytics',
+    name: 'Firebase Analytics Bypass',
+    tag: 'Tracking',
+    code: `// ── Firebase Analytics Event Monitor & Rename ─────────────────────
+// Hooks FirebaseAnalytics.logEvent(name, bundle)
+// Edit FA_RENAME to rename events; FA_BLOCK to drop them.
+var FA_RENAME = {};
+var FA_BLOCK  = [];
+
+Java.perform(function () {
+  try {
+    var FA = Java.use("com.google.firebase.analytics.FirebaseAnalytics");
+
+    FA.logEvent.overload("java.lang.String","android.os.Bundle")
+      .implementation = function (name, bundle) {
+        var params = "{}";
+        try {
+          // Dump bundle keys/values
+          if (bundle !== null) {
+            var keys = bundle.keySet().toArray();
+            var obj = {};
+            for (var i = 0; i < keys.length; i++) {
+              var k = keys[i];
+              try { obj[k] = bundle.get(k); } catch (_) { obj[k] = "?"; }
+            }
+            params = JSON.stringify(obj);
+          }
+        } catch (_) {}
+
+        send("[FA] event=" + name + " | " + params);
+
+        if (FA_BLOCK.indexOf(name) !== -1) {
+          send("[FA] BLOCKED: " + name); return;
+        }
+
+        var renamed = FA_RENAME[name] || name;
+        if (renamed !== name) send("[FA] renamed => " + renamed);
+        this.logEvent(renamed, bundle);
+      };
+
+    send("[FA] hook active");
+  } catch (e) { send("[FA] ERROR: " + e.message); }
+});`,
+  },
+  {
+    id: 'builtin_kochava',
+    name: 'Kochava Bypass',
+    tag: 'Tracking',
+    code: `// ── Kochava Event Monitor & Rename ────────────────────────────────
+// Hooks KochavaEvent send/sendEvent methods.
+// Edit KOCHAVA_RENAME to rename events; KOCHAVA_BLOCK to drop them.
+var KOCHAVA_RENAME = {};
+var KOCHAVA_BLOCK  = [];
+
+Java.perform(function () {
+  try {
+    // Modern SDK: com.kochava.tracker.events.Event
+    var KVEvent = Java.use("com.kochava.tracker.events.Event");
+
+    // Static factory: Event.buildWithEventType(String)
+    try {
+      KVEvent.buildWithEventType.overload("java.lang.String")
+        .implementation = function (type) {
+          send("[KV] buildWithEventType type=" + type);
+          var r = KOCHAVA_RENAME[type] || type;
+          return this.buildWithEventType(r);
+        };
+    } catch (_) {}
+
+    // send(Context) — final fire
+    try {
+      KVEvent.send.overload("android.content.Context")
+        .implementation = function (ctx) {
+          var name = "";
+          try { name = this.getEventType(); } catch (_) {}
+          send("[KV] send event=" + name);
+          if (KOCHAVA_BLOCK.indexOf(name) !== -1) {
+            send("[KV] BLOCKED: " + name); return;
+          }
+          this.send(ctx);
+        };
+    } catch (_) {}
+
+    send("[KV] hooks active");
+  } catch (e1) {
+    // Legacy SDK: com.kochava.base.Tracker
+    try {
+      var Tracker = Java.use("com.kochava.base.Tracker");
+      Tracker.sendEvent.overload("java.lang.String","java.lang.String")
+        .implementation = function (name, info) {
+          send("[KV-legacy] sendEvent name=" + name + " info=" + info);
+          if (KOCHAVA_BLOCK.indexOf(name) !== -1) {
+            send("[KV-legacy] BLOCKED: " + name); return;
+          }
+          var r = KOCHAVA_RENAME[name] || name;
+          this.sendEvent(r, info);
+        };
+      send("[KV-legacy] hook active");
+    } catch (e2) {
+      send("[KV] ERROR (both SDKs): " + e1.message + " | " + e2.message);
+    }
   }
 });`,
   },
