@@ -29,6 +29,10 @@ class DownloadService : Service() {
 
         private const val FRIDA_DEST     = "/data/local/tmp/frida-server"
         private const val FRIDA_CLI_DEST = "/data/local/tmp/frida-inject"
+
+        // Temp download dir — /data/local/tmp is world-writable and root-accessible
+        // avoids SELinux EACCES when shell tries to read from app private filesDir
+        private const val TMP_DIR = "/data/local/tmp"
     }
 
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -102,55 +106,59 @@ class DownloadService : Service() {
     // ─── main download logic (runs on background Thread) ────────────────────
 
     private fun doDownload(version: String) {
-        val tmp  = filesDir.absolutePath
+        // Use /data/local/tmp as staging area — world-writable, no SELinux restrictions
+        // for root shell reads. App can write here via root shell.
+        val tmp  = TMP_DIR
         val base = "https://github.com/frida/frida/releases/download/$version"
         val arch = fridaArch()
         val log  = StringBuilder()
 
         log.appendLine("▶ detected arch: $arch")
 
-        // ── frida-server — .xz only (no .gz on GitHub releases) ─────────────
+        // Ensure /data/local/tmp exists and is writable
+        Shell.cmd("mkdir -p /data/local/tmp && chmod 777 /data/local/tmp 2>/dev/null; true").exec()
+
+        // ── frida-server ─────────────────────────────────────────────────────
         if (!File(FRIDA_DEST).exists() || File(FRIDA_DEST).length() < 1024) {
             log.appendLine("▶ frida-server $version")
-            val dl  = "$tmp/frida-server.dl"
+            // Download .xz directly to /data/local/tmp — root shell can read/write freely
+            val dl  = "$tmp/frida-server.xz"
             val bin = "$tmp/frida-server.bin"
             try {
-                downloadFile(
+                downloadFileSu(
                     "$base/frida-server-$version-$arch.xz", dl
                 ) { emitProgress("frida-server", it) }
-                extractXzShell(dl, bin)
+                extractXzAny(dl, bin)
                 cleanup(dl)
-                copyToTmp(bin, FRIDA_DEST)
+                Shell.cmd("mv '$bin' '$FRIDA_DEST' && chmod 755 '$FRIDA_DEST'").exec()
                 cleanup(bin)
-                log.appendLine("  ✓ done")
+                log.appendLine("  ✓ done → $FRIDA_DEST (${File(FRIDA_DEST).length()/1024}KB)")
             } catch (e: Exception) {
                 cleanup(dl); cleanup(bin)
                 finishService(ACTION_ERROR, "frida-server failed: ${e.message}")
                 return
             }
         } else {
-            log.appendLine("▶ frida-server already present")
+            log.appendLine("▶ frida-server already present (${File(FRIDA_DEST).length()/1024}KB)")
         }
 
-        // ── frida-inject — replaces "frida" CLI (not published for Android) ──
-        // Binary name on GitHub: frida-inject-VERSION-android-ARCH.xz
+        // ── frida-inject ─────────────────────────────────────────────────────
         if (!File(FRIDA_CLI_DEST).exists() || File(FRIDA_CLI_DEST).length() < 1024) {
             log.appendLine("▶ frida-inject $version")
-            val dl  = "$tmp/frida-inject.dl"
+            val dl  = "$tmp/frida-inject.xz"
             val bin = "$tmp/frida-inject.bin"
             try {
-                downloadFile(
+                downloadFileSu(
                     "$base/frida-inject-$version-$arch.xz", dl
                 ) { emitProgress("frida-inject", it) }
-                extractXzShell(dl, bin)
+                extractXzAny(dl, bin)
                 cleanup(dl)
-                copyToTmp(bin, FRIDA_CLI_DEST)
+                Shell.cmd("mv '$bin' '$FRIDA_CLI_DEST' && chmod 755 '$FRIDA_CLI_DEST'").exec()
                 cleanup(bin)
-                log.appendLine("  ✓ done")
+                log.appendLine("  ✓ done → $FRIDA_CLI_DEST (${File(FRIDA_CLI_DEST).length()/1024}KB)")
             } catch (e: Exception) {
                 cleanup(dl); cleanup(bin)
-                log.appendLine("  ⚠ frida-inject failed: ${e.message}")
-                // non-fatal — frida-server still usable without inject
+                log.appendLine("  ⚠ frida-inject failed (non-fatal): ${e.message}")
             }
         } else {
             log.appendLine("▶ frida-inject already present")
@@ -162,27 +170,25 @@ class DownloadService : Service() {
     // ─── file helpers ────────────────────────────────────────────────────────
 
     private fun cleanup(path: String) {
-        try { File(path).delete() } catch (_: Exception) {}
-    }
-
-    /** Copy extracted binary to /data/local/tmp via root shell */
-    private fun copyToTmp(src: String, dest: String) {
-        val r = Shell.cmd("cp '$src' '$dest' && chmod 755 '$dest'").exec()
-        if (!r.isSuccess)
-            throw Exception("cp failed: ${r.out.joinToString(" ")}")
+        try {
+            File(path).delete()
+        } catch (_: Exception) {}
+        // Also try via root in case file was written by root shell
+        try { Shell.cmd("rm -f '$path' 2>/dev/null; true").exec() } catch (_: Exception) {}
     }
 
     // ─── download ────────────────────────────────────────────────────────────
 
-    /** Returns true on success, false on 4xx/5xx (caller tries next URL) */
-    private fun tryDownload(url: String, dest: String, onProgress: (Int) -> Unit): Boolean {
-        return try {
-            downloadFile(url, dest, onProgress)
-            true
-        } catch (e: Exception) {
-            cleanup(dest)
-            false
-        }
+    /**
+     * Download to a path under /data/local/tmp using Java HTTP.
+     * Works because /data/local/tmp is world-writable — no EACCES.
+     */
+    private fun downloadFileSu(url: String, dest: String, onProgress: (Int) -> Unit) {
+        // Ensure parent dir writable
+        val parentDir = File(dest).parent ?: TMP_DIR
+        Shell.cmd("mkdir -p '$parentDir' && chmod 777 '$parentDir' 2>/dev/null; true").exec()
+        // Download directly via Java — dest is /data/local/tmp/ which app can write
+        downloadFile(url, dest, onProgress)
     }
 
     private fun downloadFile(url: String, dest: String, onProgress: (Int) -> Unit) {
@@ -244,56 +250,52 @@ class DownloadService : Service() {
 
     // ─── extraction ──────────────────────────────────────────────────────────
 
-    private fun extractGz(gzPath: String, outPath: String) {
-        cleanup(outPath)
-        BufferedInputStream(FileInputStream(gzPath), 32_768).use { bis ->
-            GZIPInputStream(bis).use { gz ->
-                FileOutputStream(outPath).use { out ->
-                    val buf = ByteArray(32_768)
-                    var n: Int
-                    while (gz.read(buf).also { n = it } != -1) out.write(buf, 0, n)
-                }
-            }
-        }
-        if (!File(outPath).exists() || File(outPath).length() < 1024)
-            throw Exception("GZ extraction produced empty file")
-    }
-
-    private fun extractXzShell(xzPath: String, outPath: String) {
+    /**
+     * Extract .xz file using best available method.
+     * Priority: xz → busybox xz → toybox xz → python3 lzma → java XZ
+     * All paths are under /data/local/tmp so no SELinux issues.
+     */
+    private fun extractXzAny(xzPath: String, outPath: String) {
         cleanup(outPath)
 
-        // 1) system xz
+        // 1) system xz (rare on Android but check first)
         if (tryShellExtract("xz -d -k -c '$xzPath' > '$outPath'", outPath)) return
+
         // 2) busybox xz
-        val bb = Shell.cmd("busybox 2>/dev/null | head -1").exec().out.firstOrNull()
-        if (!bb.isNullOrBlank()) {
-            if (tryShellExtract("busybox xz -d -k -c '$xzPath' > '$outPath'", outPath)) return
-        }
-        // 3) magisk/toybox
+        if (tryShellExtract("busybox xz -d -k -c '$xzPath' > '$outPath'", outPath)) return
+
+        // 3) toybox xz (Magisk devices)
         if (tryShellExtract("toybox xz -d -k -c '$xzPath' > '$outPath'", outPath)) return
 
-        // 4) Java XZ — last resort
+        // 4) Python3 lzma — available on many modern Android via Termux/system python
+        val pyCmd = "python3 -c \"import lzma,sys; open('$outPath','wb').write(lzma.open('$xzPath').read())\""
+        if (tryShellExtract(pyCmd, outPath)) return
+
+        // 5) Java XZ (apache commons-compress) — last resort, may OOM on low-RAM devices
+        // Use small chunk size to reduce peak memory
         try {
-            BufferedInputStream(FileInputStream(xzPath), 8_192).use { bis ->
+            BufferedInputStream(FileInputStream(xzPath), 4_096).use { bis ->
                 XZCompressorInputStream(bis, true).use { xzIn ->
                     FileOutputStream(outPath).use { out ->
-                        val buf = ByteArray(8_192); var n: Int
+                        val buf = ByteArray(4_096); var n: Int
                         while (xzIn.read(buf).also { n = it } != -1) out.write(buf, 0, n)
                     }
                 }
             }
         } catch (e: Exception) {
             cleanup(outPath)
-            throw Exception("XZ extraction failed (no shell xz + Java OOM?): ${e.message}")
+            throw Exception("XZ extraction failed — all methods exhausted. Last error: ${e.message}")
         }
 
-        if (!File(outPath).exists() || File(outPath).length() < 1024)
-            throw Exception("XZ extraction produced empty file")
+        if (!File(outPath).exists() || File(outPath).length() < 1024) {
+            cleanup(outPath)
+            throw Exception("XZ extraction produced empty/invalid file")
+        }
     }
 
     private fun tryShellExtract(cmd: String, outPath: String): Boolean {
         return try {
-            Shell.cmd(cmd).exec()
+            val result = Shell.cmd(cmd).exec()
             File(outPath).exists() && File(outPath).length() > 1024
         } catch (_: Exception) { false }
     }
