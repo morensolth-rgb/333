@@ -98,14 +98,12 @@ class TrafficVpnService : VpnService() {
                 .setMtu(1500)
                 .setBlocking(true)
 
-            // If target package specified — only capture that app
             if (targetPackage.isNotEmpty()) {
                 try {
                     builder.addAllowedApplication(targetPackage)
                     builder.addAllowedApplication(packageName)
                 } catch (e: Exception) {
                     Log.w(TAG, "addAllowedApplication failed, capturing all: ${e.message}")
-                    // Don't filter by app — capture everything instead of crashing
                 }
             }
 
@@ -121,6 +119,9 @@ class TrafficVpnService : VpnService() {
             running = true
             isRunning.set(true)
             capturedPackets.clear()
+
+            // Start HTTP proxy — captures plain HTTP with full headers/body
+            HttpProxyServer.start()
 
             readerThread = Thread { readPackets() }.apply {
                 name = "TrafficVpnReader"
@@ -236,6 +237,7 @@ class TrafficVpnService : VpnService() {
         readerThread = null
         try { vpnInterface?.close() } catch (e: Exception) { }
         vpnInterface = null
+        HttpProxyServer.stop()
         stopForeground(true)
         stopSelf()
     }
