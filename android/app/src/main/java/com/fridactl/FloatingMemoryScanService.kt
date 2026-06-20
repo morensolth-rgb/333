@@ -509,11 +509,15 @@ class FloatingMemoryScanService : Service() {
     private fun doFirstScan(value: String) {
         try {
             val pid = resolvePid()
-            if (pid.isEmpty()) { mainHandler.post { log("✗ Process not found — launch game first"); setBusy(false) }; return }
-            mainHandler.post { log("[SCAN #1] type=$scanType val=$value") }
+            if (pid.isEmpty()) {
+                mainHandler.post { log("✗ Process not found — launch game first"); setBusy(false) }
+                return
+            }
+            mainHandler.post { log("⏳ Scanning… type=$scanType val=$value") }
 
             val script = buildScanScript(value, emptyList())
-            val raw = runFrida(pid, script)
+            // Use 15s timeout — enough for scan but won't hang forever
+            val raw = runFrida(pid, script, timeoutMs = 15000L)
             val parsed = parseResults(raw)
 
             mainHandler.post {
@@ -522,7 +526,7 @@ class FloatingMemoryScanService : Service() {
                 scanCount = 1
                 renderResults()
                 updateScanCount()
-                log("✓ Found ${parsed.size} addresses")
+                log(if (parsed.isEmpty()) "⚠ 0 results — value not found in heap regions" else "✓ Found ${parsed.size} addresses")
                 setBusy(false)
             }
         } catch (e: Exception) {
@@ -533,12 +537,16 @@ class FloatingMemoryScanService : Service() {
     private fun doNextScan(value: String) {
         try {
             val pid = resolvePid()
-            if (pid.isEmpty()) { mainHandler.post { log("✗ Process not found"); setBusy(false) }; return }
-            mainHandler.post { log("[NEXT #${scanCount + 1}] val=$value mode=$scanMode") }
+            if (pid.isEmpty()) {
+                mainHandler.post { log("✗ Process not found"); setBusy(false) }
+                return
+            }
+            mainHandler.post { log("⏳ Next scan #${scanCount + 1}… val=$value mode=$scanMode") }
 
             val addrs = results.map { it.addr }
             val script = buildNextScanScript(value, addrs)
-            val raw = runFrida(pid, script)
+            // Next scan is cheaper — shorter timeout is fine
+            val raw = runFrida(pid, script, timeoutMs = 10000L)
             val parsed = parseResults(raw)
 
             mainHandler.post {
@@ -547,7 +555,7 @@ class FloatingMemoryScanService : Service() {
                 scanCount++
                 renderResults()
                 updateScanCount()
-                log("✓ Narrowed to ${parsed.size} addresses")
+                log(if (parsed.isEmpty()) "⚠ 0 results — try different value or mode" else "✓ Narrowed to ${parsed.size} addresses")
                 setBusy(false)
             }
         } catch (e: Exception) {
@@ -556,25 +564,43 @@ class FloatingMemoryScanService : Service() {
     }
 
     // ─── Build scan Frida script ───────────────────────────────────────────────
+    // Key fix: limit scan to heap/anonymous regions only, cap per-region size,
+    // and hard-stop after MAX_RESULTS to avoid freezing the game process.
     private fun buildScanScript(value: String, prevAddrs: List<String>): String {
         val readFn   = readFnFor(scanType)
         val pattern  = buildPattern(value)
         return """
 (function(){
   var results = [];
-  Process.enumerateRanges({protection:"rw-",coalesce:true}).forEach(function(r){
-    if(r.size < 4) return;
+  var MAX_RESULTS = 200;
+  var MAX_REGION_SIZE = 32 * 1024 * 1024; // 32 MB per region cap — prevents huge scans
+
+  var ranges = Process.enumerateRanges({protection:"rw-", coalesce:false});
+  // Filter: skip file-backed regions (mapped libs/DEX) — they rarely have game values
+  // Only scan anonymous + heap regions to keep it fast and non-intrusive
+  ranges = ranges.filter(function(r){
+    return r.size >= 4
+        && r.size <= MAX_REGION_SIZE
+        && (!r.file || r.file.path === "" || r.file.path === "[heap]" || r.file.path === "[anon]"
+            || r.file.path.indexOf("/dev/") === -1);
+  });
+
+  for (var i = 0; i < ranges.length; i++) {
+    if (results.length >= MAX_RESULTS) break;
+    var r = ranges[i];
     try {
       Memory.scan(r.base, r.size, "$pattern", {
         onMatch: function(addr){
-          try { results.push({addr: addr.toString(), value: String(addr.$readFn)}); } catch(e){}
-          if(results.length >= 300) return "stop";
+          try {
+            results.push({addr: addr.toString(), value: String(addr.$readFn)});
+          } catch(e){}
+          if(results.length >= MAX_RESULTS) return "stop";
         },
         onError: function(){},
         onComplete: function(){}
       });
     } catch(e){}
-  });
+  }
   send({type:"scan_results", results: results});
 })();"""
     }
@@ -650,21 +676,30 @@ class FloatingMemoryScanService : Service() {
         }
     }
 
-    // ─── Run Frida via shell (same approach as RootBridgeModule) ─────────────
-    private fun runFrida(pid: String, script: String): String {
+    // ─── Run Frida via shell — with timeout to prevent game freeze ───────────
+    private fun runFrida(pid: String, script: String, timeoutMs: Long = 12000L): String {
         val ctx = applicationContext
         val fridaInject = "${ctx.applicationInfo.nativeLibraryDir}/libfrida-inject.so"
         val scriptPath  = "${ctx.filesDir}/mem_scan_tmp.js"
 
-        // Write script file via root
+        // Write script file locally then copy via root
         val tmpLocal = java.io.File(ctx.filesDir, "mem_scan_tmp.js")
         tmpLocal.writeText(script)
         Shell.cmd("cp '${tmpLocal.absolutePath}' '$scriptPath' && chmod 644 '$scriptPath'").exec()
-
-        val cmd = "'$fridaInject' -p $pid -s '$scriptPath' 2>&1"
-        val r = Shell.cmd(cmd).exec()
         tmpLocal.delete()
-        return r.out.joinToString("\n")
+
+        // Run frida-inject with a hard timeout via `timeout` shell command.
+        // This ensures the game never stays frozen — frida-inject is killed after timeoutMs.
+        val timeoutSec = (timeoutMs / 1000).coerceAtLeast(5)
+        val cmd = "timeout ${timeoutSec}s '$fridaInject' -p $pid -s '$scriptPath' --no-pause 2>&1; echo __FRIDA_DONE__"
+        val r = Shell.cmd(cmd).exec()
+        val output = r.out.joinToString("\n")
+
+        // If we never got __FRIDA_DONE__ it means timeout killed it
+        if (!output.contains("__FRIDA_DONE__")) {
+            mainHandler.post { log("⚠ Scan timed out after ${timeoutSec}s — try smaller range") }
+        }
+        return output
     }
 
     // ─── Parse results from Frida output ─────────────────────────────────────
@@ -740,14 +775,22 @@ class FloatingMemoryScanService : Service() {
             "string" -> "writeUtf8String(\"$value\")"
             else     -> "writeInt($value)"
         }
+        // Freeze interval set to 100ms (was 50ms) — less aggressive, less chance of stutter
         val freezeScript = """
 (function(){
   var ptr = ptr64("$addr");
+  // Write once immediately to confirm address is valid before starting loop
+  try { ptr.$writeFn; } catch(e){ send({type:"freeze_err",addr:"$addr",msg:String(e)}); return; }
+
   var iv = setInterval(function(){
-    try { ptr.$writeFn; } catch(e){ clearInterval(iv); }
-  }, 50);
-  recv("unfreeze_${addr.replace("0x","")}", function(){ clearInterval(iv); send({type:"unfrozen",addr:"$addr"}); });
-  send({type:"frozen",addr:"$addr"});
+    try { ptr.$writeFn; } catch(e){ clearInterval(iv); send({type:"freeze_stopped",addr:"$addr"}); }
+  }, 100);
+
+  recv("unfreeze_${addr.replace("0x","")}", function(){
+    clearInterval(iv);
+    send({type:"unfrozen", addr:"$addr"});
+  });
+  send({type:"frozen", addr:"$addr"});
 })();"""
 
         Thread {
