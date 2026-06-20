@@ -69,6 +69,11 @@ class TrafficVpnService : VpnService() {
         val capturedPackets: CopyOnWriteArrayList<TrafficEntry> = CopyOnWriteArrayList()
         var targetPackage: String = ""
         var onPacketCallback: ((TrafficEntry) -> Unit)? = null
+
+        // NDK needs raw fd of the VPN TUN interface
+        @Volatile private var _vpnFd: Int = -1
+        fun getVpnFd(): Int = _vpnFd
+        internal fun setVpnFd(fd: Int) { _vpnFd = fd }
     }
 
     private var vpnInterface: ParcelFileDescriptor? = null
@@ -116,6 +121,7 @@ class TrafficVpnService : VpnService() {
             }
 
             vpnInterface = iface
+            setVpnFd(iface.fd)   // expose fd for NDK layer
             running = true
             isRunning.set(true)
             capturedPackets.clear()
@@ -233,6 +239,7 @@ class TrafficVpnService : VpnService() {
     private fun stopVpn() {
         running = false
         isRunning.set(false)
+        setVpnFd(-1)   // invalidate fd — NDK should have stopped already
         readerThread?.interrupt()
         readerThread = null
         try { vpnInterface?.close() } catch (e: Exception) { }

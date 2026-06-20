@@ -9,10 +9,123 @@ import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 class TrafficModule(private val ctx: ReactApplicationContext) : ReactContextBaseJavaModule(ctx) {
 
     override fun getName() = "TrafficModule"
+
+    // ── NDK native declarations ────────────────────────────────────────────────
+    private external fun nativeCreate(fd: Int): Long
+    private external fun nativeRun(ptr: Long)
+    private external fun nativeStop(ptr: Long)
+    private external fun nativeDestroy(ptr: Long)
+
+    companion object {
+        init {
+            System.loadLibrary("fridacapture")
+        }
+    }
+
+    // ── NDK capture state ──────────────────────────────────────────────────────
+    private val nativePtr = AtomicLong(0L)
+    private var nativeThread: Thread? = null
+
+    // ── NDK → JS callbacks (called from C via JNI) ────────────────────────────
+    @Suppress("unused")
+    fun onNativePacket(ts: Long, src: String, dst: String, dstPort: Int, len: Int, proto: String) {
+        val params = Arguments.createMap().apply {
+            putDouble("ts", ts.toDouble())
+            putString("protocol", proto)
+            putString("src", src)
+            putString("dst", dst)
+            putString("host", KnownPorts.resolve(dstPort) ?: dst)
+            putInt("port", dstPort)
+            putInt("len", len)
+            putString("dir", "out")
+            putString("type", "packet")
+        }
+        emit("onTrafficPacket", params)
+    }
+
+    @Suppress("unused")
+    fun onNativeHttpRequest(
+        id: Long, ts: Long,
+        method: String, url: String, host: String, path: String,
+        headersJson: String, body: String
+    ) {
+        val req = HttpRequest(
+            id      = id,
+            ts      = ts,
+            method  = method,
+            url     = url,
+            host    = host,
+            path    = path,
+            headers = parseHeadersJson(headersJson),
+            body    = body,
+            source  = "ndk"
+        )
+        if (HttpProxyServer.requests.size >= 500) HttpProxyServer.requests.removeAt(0)
+        HttpProxyServer.requests.add(req)
+        HttpProxyServer.onRequest?.invoke(req)
+    }
+
+    @Suppress("unused")
+    fun onNativeHttpResponse(
+        reqId: Long, ts: Long,
+        statusCode: Int, statusText: String,
+        headersJson: String, body: String
+    ) {
+        val res = HttpResponse(
+            requestId  = reqId,
+            ts         = ts,
+            statusCode = statusCode,
+            statusText = statusText,
+            headers    = parseHeadersJson(headersJson),
+            body       = body,
+            source     = "ndk"
+        )
+        if (HttpProxyServer.responses.size >= 500) HttpProxyServer.responses.removeAt(0)
+        HttpProxyServer.responses.add(res)
+        HttpProxyServer.onResponse?.invoke(res)
+    }
+
+    // ── NDK startCapture / stopCapture ────────────────────────────────────────
+    private fun startNdkCapture() {
+        val fd = TrafficVpnService.getVpnFd()
+        if (fd < 0) {
+            Log.w("TrafficModule", "NDK capture: vpn fd not available yet")
+            return
+        }
+        try {
+            val ptr = nativeCreate(fd)
+            if (ptr == 0L) {
+                Log.e("TrafficModule", "nativeCreate returned null")
+                return
+            }
+            nativePtr.set(ptr)
+            nativeThread = Thread {
+                nativeRun(ptr)   // blocks until nativeStop() is called
+            }.apply {
+                name = "NdkCapture"
+                isDaemon = true
+                start()
+            }
+            Log.d("TrafficModule", "NDK capture started fd=$fd ptr=$ptr")
+        } catch (e: Exception) {
+            Log.e("TrafficModule", "startNdkCapture error: ${e.message}")
+        }
+    }
+
+    private fun stopNdkCapture() {
+        val ptr = nativePtr.getAndSet(0L)
+        if (ptr != 0L) {
+            try { nativeStop(ptr) }   catch (e: Exception) { Log.w("TrafficModule", "nativeStop: ${e.message}") }
+            nativeThread?.join(2000)
+            nativeThread = null
+            try { nativeDestroy(ptr) } catch (e: Exception) { Log.w("TrafficModule", "nativeDestroy: ${e.message}") }
+        }
+    }
 
     // ── Frida stdout bridge state ──────────────────────────────────────────────
     private var fridaProcess: Process? = null
@@ -105,6 +218,13 @@ class TrafficModule(private val ctx: ReactApplicationContext) : ReactContextBase
                         putExtra(TrafficVpnService.EXTRA_PKG, targetPackage)
                     }
                     activity.startService(intent)
+
+                    // Give VPN service ~600ms to establish interface, then start NDK
+                    Thread {
+                        Thread.sleep(600)
+                        startNdkCapture()
+                    }.also { it.isDaemon = true; it.start() }
+
                     promise.resolve("started")
                 } catch (e: Exception) {
                     promise.reject("START_ERROR", e.message)
@@ -349,7 +469,8 @@ class TrafficModule(private val ctx: ReactApplicationContext) : ReactContextBase
     @ReactMethod
     fun stopCapture(promise: Promise) {
         try {
-            stopFridaBridge() // أوقف frida process والـ reader thread
+            stopNdkCapture()   // NDK أولاً قبل إغلاق fd
+            stopFridaBridge()  // أوقف frida process والـ reader thread
             TrafficVpnService.onPacketCallback = null
             HttpProxyServer.onRequest  = null
             HttpProxyServer.onResponse = null
