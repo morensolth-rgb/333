@@ -36,6 +36,8 @@ export const rootBridge = {
   showFloatingLog:       (): Promise<string>   => RootBridge.showFloatingLog(),
   hideFloatingLog:       (): Promise<void>     => RootBridge.hideFloatingLog(),
   flushPendingLogs:      (): Promise<string[]> => RootBridge.flushPendingLogs(),
+  startMemoryOverlay:    (pkg: string): Promise<string> => RootBridge.startMemoryOverlay(pkg),
+  stopMemoryOverlay:     (): Promise<string>   => RootBridge.stopMemoryOverlay(),
 };
 
 export const repackBridge = {

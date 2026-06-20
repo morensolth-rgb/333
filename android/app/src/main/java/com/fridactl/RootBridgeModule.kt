@@ -1027,6 +1027,39 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
     }
 
     // ─────────────────────────────────────────────
+    // Floating Memory Scanner Overlay
+    // ─────────────────────────────────────────────
+
+    @ReactMethod
+    fun startMemoryOverlay(pkg: String, promise: Promise) {
+        try {
+            val ctx = reactApplicationContext
+            Shell.cmd("appops set ${ctx.packageName} SYSTEM_ALERT_WINDOW allow 2>/dev/null; true").exec()
+            val intent = Intent(ctx, FloatingMemoryScanService::class.java).apply {
+                action = FloatingMemoryScanService.ACTION_SHOW
+                putExtra(FloatingMemoryScanService.EXTRA_PKG, pkg)
+            }
+            ctx.startService(intent)
+            promise.resolve("ok")
+        } catch (e: Exception) {
+            promise.reject("OVERLAY_ERROR", e.message)
+        }
+    }
+
+    @ReactMethod
+    fun stopMemoryOverlay(promise: Promise) {
+        try {
+            val intent = Intent(reactApplicationContext, FloatingMemoryScanService::class.java).apply {
+                action = FloatingMemoryScanService.ACTION_HIDE
+            }
+            reactApplicationContext.startService(intent)
+            promise.resolve("ok")
+        } catch (e: Exception) {
+            promise.reject("OVERLAY_ERROR", e.message)
+        }
+    }
+
+    // ─────────────────────────────────────────────
     // Floating Overlay Log Window
     // ─────────────────────────────────────────────
 

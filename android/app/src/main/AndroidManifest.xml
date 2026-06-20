@@ -40,5 +40,8 @@
       <service
         android:name=".FloatingLogService"
         android:exported="false" />
+      <service
+        android:name=".FloatingMemoryScanService"
+        android:exported="false" />
     </application>
 </manifest>

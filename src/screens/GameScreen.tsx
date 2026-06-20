@@ -475,287 +475,141 @@ const ANTI_CHEAT_SIGS: {pattern: string; label: string; severity: 'high'|'medium
 ];
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// MEMORY TAB
+// MEMORY TAB  (Floating Overlay — GameGuardian style)
 // ═══════════════════════════════════════════════════════════════════════════════
 function MemoryTab() {
   const [pkg, setPkg] = useState('');
-  const [pid, setPid] = useState('');
-  const [searchVal, setSearchVal] = useState('');
-  const [searchType, setSearchType] = useState<'int32'|'float'|'string'>('int32');
-  const [results, setResults] = useState<MemResult[]>([]);
-  const [regions, setRegions] = useState<MapRegion[]>([]);
-  const [log, setLog] = useState<string[]>([]);
+  const [overlayActive, setOverlayActive] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [frozenAddrs, setFrozenAddrs] = useState<{addr: string; val: string}[]>([]);
-  const freezeRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [log, setLog] = useState<string[]>([]);
 
-  const addLog = (s: string) => setLog(p => [s, ...p.slice(0, 80)]);
+  const addLog = (s: string) => setLog(p => [s, ...p.slice(0, 40)]);
 
-  const resolvePid = async () => {
-    if (!pkg.trim()) { Alert.alert('Enter package name first'); return null; }
-    const out = await rootBridge.execShell(`pidof '${pkg.trim()}' 2>/dev/null | tr ' ' '\n' | head -1`);
-    const p = out.replace('ERR:', '').trim();
-    if (!p || !/^\d+$/.test(p)) {
-      addLog('✗ Process not running: ' + pkg);
-      Alert.alert('Process not running', 'Launch the game first');
-      return null;
-    }
-    setPid(p);
-    addLog('✓ PID: ' + p);
-    return p;
-  };
-
-  const loadMaps = async () => {
+  const launchOverlay = async () => {
+    if (!pkg.trim()) { Alert.alert('Enter package name', 'The overlay will pre-fill it for scanning'); return; }
     setBusy(true);
     try {
-      const p = pid || await resolvePid();
-      if (!p) return;
-      const out = await rootBridge.execShell(`cat /proc/${p}/maps 2>/dev/null | head -200`);
-      if (out.startsWith('ERR:')) { addLog('✗ Cannot read maps: ' + out); return; }
-      const parsed: MapRegion[] = out.split('\n').filter(Boolean).map(line => {
-        const parts = line.split(/\s+/);
-        const [range, perm] = parts;
-        const [start, end] = (range || '').split('-');
-        const name = parts[parts.length - 1] || '[anon]';
-        return {start: start||'', end: end||'', perm: perm||'', name};
-      }).filter(r => r.start && r.end);
-      setRegions(parsed);
-      addLog(`✓ Loaded ${parsed.length} memory regions`);
-    } catch(e: any) { addLog('✗ ' + e.message); }
-    finally { setBusy(false); }
+      await rootBridge.startMemoryOverlay(pkg.trim());
+      setOverlayActive(true);
+      addLog('✓ Memory overlay launched over ' + pkg.trim());
+      addLog('   Drag the overlay window over the game');
+      addLog('   SCAN → finds addresses matching your value');
+      addLog('   NEXT SCAN → narrows down to changed values');
+      addLog('   EDIT → write new value to address');
+      addLog('   FRZ → freeze address at value (1.5s loop)');
+    } catch (e: any) {
+      addLog('✗ ' + (e.message || 'Failed to launch overlay'));
+    } finally {
+      setBusy(false);
+    }
   };
 
-  const scanMemory = async () => {
-    if (!searchVal.trim()) { Alert.alert('Enter search value'); return; }
-    setBusy(true);
-    setResults([]);
+  const closeOverlay = async () => {
     try {
-      const p = pid || await resolvePid();
-      if (!p) return;
-      addLog(`⏳ Scanning PID ${p} for ${searchType}:${searchVal}...`);
-
-      let grepCmd = '';
-      if (searchType === 'string') {
-        // Use grep on /proc/pid/mem regions — strings approach
-        grepCmd = `grep -r -l '${searchVal}' /proc/${p}/fd 2>/dev/null | head -5`;
-        const fdsOut = await rootBridge.execShell(grepCmd);
-        addLog('FDs: ' + fdsOut);
-        // Use scanmem-style: write value to tmp file then scan via dd
-        const script = `
-          /proc/${p}/maps to scan heap/anon regions for string
-          for region in $(cat /proc/${p}/maps | grep -E 'heap|\\[anon\\]' | awk '{print $1}'); do
-            start=$(echo $region | cut -d- -f1)
-            end=$(echo $region | cut -d- -f2)
-            start_dec=$((16#$start))
-            end_dec=$((16#$end))
-            size=$((end_dec - start_dec))
-            if [ $size -gt 0 ] && [ $size -lt 52428800 ]; then
-              dd if=/proc/${p}/mem bs=1 skip=$start_dec count=$size 2>/dev/null | strings | grep -i '${searchVal}' | head -3
-            fi
-          done 2>/dev/null | head -20
-        `;
-        // simplified scan
-        const scanOut = await rootBridge.execShell(
-          `cat /proc/${p}/maps | grep -E 'heap|\\[anon\\]' | head -5 | while read line; do echo "Region: $line"; done`
-        );
-        addLog(scanOut || 'No heap regions found');
-        setResults([{offset:'heap', value: searchVal, region:'heap scan - use Frida for precision'}]);
-      } else {
-        // int32 / float — use a Frida-powered memory scan (most accurate)
-        addLog('⚠ For precise int/float scan, use the Frida Memory script below');
-        // Still show maps so user can pick region
-        const mapsOut = await rootBridge.execShell(
-          `cat /proc/${p}/maps | grep -E 'heap|\\[anon\\]' | head -10`
-        );
-        const mockResults: MemResult[] = mapsOut.split('\n').filter(Boolean).slice(0,5).map(line => {
-          const parts = line.split(/\s+/);
-          return {offset: parts[0]?.split('-')[0] || '0', value: searchVal, region: parts[parts.length-1] || '[anon]'};
-        });
-        setResults(mockResults);
-        addLog(`Found ${mockResults.length} candidate regions (use Frida script for exact offset)`);
-      }
-    } catch(e: any) { addLog('✗ ' + e.message); }
-    finally { setBusy(false); }
-  };
-
-  // Frida-powered int32 scan script
-  const getFridaScanScript = () => `
-Java.perform(function() {
-  send('[Mem] Starting memory scan for value: ${searchVal}');
-});
-
-var TARGET_VALUE = ${searchType === 'int32' ? parseInt(searchVal)||0 : parseFloat(searchVal)||0};
-var TYPE = '${searchType}';
-var results = [];
-
-Process.enumerateRanges('rw-').forEach(function(range) {
-  if (range.size > 50 * 1024 * 1024) return; // skip >50MB regions
-  try {
-    var ptr = range.base;
-    var end = range.base.add(range.size);
-    var step = TYPE === 'float' ? 4 : 4;
-    while (ptr.compare(end) < 0) {
-      var val = TYPE === 'float' ? ptr.readFloat() : ptr.readS32();
-      if (Math.abs(val - TARGET_VALUE) < 0.01) {
-        results.push({addr: ptr.toString(), val: val, region: range.base.toString()});
-        if (results.length >= 50) return;
-      }
-      ptr = ptr.add(step);
-    }
-  } catch(e) {}
-});
-
-send('[Mem] Found ' + results.length + ' matches');
-results.forEach(function(r) {
-  send('[Mem] MATCH @ ' + r.addr + ' = ' + r.val + ' (region: ' + r.region + ')');
-});
-`;
-
-  const writeMemory = async (addr: string, newVal: string) => {
-    if (!addr || !newVal) return;
-    const p = pid;
-    if (!p) { Alert.alert('Get PID first'); return; }
-    // Use dd to write to /proc/pid/mem
-    const decAddr = parseInt(addr, 16);
-    if (isNaN(decAddr)) { Alert.alert('Invalid address'); return; }
-    addLog(`⏳ Writing ${newVal} @ 0x${addr}...`);
-    try {
-      // Write via Frida for precision
-      Alert.alert('Use Frida', `To write memory precisely, use Script tab with:\nptr("${addr}").writeInt(${newVal})`);
-    } catch(e: any) { addLog('✗ ' + e.message); }
-  };
-
-  const toggleFreeze = (addr: string, val: string) => {
-    const exists = frozenAddrs.find(f => f.addr === addr);
-    if (exists) {
-      setFrozenAddrs(p => p.filter(f => f.addr !== addr));
-      addLog(`❄ Unfroze ${addr}`);
-    } else {
-      setFrozenAddrs(p => [...p, {addr, val}]);
-      addLog(`❄ Froze ${addr} = ${val}`);
+      await rootBridge.stopMemoryOverlay();
+      setOverlayActive(false);
+      addLog('Overlay closed');
+    } catch (e: any) {
+      addLog('✗ ' + (e.message || 'Failed to close overlay'));
     }
   };
-
-  useEffect(() => {
-    if (frozenAddrs.length > 0) {
-      freezeRef.current = setInterval(async () => {
-        for (const {addr, val} of frozenAddrs) {
-          // continuous write via Frida not possible here — show note
-          addLog(`[freeze] Keeping ${addr} = ${val} (run Frida freeze script)`);
-        }
-      }, 2000);
-    } else {
-      if (freezeRef.current) { clearInterval(freezeRef.current); freezeRef.current = null; }
-    }
-    return () => { if (freezeRef.current) clearInterval(freezeRef.current); };
-  }, [frozenAddrs]);
 
   return (
-    <KeyboardAvoidingView style={{flex:1}} behavior={Platform.OS==='ios'?'padding':undefined}>
-      <ScrollView style={s.tab} contentContainerStyle={{paddingBottom: 40}}>
-        {/* Package + PID */}
-        <View style={s.card}>
-          <Text style={s.cardTitle}>⚙ Target Process</Text>
-          <TextInput
-            style={s.input} placeholder="Package name (e.g. com.game.xyz)"
-            placeholderTextColor={C.dim} value={pkg} onChangeText={setPkg}
-            autoCapitalize="none" autoCorrect={false}
-          />
-          <View style={s.row}>
-            <TouchableOpacity style={[s.btn, {flex:1}]} onPress={resolvePid}>
-              <Text style={s.btnTxt}>GET PID</Text>
-            </TouchableOpacity>
-            <TouchableOpacity style={[s.btn, {flex:1, marginLeft:8}]} onPress={loadMaps}>
-              <Text style={s.btnTxt}>LOAD MAPS</Text>
-            </TouchableOpacity>
-          </View>
-          {pid ? <Text style={s.pidBadge}>PID: {pid}</Text> : null}
-        </View>
-
-        {/* Search */}
-        <View style={s.card}>
-          <Text style={s.cardTitle}>🔍 Memory Scan</Text>
-          <View style={s.row}>
-            {(['int32','float','string'] as const).map(t => (
-              <TouchableOpacity
-                key={t}
-                style={[s.chip, searchType===t && s.chipActive]}
-                onPress={() => setSearchType(t)}
-              >
-                <Text style={[s.chipTxt, searchType===t && s.chipTxtActive]}>{t}</Text>
-              </TouchableOpacity>
-            ))}
-          </View>
-          <TextInput
-            style={s.input} placeholder={`Value to search (${searchType})`}
-            placeholderTextColor={C.dim} value={searchVal} onChangeText={setSearchVal}
-            keyboardType={searchType==='string'?'default':'numeric'}
-          />
-          <View style={s.row}>
-            <TouchableOpacity style={[s.btn, {flex:1}]} onPress={scanMemory} disabled={busy}>
-              {busy ? <ActivityIndicator color={C.green} size="small"/> : <Text style={s.btnTxt}>SCAN</Text>}
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={[s.btn, {flex:1, marginLeft:8, borderColor:C.yellow}]}
-              onPress={() => Alert.alert('Frida Scan', 'Copy this script to Script tab:\n\n' + getFridaScanScript())}
-            >
-              <Text style={[s.btnTxt, {color:C.yellow}]}>FRIDA SCAN</Text>
-            </TouchableOpacity>
-          </View>
-        </View>
-
-        {/* Results */}
-        {results.length > 0 && (
-          <View style={s.card}>
-            <Text style={s.cardTitle}>📍 Results ({results.length})</Text>
-            {results.map((r, i) => (
-              <View key={i} style={s.resultRow}>
-                <View style={{flex:1}}>
-                  <Text style={s.mono}>0x{r.offset}</Text>
-                  <Text style={[s.mono, {color:C.green, fontSize:11}]}>{r.region}</Text>
-                </View>
-                <Text style={[s.mono, {color:C.yellow, marginRight:8}]}>{r.value}</Text>
-                <TouchableOpacity
-                  style={[s.chip, {borderColor: frozenAddrs.find(f=>f.addr===r.offset) ? C.red : C.dim}]}
-                  onPress={() => toggleFreeze(r.offset, r.value)}
-                >
-                  <Text style={[s.chipTxt, {color: frozenAddrs.find(f=>f.addr===r.offset) ? C.red : C.dim}]}>
-                    {frozenAddrs.find(f=>f.addr===r.offset) ? '❄ FROZEN' : 'FREEZE'}
-                  </Text>
-                </TouchableOpacity>
-              </View>
-            ))}
-          </View>
-        )}
-
-        {/* Regions */}
-        {regions.length > 0 && (
-          <View style={s.card}>
-            <Text style={s.cardTitle}>🗺 Memory Map ({regions.length} regions)</Text>
-            {regions.slice(0,30).map((r, i) => (
-              <View key={i} style={s.mapRow}>
-                <Text style={[s.mono, {color: r.perm.includes('w') ? C.green : C.dim, fontSize:10, flex:1}]}>
-                  {r.start}-{r.end}  {r.perm}
-                </Text>
-                <Text style={[s.mono, {color:C.txt, fontSize:10, flex:1}]} numberOfLines={1}>{r.name}</Text>
-              </View>
-            ))}
-            {regions.length > 30 && <Text style={[s.mono, {color:C.dim, marginTop:4}]}>+{regions.length-30} more...</Text>}
-          </View>
-        )}
-
-        {/* Log */}
-        <View style={s.card}>
-          <Text style={s.cardTitle}>📋 Log</Text>
-          {log.slice(0,20).map((l, i) => (
-            <Text key={i} style={[s.mono, {fontSize:11, color:l.startsWith('✗')?C.red:C.txt}]}>{l}</Text>
+    <ScrollView style={s.tab} contentContainerStyle={{paddingBottom: 40}}>
+      {/* How it works */}
+      <View style={[s.card, {borderColor: C.green2}]}>
+        <Text style={[s.cardTitle, {color: C.green}]}>🎮 GameGuardian-Style Memory Scanner</Text>
+        <Text style={[s.txt, {marginBottom: 6, lineHeight: 18}]}>
+          {'A draggable overlay window floats above the running game.
+' +
+           'Scan for values, narrow them down with NEXT SCAN, then edit or freeze.'}
+        </Text>
+        <View style={{flexDirection:'row', flexWrap:'wrap', gap:6, marginBottom:4}}>
+          {['int32','float','string'].map(t => (
+            <View key={t} style={[s.chip, {borderColor: C.green}]}>
+              <Text style={[s.chipTxt, {color: C.green}]}>{t}</Text>
+            </View>
+          ))}
+          {['SCAN','NEXT SCAN','EDIT','FREEZE'].map(t => (
+            <View key={t} style={[s.chip, {borderColor: C.dim}]}>
+              <Text style={[s.chipTxt, {color: C.dim}]}>{t}</Text>
+            </View>
           ))}
         </View>
-      </ScrollView>
-    </KeyboardAvoidingView>
+      </View>
+
+      {/* Target package */}
+      <View style={s.card}>
+        <Text style={s.cardTitle}>🎯 Target Game</Text>
+        <TextInput
+          style={s.input}
+          placeholder="Package name (e.g. com.game.xyz)"
+          placeholderTextColor={C.dim}
+          value={pkg}
+          onChangeText={setPkg}
+          autoCapitalize="none"
+          autoCorrect={false}
+        />
+        <Text style={[s.mono, {color: C.dim, fontSize: 10, marginBottom: 8}]}>
+          {'Launch the game first, then open the overlay.
+The overlay will stay visible while you play.'}
+        </Text>
+      </View>
+
+      {/* Launch / Close button */}
+      <View style={s.card}>
+        {!overlayActive ? (
+          <TouchableOpacity
+            style={[s.btn, {paddingVertical: 14, borderColor: C.green}]}
+            onPress={launchOverlay}
+            disabled={busy}
+          >
+            {busy
+              ? <ActivityIndicator color={C.green} size="small" />
+              : (
+                <View style={{alignItems: 'center'}}>
+                  <Text style={[s.btnTxt, {fontSize: 15}]}>🧠 LAUNCH MEMORY OVERLAY</Text>
+                  <Text style={[s.mono, {color: C.dim, fontSize: 10, marginTop: 4}]}>
+                    Floats above the game • draggable • scan / edit / freeze
+                  </Text>
+                </View>
+              )
+            }
+          </TouchableOpacity>
+        ) : (
+          <View>
+            <View style={[s.card, {borderColor: C.green, marginBottom: 8}]}>
+              <Text style={[s.cardTitle, {color: C.green}]}>✓ Overlay is Active</Text>
+              <Text style={[s.txt, {marginBottom: 8}]}>
+                The scanner window is floating above your game.{'
+'}
+                Switch to the game — the overlay stays on top.
+              </Text>
+            </View>
+            <TouchableOpacity
+              style={[s.btn, {borderColor: C.red}]}
+              onPress={closeOverlay}
+            >
+              <Text style={[s.btnTxt, {color: C.red}]}>✕ CLOSE OVERLAY</Text>
+            </TouchableOpacity>
+          </View>
+        )}
+      </View>
+
+      {/* Log */}
+      {log.length > 0 && (
+        <View style={s.card}>
+          <Text style={s.cardTitle}>📋 Log</Text>
+          {log.map((l, i) => (
+            <Text key={i} style={[s.mono, {fontSize: 11, color: l.startsWith('✗') ? C.red : l.startsWith('✓') ? C.green : C.txt}]}>
+              {l}
+            </Text>
+          ))}
+        </View>
+      )}
+    </ScrollView>
   );
 }
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // SCRIPTS TAB
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -821,14 +675,205 @@ function ScriptsTab() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// ANTI-DETECTION TAB
+// ANTI-DETECTION TAB  (Device Spoofer + Carrier + GPS)
 // ═══════════════════════════════════════════════════════════════════════════════
+
+// ── Real device profiles ──────────────────────────────────────────────────────
+const REAL_DEVICES = [
+  {
+    label: 'Samsung Galaxy S24 Ultra',
+    fingerprint: 'samsung/SM-S928B/SM-S928B:14/UP1A.231005.007/S928BXXS2AXK5:user/release-keys',
+    model: 'SM-S928B', manufacturer: 'samsung', brand: 'samsung',
+    device: 'e3q', product: 'SM-S928B', hardware: 'exynos2400',
+    imei: '358971120234567',
+  },
+  {
+    label: 'Samsung Galaxy S24',
+    fingerprint: 'samsung/SM-S921B/SM-S921B:14/UP1A.231005.007/S921BXXU3AXK2:user/release-keys',
+    model: 'SM-S921B', manufacturer: 'samsung', brand: 'samsung',
+    device: 'e1s', product: 'SM-S921B', hardware: 'exynos2400',
+    imei: '357921100234561',
+  },
+  {
+    label: 'Samsung Galaxy S23+',
+    fingerprint: 'samsung/SM-S916B/SM-S916B:13/TP1A.220624.014/S916BXXU5CWK1:user/release-keys',
+    model: 'SM-S916B', manufacturer: 'samsung', brand: 'samsung',
+    device: 'q5q', product: 'SM-S916B', hardware: 'exynos2200',
+    imei: '354821090876543',
+  },
+  {
+    label: 'Samsung Galaxy A54 5G',
+    fingerprint: 'samsung/SM-A546B/SM-A546B:13/TP1A.220624.014/A546BXXU3CWK1:user/release-keys',
+    model: 'SM-A546B', manufacturer: 'samsung', brand: 'samsung',
+    device: 'a54x', product: 'SM-A546B', hardware: 'exynos1380',
+    imei: '352314110987654',
+  },
+  {
+    label: 'Google Pixel 8 Pro',
+    fingerprint: 'google/husky/husky:14/AP1A.240405.002/11480754:user/release-keys',
+    model: 'Pixel 8 Pro', manufacturer: 'Google', brand: 'google',
+    device: 'husky', product: 'husky', hardware: 'husky',
+    imei: '351826110345678',
+  },
+  {
+    label: 'Google Pixel 8',
+    fingerprint: 'google/shiba/shiba:14/AP1A.240405.002/11480754:user/release-keys',
+    model: 'Pixel 8', manufacturer: 'Google', brand: 'google',
+    device: 'shiba', product: 'shiba', hardware: 'shiba',
+    imei: '357821090765432',
+  },
+  {
+    label: 'Google Pixel 7',
+    fingerprint: 'google/panther/panther:13/TQ3A.230901.001/10750268:user/release-keys',
+    model: 'Pixel 7', manufacturer: 'Google', brand: 'google',
+    device: 'panther', product: 'panther', hardware: 'tangorpro',
+    imei: '354128090876541',
+  },
+  {
+    label: 'OnePlus 12',
+    fingerprint: 'OnePlus/CPH2583/OP5929L1:14/UP1A.231005.007/V14.0.0.160:user/release-keys',
+    model: 'CPH2583', manufacturer: 'OnePlus', brand: 'OnePlus',
+    device: 'OP5929L1', product: 'CPH2583', hardware: 'kalama',
+    imei: '869547050234567',
+  },
+  {
+    label: 'Xiaomi 14 Pro',
+    fingerprint: 'Xiaomi/shennong/shennong:14/UP1A.231005.007/V14.0.6.0.UNCMIXM:user/release-keys',
+    model: '23116PN5BC', manufacturer: 'Xiaomi', brand: 'Xiaomi',
+    device: 'shennong', product: 'shennong', hardware: 'sm8650',
+    imei: '867821050123456',
+  },
+  {
+    label: 'Redmi Note 13 Pro',
+    fingerprint: 'Redmi/garnet/garnet:13/TP1A.220624.014/V14.0.8.0.TMGMIXM:user/release-keys',
+    model: '23090RA98G', manufacturer: 'Xiaomi', brand: 'Redmi',
+    device: 'garnet', product: 'garnet', hardware: 'mt6789',
+    imei: '353724110234987',
+  },
+  {
+    label: 'Motorola Edge 40 Pro',
+    fingerprint: 'motorola/rtwo/rtwo:13/T1TAS33.73-22/36:user/release-keys',
+    model: 'XT2301-4', manufacturer: 'motorola', brand: 'motorola',
+    device: 'rtwo', product: 'rtwo_g', hardware: 'sm8550',
+    imei: '352178090765984',
+  },
+];
+
+// ── US Carrier profiles ───────────────────────────────────────────────────────
+const US_CARRIERS = [
+  { label: 'AT&T',     operator: '310410', operatorName: 'AT&T',     simSerial: '8901410123456789012' },
+  { label: 'Verizon',  operator: '311480', operatorName: 'Verizon',  simSerial: '8901260987654321098' },
+  { label: 'T-Mobile', operator: '310260', operatorName: 'T-Mobile', simSerial: '8901260123456789013' },
+  { label: 'Sprint',   operator: '312250', operatorName: 'Sprint',   simSerial: '8901260123456789014' },
+  { label: 'US Cellular', operator: '311220', operatorName: 'US Cellular', simSerial: '8901220123456789015' },
+  { label: 'Mint Mobile', operator: '310260', operatorName: 'Mint',  simSerial: '8901260123456789016' },
+  { label: 'Cricket',  operator: '310410', operatorName: 'Cricket',  simSerial: '8901410123456789017' },
+  { label: 'Boost',    operator: '311580', operatorName: 'Boost Mobile', simSerial: '8901580123456789018' },
+];
+
+// ── US GPS locations ──────────────────────────────────────────────────────────
+const US_LOCATIONS = [
+  { label: 'New York, NY',     lat: 40.7128,  lon: -74.0060 },
+  { label: 'Los Angeles, CA',  lat: 34.0522,  lon: -118.2437 },
+  { label: 'Chicago, IL',      lat: 41.8781,  lon: -87.6298 },
+  { label: 'Houston, TX',      lat: 29.7604,  lon: -95.3698 },
+  { label: 'Phoenix, AZ',      lat: 33.4484,  lon: -112.0740 },
+  { label: 'Philadelphia, PA', lat: 39.9526,  lon: -75.1652 },
+  { label: 'San Antonio, TX',  lat: 29.4241,  lon: -98.4936 },
+  { label: 'San Diego, CA',    lat: 32.7157,  lon: -117.1611 },
+  { label: 'Dallas, TX',       lat: 32.7767,  lon: -96.7970 },
+  { label: 'San Jose, CA',     lat: 37.3382,  lon: -121.8863 },
+];
+
+// ── Frida script generator ────────────────────────────────────────────────────
+function buildSpoofScript(
+  device: typeof REAL_DEVICES[0],
+  carrier: typeof US_CARRIERS[0],
+  location: typeof US_LOCATIONS[0],
+) {
+  return `Java.perform(function () {
+  // ── Build / Device ──────────────────────────────────────────────────────────
+  var Build = Java.use('android.os.Build');
+  Build.FINGERPRINT.value  = '${device.fingerprint}';
+  Build.MODEL.value        = '${device.model}';
+  Build.MANUFACTURER.value = '${device.manufacturer}';
+  Build.BRAND.value        = '${device.brand}';
+  Build.DEVICE.value       = '${device.device}';
+  Build.PRODUCT.value      = '${device.product}';
+  Build.HARDWARE.value     = '${device.hardware}';
+  Build.TAGS.value         = 'release-keys';
+  Build.TYPE.value         = 'user';
+  send('[Spoof] Build → ${device.label}');
+
+  // ── TelephonyManager / Carrier ──────────────────────────────────────────────
+  try {
+    var TM = Java.use('android.telephony.TelephonyManager');
+    TM.getDeviceId.overload().implementation                = function() { return '${device.imei}'; };
+    TM.getImei.overload().implementation                    = function() { return '${device.imei}'; };
+    TM.getImei.overload('int').implementation               = function() { return '${device.imei}'; };
+    TM.getSimSerialNumber.overload().implementation         = function() { return '${carrier.simSerial}'; };
+    TM.getNetworkOperator.overload().implementation         = function() { return '${carrier.operator}'; };
+    TM.getNetworkOperatorName.overload().implementation     = function() { return '${carrier.operatorName}'; };
+    TM.getSimOperator.overload().implementation             = function() { return '${carrier.operator}'; };
+    TM.getSimOperatorName.overload().implementation         = function() { return '${carrier.operatorName}'; };
+    TM.getNetworkCountryIso.overload().implementation       = function() { return 'us'; };
+    TM.getSimCountryIso.overload().implementation           = function() { return 'us'; };
+    TM.getPhoneType.overload().implementation               = function() { return 1; }; // GSM
+    send('[Spoof] Carrier → ${carrier.label} (${carrier.operator})');
+  } catch(e) { send('[Spoof] TelephonyManager error: ' + e); }
+
+  // ── ANDROID_ID ──────────────────────────────────────────────────────────────
+  try {
+    var Secure = Java.use('android.provider.Settings$Secure');
+    Secure.getString.implementation = function(cr, name) {
+      if (name === 'android_id') return 'b3f2a1c4d5e6f708';
+      return this.getString(cr, name);
+    };
+    send('[Spoof] ANDROID_ID spoofed');
+  } catch(e) {}
+
+  // ── GPS Location ────────────────────────────────────────────────────────────
+  try {
+    var Location = Java.use('android.location.Location');
+    Location.getLatitude.implementation  = function() { return ${location.lat}; };
+    Location.getLongitude.implementation = function() { return ${location.lon}; };
+    Location.getAccuracy.implementation  = function() { return 4.2; };
+    Location.getAltitude.implementation  = function() { return 12.0; };
+    Location.hasAccuracy.implementation  = function() { return true; };
+    send('[Spoof] GPS → ${location.label} (${location.lat}, ${location.lon})');
+  } catch(e) { send('[Spoof] Location error: ' + e); }
+
+  // ── LocationManager ─────────────────────────────────────────────────────────
+  try {
+    var LM = Java.use('android.location.LocationManager');
+    LM.getLastKnownLocation.overload('java.lang.String').implementation = function(provider) {
+      var loc = this.getLastKnownLocation(provider);
+      if (loc !== null) {
+        loc.setLatitude(${location.lat});
+        loc.setLongitude(${location.lon});
+      }
+      return loc;
+    };
+  } catch(e) {}
+
+  send('[Spoof] ✓ All hooks active — Device: ${device.label} | Carrier: ${carrier.label} | GPS: ${location.label}');
+});`;
+}
+
 function AntiDetTab() {
   const navigation = useNavigation<any>();
   const [pkg, setPkg] = useState('');
   const [busy, setBusy] = useState<string|null>(null);
   const [log, setLog] = useState<string[]>([]);
   const [activeProfile, setActiveProfile] = useState<string|null>(null);
+
+  // Spoofer state
+  const [selectedDevice, setSelectedDevice] = useState(0);
+  const [selectedCarrier, setSelectedCarrier] = useState(0);
+  const [selectedLocation, setSelectedLocation] = useState(0);
+  const [showDevicePicker, setShowDevicePicker] = useState(false);
+  const [showCarrierPicker, setShowCarrierPicker] = useState(false);
+  const [showLocationPicker, setShowLocationPicker] = useState(false);
 
   const addLog = (s: string) => setLog(p => [s, ...p.slice(0, 60)]);
 
@@ -842,14 +887,35 @@ function AntiDetTab() {
     addLog(`▶ Running profile: ${profile.title}`);
 
     try {
-      // Combine all scripts in profile
       const combined = profile.scripts.map(sid => {
         const sc = SCRIPT_LIBRARY.find(s => s.id === sid);
-        return sc ? `// ── ${sc.title} ──\n${sc.code}` : '';
-      }).filter(Boolean).join('\n\n');
+        return sc ? `// ── ${sc.title} ──
+${sc.code}` : '';
+      }).filter(Boolean).join('
+
+');
 
       addLog(`📝 Injecting ${profile.scripts.length} scripts into ${pkg}`);
       const result = await rootBridge.runScript(pkg.trim(), combined, 'pid');
+      addLog('✓ ' + result);
+    } catch(e: any) {
+      addLog('✗ ' + e.message);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const injectSpoof = async () => {
+    if (!pkg.trim()) { Alert.alert('Enter target package name'); return; }
+    setBusy('spoof');
+    const device   = REAL_DEVICES[selectedDevice];
+    const carrier  = US_CARRIERS[selectedCarrier];
+    const location = US_LOCATIONS[selectedLocation];
+    addLog(`▶ Injecting device spoof: ${device.label}`);
+    addLog(`   Carrier: ${carrier.label}  GPS: ${location.label}`);
+    try {
+      const script = buildSpoofScript(device, carrier, location);
+      const result = await rootBridge.runScript(pkg.trim(), script, 'pid');
       addLog('✓ ' + result);
     } catch(e: any) {
       addLog('✗ ' + e.message);
@@ -886,8 +952,48 @@ function AntiDetTab() {
     finally { setBusy(null); }
   };
 
+  const Picker = ({
+    visible, items, selected, onSelect, onClose,
+  }: {
+    visible: boolean;
+    items: {label: string}[];
+    selected: number;
+    onSelect: (i: number) => void;
+    onClose: () => void;
+  }) => (
+    <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
+      <View style={{flex:1, backgroundColor:'rgba(0,0,0,0.7)', justifyContent:'flex-end'}}>
+        <View style={{backgroundColor:C.card, borderTopWidth:1, borderTopColor:C.border, maxHeight:'60%'}}>
+          <View style={[s.row, {padding:12, borderBottomWidth:1, borderBottomColor:C.border}]}>
+            <Text style={[s.cardTitle, {flex:1, marginBottom:0}]}>Select</Text>
+            <TouchableOpacity onPress={onClose}><Text style={{color:C.red, fontSize:18}}>✕</Text></TouchableOpacity>
+          </View>
+          <ScrollView>
+            {items.map((item, i) => (
+              <TouchableOpacity
+                key={i}
+                style={[{padding:12, borderBottomWidth:1, borderBottomColor:C.border},
+                  selected===i && {backgroundColor:C.green2}]}
+                onPress={() => { onSelect(i); onClose(); }}
+              >
+                <Text style={[s.mono, {color: selected===i ? C.green : C.txt}]}>
+                  {selected===i ? '▶ ' : '  '}{item.label}
+                </Text>
+              </TouchableOpacity>
+            ))}
+          </ScrollView>
+        </View>
+      </View>
+    </Modal>
+  );
+
   return (
     <ScrollView style={s.tab} contentContainerStyle={{paddingBottom:40}}>
+      {/* Pickers */}
+      <Picker visible={showDevicePicker}   items={REAL_DEVICES}    selected={selectedDevice}   onSelect={setSelectedDevice}   onClose={() => setShowDevicePicker(false)} />
+      <Picker visible={showCarrierPicker}  items={US_CARRIERS}     selected={selectedCarrier}  onSelect={setSelectedCarrier}  onClose={() => setShowCarrierPicker(false)} />
+      <Picker visible={showLocationPicker} items={US_LOCATIONS}    selected={selectedLocation} onSelect={setSelectedLocation} onClose={() => setShowLocationPicker(false)} />
+
       {/* Target */}
       <View style={s.card}>
         <Text style={s.cardTitle}>🎯 Target Package</Text>
@@ -898,44 +1004,93 @@ function AntiDetTab() {
         />
       </View>
 
+      {/* ── Device Spoofer ── */}
+      <View style={s.card}>
+        <Text style={s.cardTitle}>📱 Device Spoofer</Text>
+        <Text style={[s.mono, {color:C.dim, fontSize:10, marginBottom:8}]}>
+          Spoofs Build props + IMEI + carrier + GPS to a real US device profile.
+        </Text>
+
+        {/* Device picker row */}
+        <Text style={[s.mono, {color:C.green, fontSize:10, marginBottom:4}]}>DEVICE</Text>
+        <TouchableOpacity
+          style={[s.input, {flexDirection:'row', alignItems:'center', marginBottom:8}]}
+          onPress={() => setShowDevicePicker(true)}
+        >
+          <Text style={[s.mono, {color:C.white, flex:1, fontSize:12}]}>
+            {REAL_DEVICES[selectedDevice].label}
+          </Text>
+          <Text style={{color:C.dim}}>▼</Text>
+        </TouchableOpacity>
+
+        {/* Device fingerprint preview */}
+        <ScrollView horizontal style={{marginBottom:10}}>
+          <Text style={[s.mono, {color:C.dim, fontSize:9}]}>
+            {REAL_DEVICES[selectedDevice].fingerprint}
+          </Text>
+        </ScrollView>
+
+        {/* Carrier picker row */}
+        <Text style={[s.mono, {color:C.green, fontSize:10, marginBottom:4}]}>CARRIER (US)</Text>
+        <TouchableOpacity
+          style={[s.input, {flexDirection:'row', alignItems:'center', marginBottom:8}]}
+          onPress={() => setShowCarrierPicker(true)}
+        >
+          <Text style={[s.mono, {color:C.white, flex:1, fontSize:12}]}>
+            {US_CARRIERS[selectedCarrier].label}  ({US_CARRIERS[selectedCarrier].operator})
+          </Text>
+          <Text style={{color:C.dim}}>▼</Text>
+        </TouchableOpacity>
+
+        {/* GPS picker row */}
+        <Text style={[s.mono, {color:C.green, fontSize:10, marginBottom:4}]}>GPS LOCATION (US)</Text>
+        <TouchableOpacity
+          style={[s.input, {flexDirection:'row', alignItems:'center', marginBottom:12}]}
+          onPress={() => setShowLocationPicker(true)}
+        >
+          <Text style={[s.mono, {color:C.white, flex:1, fontSize:12}]}>
+            📍 {US_LOCATIONS[selectedLocation].label}
+          </Text>
+          <Text style={[s.mono, {color:C.dim, fontSize:10}]}>
+            {US_LOCATIONS[selectedLocation].lat.toFixed(4)}, {US_LOCATIONS[selectedLocation].lon.toFixed(4)}
+          </Text>
+          <Text style={{color:C.dim, marginLeft:6}}>▼</Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          style={[s.btn, busy==='spoof' && {borderColor:C.dim}]}
+          onPress={injectSpoof}
+          disabled={!!busy}
+        >
+          {busy==='spoof'
+            ? <ActivityIndicator color={C.green} size="small"/>
+            : <Text style={s.btnTxt}>▶ INJECT DEVICE SPOOF</Text>
+          }
+        </TouchableOpacity>
+      </View>
+
       {/* Quick actions */}
       <View style={s.card}>
         <Text style={s.cardTitle}>⚡ Quick System Actions</Text>
         <View style={s.row}>
-          <TouchableOpacity
-            style={[s.btn, {flex:1}]}
-            onPress={() => quickAction('ptrace_off')} disabled={!!busy}
-          >
-            {busy==='ptrace_off' ? <ActivityIndicator color={C.green} size="small"/> :
-              <Text style={s.btnTxt}>PTRACE OFF</Text>}
+          <TouchableOpacity style={[s.btn, {flex:1}]} onPress={() => quickAction('ptrace_off')} disabled={!!busy}>
+            {busy==='ptrace_off' ? <ActivityIndicator color={C.green} size="small"/> : <Text style={s.btnTxt}>PTRACE OFF</Text>}
           </TouchableOpacity>
-          <TouchableOpacity
-            style={[s.btn, {flex:1, marginLeft:8}]}
-            onPress={() => quickAction('selinux_perm')} disabled={!!busy}
-          >
-            {busy==='selinux_perm' ? <ActivityIndicator color={C.green} size="small"/> :
-              <Text style={s.btnTxt}>SELINUX PERM</Text>}
+          <TouchableOpacity style={[s.btn, {flex:1, marginLeft:8}]} onPress={() => quickAction('selinux_perm')} disabled={!!busy}>
+            {busy==='selinux_perm' ? <ActivityIndicator color={C.green} size="small"/> : <Text style={s.btnTxt}>SELINUX PERM</Text>}
           </TouchableOpacity>
         </View>
         <View style={[s.row, {marginTop:8}]}>
-          <TouchableOpacity
-            style={[s.btn, {flex:1}]}
-            onPress={() => quickAction('hide_magisk')} disabled={!!busy}
-          >
-            {busy==='hide_magisk' ? <ActivityIndicator color={C.green} size="small"/> :
-              <Text style={s.btnTxt}>HIDE MAGISK</Text>}
+          <TouchableOpacity style={[s.btn, {flex:1}]} onPress={() => quickAction('hide_magisk')} disabled={!!busy}>
+            {busy==='hide_magisk' ? <ActivityIndicator color={C.green} size="small"/> : <Text style={s.btnTxt}>HIDE MAGISK</Text>}
           </TouchableOpacity>
-          <TouchableOpacity
-            style={[s.btn, {flex:1, marginLeft:8}]}
-            onPress={() => quickAction('clear_detect_cache')} disabled={!!busy}
-          >
-            {busy==='clear_detect_cache' ? <ActivityIndicator color={C.green} size="small"/> :
-              <Text style={s.btnTxt}>CLEAR CACHE</Text>}
+          <TouchableOpacity style={[s.btn, {flex:1, marginLeft:8}]} onPress={() => quickAction('clear_detect_cache')} disabled={!!busy}>
+            {busy==='clear_detect_cache' ? <ActivityIndicator color={C.green} size="small"/> : <Text style={s.btnTxt}>CLEAR CACHE</Text>}
           </TouchableOpacity>
         </View>
       </View>
 
-      {/* Profiles */}
+      {/* Stealth Profiles */}
       <Text style={[s.cardTitle, {marginHorizontal:12, marginTop:8}]}>🛡 Stealth Profiles</Text>
       {ANTI_DET_PROFILES.map(profile => (
         <View key={profile.id} style={[s.card, activeProfile===profile.id && {borderColor:C.green}]}>
@@ -976,7 +1131,6 @@ function AntiDetTab() {
     </ScrollView>
   );
 }
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // INSPECTOR TAB
 // ═══════════════════════════════════════════════════════════════════════════════
