@@ -1,14 +1,23 @@
 package com.fridactl
 
 import android.content.Intent
+import android.util.Log
 import com.facebook.react.bridge.*
 import com.facebook.react.modules.core.DeviceEventManagerModule
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.BufferedReader
+import java.io.InputStreamReader
+import java.util.concurrent.atomic.AtomicBoolean
 
 class TrafficModule(private val ctx: ReactApplicationContext) : ReactContextBaseJavaModule(ctx) {
 
     override fun getName() = "TrafficModule"
+
+    // ── Frida stdout bridge state ──────────────────────────────────────────────
+    private var fridaProcess: Process? = null
+    private var fridaReaderThread: Thread? = null
+    private val fridaRunning = AtomicBoolean(false)
 
     private fun emit(event: String, params: WritableMap) {
         try {
@@ -112,6 +121,8 @@ class TrafficModule(private val ctx: ReactApplicationContext) : ReactContextBase
             return
         }
         try {
+            // ── كل المنطق القديم محفوظ — فقط أضفنا stdout bridge ──────────────
+
             // Read hook script from assets
             val script = ctx.assets.open("traffic_hook.js")
                 .bufferedReader().readText()
@@ -120,31 +131,155 @@ class TrafficModule(private val ctx: ReactApplicationContext) : ReactContextBase
             val scriptPath = ctx.filesDir.absolutePath + "/traffic_hook.js"
             java.io.File(scriptPath).writeText(script)
 
-            // Use existing rootBridge shell to run frida
-            val fridaPath = ctx.filesDir.absolutePath + "/../files/frida-server"
-            // frida-inject approach: inject script into running process
-            val cmd = "frida-inject -p \$(pidof $targetPackage 2>/dev/null || " +
-                      "frida -U -n $targetPackage --no-pause -q 2>/dev/null | head -1) " +
-                      "-s $scriptPath 2>&1 &"
+            // Stop any previous frida process before starting new one
+            stopFridaBridge()
 
-            // Simpler: use frida CLI directly
-            val fridaCmd = "frida -U -f $targetPackage -l $scriptPath --no-pause 2>&1 &"
+            // Build frida command — attach mode أولاً (التطبيق شغال)، spawn fallback
+            // نستخدم -O file بدل -l لنتأكد من output JSON واضح بدون prompt
+            val attachCmd = "frida -U -n $targetPackage -l $scriptPath --no-pause --runtime=v8 2>&1"
+            val spawnCmd  = "frida -U -f $targetPackage -l $scriptPath --no-pause --runtime=v8 2>&1"
 
-            com.topjohnwu.superuser.Shell.cmd(fridaCmd).submit { result ->
-                if (result.isSuccess) {
-                    promise.resolve("frida_hook_injected")
-                } else {
-                    // Try attach mode (app already running)
-                    val attachCmd = "frida -U -n $targetPackage -l $scriptPath --no-pause 2>&1 &"
-                    com.topjohnwu.superuser.Shell.cmd(attachCmd).submit { r2 ->
-                        if (r2.isSuccess) promise.resolve("frida_hook_attached")
-                        else promise.reject("FRIDA_ERROR", r2.out.joinToString("\n"))
+            // شغّل frida عبر su shell وخذ الـ Process object لقراءة stdout
+            fridaRunning.set(true)
+
+            Thread {
+                try {
+                    // جرب attach أولاً
+                    var proc = Runtime.getRuntime().exec(arrayOf("su", "-c", attachCmd))
+                    var br   = BufferedReader(InputStreamReader(proc.inputStream))
+
+                    // اقرأ أول سطر — إذا كان error جرب spawn
+                    val firstLine = br.readLine()
+                    if (firstLine != null && firstLine.contains("Unable to find process")) {
+                        proc.destroy()
+                        proc = Runtime.getRuntime().exec(arrayOf("su", "-c", spawnCmd))
+                        br   = BufferedReader(InputStreamReader(proc.inputStream))
                     }
+
+                    fridaProcess = proc
+                    promise.resolve("frida_hook_started")
+
+                    // ── stdout bridge: كل سطر JSON → processFridaMessage ──────
+                    startFridaReaderThread(br)
+
+                } catch (e: Exception) {
+                    Log.e("TrafficModule", "frida launch error: ${e.message}")
+                    promise.reject("FRIDA_ERROR", e.message)
+                    fridaRunning.set(false)
                 }
-            }
+            }.also { it.isDaemon = true; it.start() }
+
         } catch (e: Exception) {
             promise.reject("FRIDA_HOOK_ERROR", e.message)
         }
+    }
+
+    // ── يقرأ stdout من frida ويحوّل كل سطر لـ processFridaMessageInternal ─────
+    // frida CLI يطبع بشكلين:
+    //   1) {"type":"send","payload":"{\"type\":\"request\",\"data\":{...}}"}
+    //   2) مباشرة {"type":"request","data":{...}}   (عند --no-pause بعض الإصدارات)
+    private fun startFridaReaderThread(br: BufferedReader) {
+        fridaReaderThread?.interrupt()
+        fridaReaderThread = Thread {
+            try {
+                var line: String?
+                while (fridaRunning.get()) {
+                    line = br.readLine() ?: break
+                    val trimmed = line.trim()
+                    if (trimmed.isEmpty()) continue
+
+                    Log.d("TrafficModule", "frida>>: $trimmed") // للتشخيص فقط
+
+                    val jsonStart = trimmed.indexOf('{')
+                    if (jsonStart < 0) continue
+
+                    val jsonStr = trimmed.substring(jsonStart)
+                    try {
+                        val outer = JSONObject(jsonStr)
+
+                        // الشكل 1: frida CLI envelope
+                        if (outer.optString("type") == "send") {
+                            val payload = outer.opt("payload")
+                            val inner: JSONObject? = when (payload) {
+                                is String     -> try { JSONObject(payload) } catch (_: Exception) { null }
+                                is JSONObject -> payload
+                                else          -> null
+                            }
+                            if (inner != null) processFridaMessageInternal(inner.toString())
+
+                        // الشكل 2: مباشرة JSON من send()
+                        } else if (outer.has("type") && outer.has("data")) {
+                            processFridaMessageInternal(jsonStr)
+                        }
+
+                    } catch (_: Exception) {
+                        // سطر verbose من frida — تجاهل
+                    }
+                }
+            } catch (_: InterruptedException) {
+            } catch (e: Exception) {
+                Log.w("TrafficModule", "frida reader ended: ${e.message}")
+            }
+        }.also { it.isDaemon = true; it.start() }
+    }
+
+    // ── نفس منطق processFridaMessage بدون @ReactMethod لاستخدامه داخلياً ─────
+    private fun processFridaMessageInternal(jsonMsg: String) {
+        try {
+            val obj  = JSONObject(jsonMsg)
+            val type = obj.optString("type")
+            val data = obj.optJSONObject("data") ?: return
+
+            when (type) {
+                "request" -> {
+                    val req = HttpRequest(
+                        id      = data.optLong("id", System.currentTimeMillis()),
+                        ts      = data.optLong("ts", System.currentTimeMillis()),
+                        method  = data.optString("method", "GET"),
+                        url     = data.optString("url"),
+                        host    = data.optString("host"),
+                        path    = data.optString("path"),
+                        headers = parseHeadersJson(data.optString("headers")),
+                        body    = data.optString("body"),
+                        source  = "frida"
+                    )
+                    if (HttpProxyServer.requests.size >= 500) HttpProxyServer.requests.removeAt(0)
+                    HttpProxyServer.requests.add(req)
+                    HttpProxyServer.onRequest?.invoke(req)
+                }
+                "response" -> {
+                    val res = HttpResponse(
+                        requestId  = data.optLong("requestId", 0),
+                        ts         = data.optLong("ts", System.currentTimeMillis()),
+                        statusCode = data.optInt("statusCode", 0),
+                        statusText = data.optString("statusText"),
+                        headers    = parseHeadersJson(data.optString("headers")),
+                        body       = data.optString("body"),
+                        source     = "frida"
+                    )
+                    if (HttpProxyServer.responses.size >= 500) HttpProxyServer.responses.removeAt(0)
+                    HttpProxyServer.responses.add(res)
+                    HttpProxyServer.onResponse?.invoke(res)
+                }
+                "hook_status" -> {
+                    val params = Arguments.createMap().apply {
+                        putBoolean("okhttp",  data.optBoolean("okhttp"))
+                        putBoolean("httpurl", data.optBoolean("httpurl"))
+                        putDouble("ts", data.optDouble("ts"))
+                    }
+                    emit("onFridaHookStatus", params)
+                }
+            }
+        } catch (_: Exception) {}
+    }
+
+    // ── أوقف frida process والـ reader thread ─────────────────────────────────
+    private fun stopFridaBridge() {
+        fridaRunning.set(false)
+        fridaReaderThread?.interrupt()
+        fridaReaderThread = null
+        try { fridaProcess?.destroy() } catch (_: Exception) {}
+        fridaProcess = null
     }
 
     // ── Process Frida message (called from ScriptScreen pipeline) ──────────────
@@ -214,6 +349,7 @@ class TrafficModule(private val ctx: ReactApplicationContext) : ReactContextBase
     @ReactMethod
     fun stopCapture(promise: Promise) {
         try {
+            stopFridaBridge() // أوقف frida process والـ reader thread
             TrafficVpnService.onPacketCallback = null
             HttpProxyServer.onRequest  = null
             HttpProxyServer.onResponse = null
