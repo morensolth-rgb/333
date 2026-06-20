@@ -42,141 +42,168 @@ const BUILTIN_SCRIPTS: BuiltinScript[] = [
     id: 'builtin_appsflyer',
     name: 'AppsFlyer Bypass',
     tag: 'Tracking',
-    code: `// ── AppsFlyer Event Monitor & Rename ──────────────────────────────
-// Hooks logEvent — intercepts event name + params in real time.
-// Edit AF_RENAME_MAP to rename events before they fire:
-//   e.g. { "af_purchase": "af_view_item" }
-// Set AF_BLOCK = ["af_purchase"] to silently drop specific events.
-var AF_RENAME_MAP = {};
-var AF_BLOCK     = [];
+    code: `// ── AppsFlyer Deep Bypass (AES payload level) ─────────────────────
+// يلتقط الـ payload قبل التشفير مباشرة ويعدل eventName
+// ─── إعدادات التعديل ───────────────────────────────────────────────
+var NEW_EVENT_NAME = "level_20"; // ← غير هون
+// ──────────────────────────────────────────────────────────────────
 
 Java.perform(function () {
-  try {
-    var AFL = Java.use("com.appsflyer.AppsFlyerLib");
+  var Cipher        = Java.use("javax.crypto.Cipher");
+  var SecretKeySpec = Java.use("javax.crypto.spec.SecretKeySpec");
+  var IvParameterSpec = Java.use("javax.crypto.spec.IvParameterSpec");
 
-    AFL.logEvent.overload(
-      "android.content.Context",
-      "java.lang.String",
-      "java.util.Map"
-    ).implementation = function (ctx, eventName, eventValues) {
-      var params = "{}";
-      try { params = JSON.stringify(eventValues); } catch (_) {}
-      send("[AF] event=" + eventName + " | " + params);
+  function toHex(bytes) {
+    return Array.from(bytes, function(b) {
+      return ("0" + (b & 0xff).toString(16)).slice(-2);
+    }).join("");
+  }
 
-      if (AF_BLOCK.indexOf(eventName) !== -1) {
-        send("[AF] BLOCKED: " + eventName);
-        return;
+  function modifyPayload(data) {
+    try {
+      var str = String.fromCharCode.apply(null, data);
+      var json = JSON.parse(str);
+      if (json.eventName) {
+        send("[AF] original eventName=" + json.eventName);
+        json.eventName = NEW_EVENT_NAME;
+        send("[AF] patched  eventName=" + NEW_EVENT_NAME);
       }
+      if (json.eventValue && json.eventValue.startsWith("{")) {
+        json.eventValue = JSON.stringify(JSON.parse(json.eventValue));
+      }
+      var out = JSON.stringify(json);
+      var bytes = [];
+      for (var i = 0; i < out.length; i++) bytes.push(out.charCodeAt(i) & 0xff);
+      return bytes;
+    } catch (e) {
+      send("[AF] modifyPayload error: " + e.message);
+      return data;
+    }
+  }
 
-      var renamed = AF_RENAME_MAP[eventName] !== undefined
-        ? AF_RENAME_MAP[eventName] : eventName;
-
-      if (renamed !== eventName) send("[AF] renamed => " + renamed);
-      this.logEvent(ctx, renamed, eventValues);
+  SecretKeySpec.$init.overload("[B","java.lang.String")
+    .implementation = function (keyBytes, algo) {
+      send("[AF] AES key=" + toHex(keyBytes) + " algo=" + algo);
+      return this.$init(keyBytes, algo);
     };
 
-    send("[AF] hook active");
-  } catch (e) { send("[AF] ERROR: " + e.message); }
+  IvParameterSpec.$init.overload("[B")
+    .implementation = function (iv) {
+      send("[AF] IV=" + toHex(iv));
+      return this.$init(iv);
+    };
+
+  Cipher.doFinal.overload("[B")
+    .implementation = function (input) {
+      send("[AF] payload (hex)=" + toHex(input));
+      send("[AF] payload (utf8)=" + String.fromCharCode.apply(null, input));
+      var modified = modifyPayload(input);
+      return this.doFinal(modified);
+    };
+
+  send("[AF] deep hook active — AES level");
 });`,
   },
   {
     id: 'builtin_adjust',
     name: 'Adjust Bypass',
     tag: 'Tracking',
-    code: `// ── Adjust Event Monitor & Rename ─────────────────────────────────
-// Hooks AdjustEvent constructor + Adjust.trackEvent()
-// Edit ADJUST_TOKEN_MAP to swap event tokens before tracking:
-//   e.g. { "abc123": "xyz789" }
-// Set ADJUST_BLOCK = ["abc123"] to drop specific tokens.
-var ADJUST_TOKEN_MAP = {};
-var ADJUST_BLOCK    = [];
+    code: `// ── Adjust — Force Send Event by Token ────────────────────────────
+// يبعت event مباشرة بأي token بدك بعد 3 ثواني من الإنجكشن
+// ─── إعدادات ──────────────────────────────────────────────────────
+var EVENT_TOKEN = "eorlyl"; // ← حط التوكن هون
+// ──────────────────────────────────────────────────────────────────
 
 Java.perform(function () {
-  try {
-    // Hook AdjustEvent constructor to see event token at creation time
-    var AdjustEvent = Java.use("com.adjust.sdk.AdjustEvent");
-    AdjustEvent.$init.overload("java.lang.String")
-      .implementation = function (token) {
-        send("[ADJ] new AdjustEvent token=" + token);
-        var mapped = ADJUST_TOKEN_MAP[token] !== undefined
-          ? ADJUST_TOKEN_MAP[token] : token;
-        return this.$init(mapped);
-      };
+  setTimeout(function () {
+    try {
+      var AdjustEvent = Java.use("com.adjust.sdk.AdjustEvent");
+      var Adjust      = Java.use("com.adjust.sdk.Adjust");
 
-    // Hook trackEvent to see it fire
-    var Adjust = Java.use("com.adjust.sdk.Adjust");
-    Adjust.trackEvent.overload("com.adjust.sdk.AdjustEvent")
-      .implementation = function (event) {
-        var token = "";
-        try { token = event.eventToken.value; } catch (_) {}
-        send("[ADJ] trackEvent token=" + token);
+      send("[ADJ] creating event token=" + EVENT_TOKEN);
+      var event = AdjustEvent.$new(EVENT_TOKEN);
 
-        if (ADJUST_BLOCK.indexOf(token) !== -1) {
-          send("[ADJ] BLOCKED: " + token);
-          return;
+      send("[ADJ] sending via trackEvent()");
+      Adjust.trackEvent(event);
+
+      try {
+        if (Adjust.getDefaultInstance) {
+          Adjust.getDefaultInstance().sendFirstPackages();
+          send("[ADJ] queue flushed");
         }
-        this.trackEvent(event);
-      };
+      } catch (_) {}
 
-    send("[ADJ] hooks active");
-  } catch (e) { send("[ADJ] ERROR: " + e.message); }
+      send("[ADJ] done ✓");
+    } catch (e) {
+      send("[ADJ] ERROR: " + e.message);
+    }
+  }, 3000);
 });`,
   },
   {
     id: 'builtin_singular',
     name: 'Singular Bypass',
     tag: 'Tracking',
-    code: `// ── Singular Event Monitor & Rename ───────────────────────────────
-// Hooks Singular.event() and Singular.eventWithArgs()
-// Edit SINGULAR_RENAME to rename events before they fire.
-// Set SINGULAR_BLOCK = ["Purchase"] to drop specific events.
-var SINGULAR_RENAME = {};
-var SINGULAR_BLOCK  = [];
+    code: `// ── Singular Deep Bypass (JSON + SHA1 level) ──────────────────────
+// يعترض BaseApi.toJsonAsString قبل الإرسال
+// يعدل "n" (اسم الحدث) ويعيد حساب seq/event_index/rc تلقائياً
+// ─── إعدادات ──────────────────────────────────────────────────────
+var NEW_EVENT_NAME = "BR_Level_Complete_13"; // ← غير هون
+// ──────────────────────────────────────────────────────────────────
 
 Java.perform(function () {
   try {
-    var Singular = Java.use("com.singular.sdk.Singular");
+    var BaseApi = Java.use("com.singular.sdk.internal.BaseApi");
+    var Utils   = Java.use("com.singular.sdk.internal.Utils");
 
-    // event(String name)
-    Singular.event.overload("java.lang.String")
-      .implementation = function (name) {
-        send("[SNG] event=" + name);
-        if (SINGULAR_BLOCK.indexOf(name) !== -1) {
-          send("[SNG] BLOCKED: " + name); return;
-        }
-        var r = SINGULAR_RENAME[name] || name;
-        if (r !== name) send("[SNG] renamed => " + r);
-        this.event(r);
-      };
+    var state = { index: null, seq: null, rc: null };
 
-    // eventWithArgs(String name, JSONObject args)  — older SDK
-    try {
-      Singular.eventWithArgs.overload(
-        "java.lang.String", "org.json.JSONObject"
-      ).implementation = function (name, args) {
-        var a = "{}";
-        try { a = args.toString(); } catch (_) {}
-        send("[SNG] eventWithArgs name=" + name + " args=" + a);
-        if (SINGULAR_BLOCK.indexOf(name) !== -1) {
-          send("[SNG] BLOCKED: " + name); return;
-        }
-        var r = SINGULAR_RENAME[name] || name;
-        this.eventWithArgs(r, args);
-      };
-    } catch (_) { send("[SNG] eventWithArgs not found — skipping"); }
+    BaseApi.toJsonAsString.implementation = function () {
+      var original = this.toJsonAsString();
+      send("[SNG] original JSON: " + original);
 
-    // revenue(String eventName, String currency, double amount)
-    try {
-      Singular.revenue.overload(
-        "java.lang.String","java.lang.String","double"
-      ).implementation = function (name, currency, amount) {
-        send("[SNG] revenue event=" + name +
-             " currency=" + currency + " amount=" + amount);
-        this.revenue(name, currency, amount);
-      };
-    } catch (_) {}
+      var origHash = Utils.sha1Hash(original, "AIFA");
+      send("[SNG] original hash: " + origHash);
 
-    send("[SNG] hooks active");
+      // استخرج القيم الحالية
+      var mIdx = original.match(/"event_index":"(\\d+)"/);
+      var mSeq = original.match(/"seq":"(\\d+)"/);
+      var mRc  = original.match(/"rc":"(\\d+)"/);
+
+      var curIdx = mIdx ? parseInt(mIdx[1]) : null;
+      var curSeq = mSeq ? parseInt(mSeq[1]) : null;
+      var curRc  = mRc  ? parseInt(mRc[1])  : null;
+
+      if (state.index === null && curIdx !== null) state.index = curIdx;
+      if (state.seq   === null && curSeq !== null) state.seq   = curSeq;
+      if (state.rc    === null && curRc  !== null) state.rc    = curRc;
+
+      send("[SNG] before → index=" + curIdx + " seq=" + curSeq + " rc=" + curRc);
+
+      // زود العدادات
+      if (state.index !== null) state.index++;
+      if (state.seq   !== null) state.seq++;
+      if (state.rc    !== null) state.rc++;
+
+      var modified = original
+        .replace(/"n":"[^"]+"/, \`"n":"\${NEW_EVENT_NAME}"\`)
+        .replace(/"event_index":"\\d+"/, \`"event_index":"\${state.index}"\`)
+        .replace(/"seq":"\\d+"/,         \`"seq":"\${state.seq}"\`);
+
+      if (state.rc !== null) {
+        modified = modified.replace(/"rc":"\\d+"/, \`"rc":"\${state.rc}"\`);
+      }
+
+      send("[SNG] after  → index=" + state.index + " seq=" + state.seq + " rc=" + state.rc);
+      send("[SNG] modified JSON: " + modified);
+
+      var newHash = Utils.sha1Hash(modified, "AIFA");
+      send("[SNG] new hash: " + newHash);
+
+      return modified;
+    };
+
+    send("[SNG] BaseApi hook active — JSON+hash level");
   } catch (e) { send("[SNG] ERROR: " + e.message); }
 });`,
   },
