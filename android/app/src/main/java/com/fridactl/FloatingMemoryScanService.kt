@@ -18,20 +18,21 @@ import android.view.View
 import android.view.WindowManager
 import android.widget.*
 import com.topjohnwu.superuser.Shell
-import org.json.JSONArray
-import org.json.JSONObject
-import java.io.RandomAccessFile
+import java.io.File
+import java.io.FileOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
 /**
  * FloatingMemoryScanService — GameGuardian-style overlay.
  *
- * ★ REWRITTEN: uses /proc/PID/mem + /proc/PID/maps directly (NO Frida at all).
- *   - Scan runs in a background thread reading memory with Java RandomAccessFile
- *   - Write also uses /proc/PID/mem via shell dd (root required)
- *   - Freeze uses a tight background thread writing every 100ms (no injection)
- *   - Game process is never suspended/frozen — zero stutter
+ * ★ Uses gg-mem native binary (ptrace + process_vm_readv/writev).
+ *   Same technique as GameGuardian — ptrace ATTACH pauses target safely,
+ *   then process_vm_readv reads memory without opening /proc/pid/mem directly.
+ *   Zero Frida. Zero freeze. Works exactly like GG.
+ *
+ * Binary is bundled as assets/gg-mem-arm64, extracted to /data/data/.../gg-mem
+ * on first use and given +x via root shell.
  */
 class FloatingMemoryScanService : Service() {
 
@@ -50,10 +51,8 @@ class FloatingMemoryScanService : Service() {
         private const val RED    = "#ff4444"
         private const val BORDER = "#1a3a2a"
 
-        // How many results to display max
-        private const val MAX_RESULTS   = 200
-        // Skip memory regions bigger than this (saves time, game libs are huge)
-        private const val MAX_REGION_MB = 64L
+        private const val MAX_RESULTS = 500
+        private const val BINARY_NAME = "gg-mem-arm64"
     }
 
     // ─── State ────────────────────────────────────────────────────────────────
@@ -66,7 +65,7 @@ class FloatingMemoryScanService : Service() {
 
     private var targetPkg = ""
     private var targetPid = ""
-    private var scanType  = "int32"   // int32 | float | double | string
+    private var scanType  = "int32"   // int32 | int64 | float | double
     private var scanMode  = "exact"   // exact | changed | increased | decreased | unknown
     private var scanCount = 0
 
@@ -90,6 +89,9 @@ class FloatingMemoryScanService : Service() {
     private var scanCountTv:   TextView?     = null
     private val mainHandler    = Handler(Looper.getMainLooper())
 
+    // Path to extracted binary
+    private var ggMemPath: String = ""
+
     // ─── Service lifecycle ────────────────────────────────────────────────────
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -97,6 +99,7 @@ class FloatingMemoryScanService : Service() {
         super.onCreate()
         instance = this
         wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        ggMemPath = extractBinary()
         buildView()
     }
 
@@ -123,7 +126,28 @@ class FloatingMemoryScanService : Service() {
         super.onDestroy()
     }
 
-    // ─── PID resolution via shell ─────────────────────────────────────────────
+    // ─── Binary extraction ────────────────────────────────────────────────────
+    /**
+     * Extract gg-mem-arm64 from assets to app's private dir.
+     * Then chmod +x via root so it can run as root subprocess.
+     */
+    private fun extractBinary(): String {
+        val outFile = File(filesDir, "gg-mem")
+        try {
+            assets.open(BINARY_NAME).use { input ->
+                FileOutputStream(outFile).use { output ->
+                    input.copyTo(output)
+                }
+            }
+            // Make executable via root
+            Shell.cmd("chmod 755 ${outFile.absolutePath}").exec()
+        } catch (e: Exception) {
+            // Binary missing — fallback will be caught at scan time
+        }
+        return outFile.absolutePath
+    }
+
+    // ─── PID resolution ───────────────────────────────────────────────────────
     private fun resolvePid(): String {
         if (targetPid.isNotBlank() && targetPid.all { it.isDigit() }) return targetPid
         if (targetPkg.isBlank()) return ""
@@ -138,169 +162,43 @@ class FloatingMemoryScanService : Service() {
         return out
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // CORE: /proc/PID/maps parser — returns only anonymous/heap rw regions
-    // ─────────────────────────────────────────────────────────────────────────
-    data class MemRegion(val start: Long, val end: Long)
-
-    private fun readMaps(pid: String): List<MemRegion> {
-        val regions = mutableListOf<MemRegion>()
-        val maxBytes = MAX_REGION_MB * 1024 * 1024
-
-        // Read /proc/PID/maps via root shell — game process can be any UID
-        val lines = Shell.cmd("cat /proc/$pid/maps 2>/dev/null").exec().out
-        for (line in lines) {
-            // Format: start-end perms offset dev inode [pathname]
-            val parts = line.trim().split("\\s+".toRegex())
-            if (parts.size < 2) continue
-            val perms = parts[1]
-            // Only rw- regions (readable + writable, not executable libs)
-            if (!perms.startsWith("rw")) continue
-
-            val addrParts = parts[0].split("-")
-            if (addrParts.size != 2) continue
-
-            val start = addrParts[0].toLongOrNull(16) ?: continue
-            val end   = addrParts[1].toLongOrNull(16) ?: continue
-            val size  = end - start
-            if (size <= 0 || size > maxBytes) continue
-
-            // Skip file-backed regions — only anonymous (heap/stack/anon) segments
-            // A pathname starting with / means it's a mapped file (lib, apk, etc.)
-            val pathname = if (parts.size >= 6) parts[5] else ""
-            if (pathname.startsWith("/") && !pathname.contains("[heap]") && !pathname.contains("[anon")) continue
-
-            regions.add(MemRegion(start, end))
-        }
-        return regions
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // CORE: Read a chunk of memory from /proc/PID/mem
-    // Returns ByteArray or null on error
-    // ─────────────────────────────────────────────────────────────────────────
-    private fun readMemChunk(pid: String, addr: Long, size: Int): ByteArray? {
-        return try {
-            val raf = RandomAccessFile("/proc/$pid/mem", "r")
-            raf.seek(addr)
-            val buf = ByteArray(size)
-            val read = raf.read(buf)
-            raf.close()
-            if (read == size) buf else null
-        } catch (_: Exception) { null }
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // SCAN: search for a value across all rw- anonymous regions
-    // ─────────────────────────────────────────────────────────────────────────
-    private fun buildNeedle(value: String): ByteArray? {
-        return try {
-            val bb: ByteBuffer
-            when (scanType) {
-                "int32" -> {
-                    bb = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN)
-                    bb.putInt(value.toInt())
-                }
-                "float" -> {
-                    bb = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN)
-                    bb.putFloat(value.toFloat())
-                }
-                "double" -> {
-                    bb = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN)
-                    bb.putDouble(value.toDouble())
-                }
-                "int64" -> {
-                    bb = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN)
-                    bb.putLong(value.toLong())
-                }
-                "string" -> return value.toByteArray(Charsets.UTF_8)
-                else -> {
-                    bb = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN)
-                    bb.putInt(value.toInt())
-                }
+    // ─── gg-mem runner ────────────────────────────────────────────────────────
+    /**
+     * Run gg-mem command as root via libsu.
+     * Returns list of output lines.
+     */
+    private fun runGgMem(vararg args: String): List<String> {
+        if (ggMemPath.isEmpty() || !File(ggMemPath).exists()) {
+            // Try re-extracting
+            ggMemPath = extractBinary()
+            if (!File(ggMemPath).exists()) {
+                mainHandler.post { log("✗ gg-mem binary not found — rebuild the app") }
+                return emptyList()
             }
-            bb.array()
-        } catch (_: Exception) { null }
-    }
-
-    private fun readValueAt(pid: String, addr: Long): String? {
-        val size = when (scanType) { "double", "int64" -> 8; "string" -> 64; else -> 4 }
-        val bytes = readMemChunk(pid, addr, size) ?: return null
-        val bb = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
-        return try {
-            when (scanType) {
-                "float"  -> bb.float.toString()
-                "double" -> bb.double.toString()
-                "int64"  -> bb.long.toString()
-                "string" -> bytes.toString(Charsets.UTF_8).trimEnd('\u0000')
-                else     -> bb.int.toString()
-            }
-        } catch (_: Exception) { null }
-    }
-
-    // Boyer-Moore-Horspool needle search inside a byte array
-    private fun searchBytes(haystack: ByteArray, needle: ByteArray): List<Int> {
-        val n = needle.size
-        val h = haystack.size
-        if (n == 0 || h < n) return emptyList()
-
-        val skip = IntArray(256) { n }
-        for (i in 0 until n - 1) skip[needle[i].toInt() and 0xFF] = n - 1 - i
-
-        val hits = mutableListOf<Int>()
-        var i = n - 1
-        while (i < h) {
-            var j = n - 1
-            var k = i
-            while (j >= 0 && haystack[k] == needle[j]) { j--; k-- }
-            if (j == -1) hits.add(k + 1)
-            i += skip[haystack[i].toInt() and 0xFF]
         }
-        return hits
+        val cmd = "$ggMemPath ${args.joinToString(" ")}"
+        val result = Shell.cmd(cmd).exec()
+        return result.out
     }
 
+    // ─── SCAN ─────────────────────────────────────────────────────────────────
     private fun doFirstScan(value: String) {
         val pid = resolvePid()
-        if (pid.isEmpty()) return
+        if (pid.isEmpty()) { mainHandler.post { setBusy(false) }; return }
 
-        val needle = buildNeedle(value)
-        if (needle == null) {
-            mainHandler.post { log("✗ Invalid value for type $scanType"); setBusy(false) }
-            return
-        }
+        mainHandler.post { log("⏳ Scanning…") }
 
-        mainHandler.post { log("⏳ Scanning memory…") }
-
+        val lines = runGgMem("scan", pid, scanType, shellEscape(value))
         val found = mutableListOf<ScanResult>()
-        val regions = readMaps(pid)
-        mainHandler.post { log("⏳ Scanning ${regions.size} regions…") }
 
-        var regionsDone = 0
-        outer@ for (region in regions) {
-            if (found.size >= MAX_RESULTS) break
-            val size = (region.end - region.start).toInt()
-            if (size <= 0) continue
-
-            // Read in 4MB chunks to avoid huge single allocations
-            val chunkSize = 4 * 1024 * 1024
-            var offset = 0L
-            while (offset < size) {
-                val readLen = minOf(chunkSize.toLong(), size - offset).toInt()
-                val chunk = readMemChunk(pid, region.start + offset, readLen) ?: break
-
-                val hits = searchBytes(chunk, needle)
-                for (hit in hits) {
-                    val absAddr = region.start + offset + hit
-                    found.add(ScanResult(absAddr, value))
-                    if (found.size >= MAX_RESULTS) break@outer
-                }
-                offset += readLen
-            }
-            regionsDone++
-            // Progress update every 20 regions
-            if (regionsDone % 20 == 0) {
-                val done = regionsDone
-                mainHandler.post { log("⏳ Scanned $done/${regions.size} regions… ${found.size} hits") }
+        for (line in lines) {
+            if (line.startsWith("DONE")) break
+            // Format: "0xADDR VALUE"
+            val parts = line.trim().split(" ")
+            if (parts.size >= 2) {
+                val addr = parts[0].removePrefix("0x").toLongOrNull(16) ?: continue
+                found.add(ScanResult(addr, parts[1]))
+                if (found.size >= MAX_RESULTS) break
             }
         }
 
@@ -310,22 +208,38 @@ class FloatingMemoryScanService : Service() {
             scanCount = 1
             renderResults()
             updateScanCount()
-            log(if (found.isEmpty()) "⚠ 0 results — value not in heap memory" else "✓ Found ${found.size} addresses")
+            log(if (found.isEmpty()) "⚠ 0 results — value not found" else "✓ Found ${found.size} addresses")
             setBusy(false)
         }
     }
 
     private fun doNextScan(value: String) {
         val pid = resolvePid()
-        if (pid.isEmpty()) return
+        if (pid.isEmpty()) { mainHandler.post { setBusy(false) }; return }
 
         mainHandler.post { log("⏳ Next scan (${results.size} addrs)…") }
 
-        val filtered = mutableListOf<ScanResult>()
-        val targetNum = value.toDoubleOrNull()
+        // Build CSV of addresses to rescan
+        val addrCsv = results.take(MAX_RESULTS).joinToString(",") {
+            "0x${it.addr.toString(16)}"
+        }
 
+        val lines = runGgMem("rescan", pid, scanType, addrCsv)
+
+        // Build map of addr → current value from output
+        val currentMap = mutableMapOf<Long, String>()
+        for (line in lines) {
+            if (line.startsWith("DONE")) break
+            val parts = line.trim().split(" ")
+            if (parts.size >= 2) {
+                val addr = parts[0].removePrefix("0x").toLongOrNull(16) ?: continue
+                currentMap[addr] = parts[1]
+            }
+        }
+
+        val filtered = mutableListOf<ScanResult>()
         for (res in results.toList()) {
-            val current = readValueAt(pid, res.addr) ?: continue
+            val current = currentMap[res.addr] ?: continue
             val currentNum = current.toDoubleOrNull()
             val prevNum    = res.value.toDoubleOrNull()
 
@@ -351,46 +265,25 @@ class FloatingMemoryScanService : Service() {
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // WRITE: write bytes to /proc/PID/mem via shell dd
-    // ─────────────────────────────────────────────────────────────────────────
+    // ─── WRITE ────────────────────────────────────────────────────────────────
     private fun writeValue(pid: String, addr: Long, value: String) {
-        val bb: ByteBuffer
-        val bytes: ByteArray
-        try {
-            when (scanType) {
-                "float"  -> { bb = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN); bb.putFloat(value.toFloat()); bytes = bb.array() }
-                "double" -> { bb = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN); bb.putDouble(value.toDouble()); bytes = bb.array() }
-                "int64"  -> { bb = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN); bb.putLong(value.toLong()); bytes = bb.array() }
-                "string" -> { bytes = value.toByteArray(Charsets.UTF_8) }
-                else     -> { bb = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN); bb.putInt(value.toInt()); bytes = bb.array() }
-            }
-        } catch (e: Exception) {
-            mainHandler.post { log("✗ Invalid value: ${e.message}") }
-            return
-        }
-
-        // Build hex string for printf
-        val hexArgs = bytes.joinToString("") { "\\x%02x".format(it.toInt() and 0xFF) }
-        val cmd = "printf '$hexArgs' | dd of=/proc/$pid/mem bs=1 seek=$addr conv=notrunc 2>/dev/null && echo OK"
-        val result = Shell.cmd(cmd).exec()
-        val ok = result.out.any { it.contains("OK") }
+        val addrHex = "0x${addr.toString(16)}"
+        val lines   = runGgMem("write", pid, scanType, addrHex, shellEscape(value))
+        val ok      = lines.any { it.startsWith("OK") }
         mainHandler.post {
             if (ok) {
                 results.find { it.addr == addr }?.value = value
                 renderResults()
-                log("✓ Written $value → 0x${addr.toString(16)}")
+                log("✓ Written $value → $addrHex")
             } else {
-                log("✗ Write failed — process may have moved address")
+                log("✗ Write failed — address may have moved")
             }
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // FREEZE: background thread writes value every 100ms — no Frida
-    // ─────────────────────────────────────────────────────────────────────────
+    // ─── FREEZE: background thread writes every 100ms via gg-mem ─────────────
     private fun startFreeze(addr: Long, value: String) {
-        stopFreeze(addr) // stop existing if any
+        stopFreeze(addr)
 
         val job = FreezeJob(addr, scanType, value, active = true)
         frozenJobs[addr] = job
@@ -402,10 +295,11 @@ class FloatingMemoryScanService : Service() {
                 return@Thread
             }
 
-            // Validate the address is readable before committing
-            val check = readValueAt(pid, addr)
-            if (check == null) {
-                mainHandler.post { log("✗ Address 0x${addr.toString(16)} not readable") }
+            // Verify address is readable
+            val addrHex = "0x${addr.toString(16)}"
+            val check = runGgMem("read", pid, scanType, addrHex)
+            if (check.isEmpty() || check.all { it.isBlank() }) {
+                mainHandler.post { log("✗ Address $addrHex not readable") }
                 frozenJobs.remove(addr)
                 return@Thread
             }
@@ -414,16 +308,15 @@ class FloatingMemoryScanService : Service() {
                 results.find { it.addr == addr }?.frozen = true
                 renderResults()
                 updateFreezeBtn(true)
-                log("❄ Frozen 0x${addr.toString(16)} = $value")
+                log("❄ Frozen $addrHex = $value")
             }
 
-            // Keep writing until job is deactivated
             while (job.active) {
-                writeValueSilent(pid, addr, value, scanType)
+                runGgMem("write", pid, scanType, addrHex, value)
                 try { Thread.sleep(100) } catch (_: InterruptedException) { break }
             }
 
-            mainHandler.post { log("● Unfrozen 0x${addr.toString(16)}") }
+            mainHandler.post { log("● Unfrozen $addrHex") }
         }.start()
     }
 
@@ -439,26 +332,13 @@ class FloatingMemoryScanService : Service() {
         frozenJobs.clear()
     }
 
-    // Silent write used by freeze loop — no UI update
-    private fun writeValueSilent(pid: String, addr: Long, value: String, type: String) {
-        try {
-            val bb: ByteBuffer
-            val bytes: ByteArray
-            when (type) {
-                "float"  -> { bb = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN); bb.putFloat(value.toFloat()); bytes = bb.array() }
-                "double" -> { bb = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN); bb.putDouble(value.toDouble()); bytes = bb.array() }
-                "int64"  -> { bb = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN); bb.putLong(value.toLong()); bytes = bb.array() }
-                "string" -> { bytes = value.toByteArray(Charsets.UTF_8) }
-                else     -> { bb = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN); bb.putInt(value.toInt()); bytes = bb.array() }
-            }
-            val hexArgs = bytes.joinToString("") { "\\x%02x".format(it.toInt() and 0xFF) }
-            Shell.cmd("printf '$hexArgs' | dd of=/proc/$pid/mem bs=1 seek=$addr conv=notrunc 2>/dev/null").exec()
-        } catch (_: Exception) {}
+    // ─── Shell escape ─────────────────────────────────────────────────────────
+    private fun shellEscape(s: String): String {
+        // Wrap in single quotes, escape any ' inside
+        return "'${s.replace("'", "'\\''")}'"
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // UI BUILD
-    // ─────────────────────────────────────────────────────────────────────────
+    // ─── UI BUILD ──────────────────────────────────────────────────────────────
     @SuppressLint("ClickableViewAccessibility")
     private fun buildView() {
         rootView = LinearLayout(this).apply {
@@ -498,7 +378,7 @@ class FloatingMemoryScanService : Service() {
         rootView!!.addView(actionPanel)
 
         logTv = TextView(this).apply {
-            text = "[ Ready — /proc/mem scanner ]"
+            text = "[ GG-Mem engine ready ]"
             setTextColor(Color.parseColor(DIM))
             textSize = 9f
             typeface = Typeface.MONOSPACE
@@ -510,7 +390,10 @@ class FloatingMemoryScanService : Service() {
         titleBar.setOnTouchListener { _, ev ->
             val lp = rootView!!.layoutParams as? WindowManager.LayoutParams ?: return@setOnTouchListener false
             when (ev.action) {
-                MotionEvent.ACTION_DOWN -> { initX = lp.x; initY = lp.y; initTouchX = ev.rawX; initTouchY = ev.rawY }
+                MotionEvent.ACTION_DOWN -> {
+                    initX = lp.x; initY = lp.y
+                    initTouchX = ev.rawX; initTouchY = ev.rawY
+                }
                 MotionEvent.ACTION_MOVE -> {
                     lp.x = initX + (ev.rawX - initTouchX).toInt()
                     lp.y = initY + (ev.rawY - initTouchY).toInt()
@@ -550,7 +433,7 @@ class FloatingMemoryScanService : Service() {
     private fun makeTypeRow(): HorizontalScrollView {
         val scroll = HorizontalScrollView(this).apply { setPadding(6, 6, 6, 0) }
         val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        val types = listOf("int32" to "Dword", "float" to "Float", "double" to "Double", "int64" to "Qword", "string" to "String")
+        val types = listOf("int32" to "Dword", "float" to "Float", "double" to "Double", "int64" to "Qword")
         for ((val_, lbl) in types) {
             val chip = makeChip(lbl, val_ == scanType)
             chip.setOnClickListener {
@@ -568,7 +451,13 @@ class FloatingMemoryScanService : Service() {
     private fun makeModeRow(): HorizontalScrollView {
         val scroll = HorizontalScrollView(this).apply { setPadding(6, 4, 6, 4) }
         val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        val modes = listOf("exact" to "= Exact", "changed" to "≠ Changed", "increased" to "↑ Up", "decreased" to "↓ Down", "unknown" to "? Any")
+        val modes = listOf(
+            "exact"     to "= Exact",
+            "changed"   to "≠ Changed",
+            "increased" to "↑ Up",
+            "decreased" to "↓ Down",
+            "unknown"   to "? Any"
+        )
         for ((val_, lbl) in modes) {
             val chip = makeChip(lbl, val_ == scanMode)
             chip.setOnClickListener {
@@ -686,7 +575,7 @@ class FloatingMemoryScanService : Service() {
         setBackgroundColor(Color.parseColor(if (active) "#CC001a0d" else "#CC111111"))
         layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { marginEnd = 4 }
     }
-    private fun resetChip(tv: TextView)   { tv.setTextColor(Color.parseColor(DIM));   tv.setBackgroundColor(Color.parseColor("#CC111111")) }
+    private fun resetChip(tv: TextView)    { tv.setTextColor(Color.parseColor(DIM));   tv.setBackgroundColor(Color.parseColor("#CC111111")) }
     private fun activateChip(tv: TextView) { tv.setTextColor(Color.parseColor(GREEN)); tv.setBackgroundColor(Color.parseColor("#CC001a0d")) }
 
     // ─── Window management ────────────────────────────────────────────────────
@@ -694,9 +583,11 @@ class FloatingMemoryScanService : Service() {
         val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
         else @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
-        return WindowManager.LayoutParams(560, 680, type,
+        return WindowManager.LayoutParams(
+            560, 680, type,
             WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-            PixelFormat.TRANSLUCENT).apply { gravity = Gravity.TOP or Gravity.START; x = 20; y = 80 }
+            PixelFormat.TRANSLUCENT
+        ).apply { gravity = Gravity.TOP or Gravity.START; x = 20; y = 80 }
     }
 
     fun showOverlay() {
@@ -816,14 +707,24 @@ class FloatingMemoryScanService : Service() {
 
     private fun updateFreezeBtn(frozen: Boolean) {
         val btn = actionPanel?.findViewWithTag<TextView?>("freezeBtn") ?: return
-        if (frozen) { btn.text = "● UNFRZ"; btn.setTextColor(Color.parseColor(DIM)); btn.setBackgroundColor(Color.parseColor("#CC1a1a1a")) }
-        else { btn.text = "❄ FREEZE"; btn.setTextColor(Color.parseColor(YELLOW)); btn.setBackgroundColor(Color.parseColor("#CC1a1400")) }
+        if (frozen) {
+            btn.text = "● UNFRZ"; btn.setTextColor(Color.parseColor(DIM))
+            btn.setBackgroundColor(Color.parseColor("#CC1a1a1a"))
+        } else {
+            btn.text = "❄ FREEZE"; btn.setTextColor(Color.parseColor(YELLOW))
+            btn.setBackgroundColor(Color.parseColor("#CC1a1400"))
+        }
     }
 
     // ─── Helpers ──────────────────────────────────────────────────────────────
     private fun resetScan() {
         results.clear(); scanCount = 0; selectedAddr = null; stopAllFreezes()
-        mainHandler.post { renderResults(); updateScanCount(); actionPanel?.visibility = View.GONE; scanValueEt?.setText(""); log("── Scan reset ──") }
+        mainHandler.post {
+            renderResults(); updateScanCount()
+            actionPanel?.visibility = View.GONE
+            scanValueEt?.setText("")
+            log("── Scan reset ──")
+        }
     }
 
     private fun updateScanCount() {

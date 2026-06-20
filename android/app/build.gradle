@@ -13,13 +13,21 @@ android {
     compileSdk rootProject.ext.compileSdkVersion
 
     namespace "com.fridactl"
+
     defaultConfig {
         applicationId "com.fridactl"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 1
         versionName "1.0"
+        externalNativeBuild {
+            cmake {
+                abiFilters "arm64-v8a"
+                arguments "-DANDROID_STL=c++_static"
+            }
+        }
     }
+
     signingConfigs {
         debug {
             storeFile file('debug.keystore')
@@ -28,6 +36,7 @@ android {
             keyPassword 'android'
         }
     }
+
     buildTypes {
         debug { signingConfig signingConfigs.debug }
         release {
@@ -36,8 +45,17 @@ android {
             proguardFiles getDefaultProguardFile("proguard-android.txt"), "proguard-rules.pro"
         }
     }
+
     aaptOptions {
-        noCompress "frida-server-arm64", "frida-gadget-arm64.so", "apktool.jar", "uber-signer.jar"
+        noCompress "frida-server-arm64", "frida-gadget-arm64.so", "apktool.jar", "uber-signer.jar", "gg-mem-arm64"
+    }
+
+    // Build gg-mem native binary via NDK
+    externalNativeBuild {
+        cmake {
+            path "src/main/jni/CMakeLists.txt"
+            version "3.18.1+"
+        }
     }
 }
 
@@ -56,5 +74,24 @@ apply from: file("../../node_modules/@react-native-community/cli-platform-androi
 tasks.withType(org.jetbrains.kotlin.gradle.tasks.KotlinCompile).configureEach {
     kotlinOptions {
         jvmTarget = "17"
+    }
+}
+
+// After build, copy gg-mem binary to assets for deployment at runtime
+tasks.whenTaskAdded { task ->
+    if (task.name.contains("externalNativeBuild") || task.name == "mergeDebugAssets" || task.name == "mergeReleaseAssets") {
+        task.doLast {
+            def ggMemFile = file("${buildDir}/intermediates/cmake/debug/obj/arm64-v8a/gg-mem")
+            if (!ggMemFile.exists()) {
+                ggMemFile = file("${buildDir}/intermediates/cmake/release/obj/arm64-v8a/gg-mem")
+            }
+            if (ggMemFile.exists()) {
+                def assetsDir = file("src/main/assets")
+                assetsDir.mkdirs()
+                def dest = new File(assetsDir, "gg-mem-arm64")
+                ggMemFile.withInputStream { is -> dest.withOutputStream { os -> os << is } }
+                println "✓ gg-mem copied to assets/gg-mem-arm64"
+            }
+        }
     }
 }
