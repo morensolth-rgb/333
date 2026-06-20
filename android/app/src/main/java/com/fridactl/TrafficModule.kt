@@ -39,34 +39,36 @@ class TrafficModule(private val ctx: ReactApplicationContext) : ReactContextBase
                 return@requestVpnPermission
             }
 
-            try {
-                val intent = Intent(ctx, TrafficVpnService::class.java).apply {
-                    action = TrafficVpnService.ACTION_START
-                    putExtra(TrafficVpnService.EXTRA_PKG, targetPackage)
-                }
-                ctx.startService(intent)
+            // Must start service on main thread
+            activity.runOnUiThread {
+                try {
+                    // Register callback before starting service
+                    TrafficVpnService.onPacketCallback = { entry ->
+                        try {
+                            val params = Arguments.createMap().apply {
+                                putDouble("ts", entry.timestamp.toDouble())
+                                putString("protocol", entry.protocol)
+                                putString("src", entry.srcIp)
+                                putString("dst", entry.dstIp)
+                                putString("host", KnownPorts.resolve(entry.dstPort) ?: entry.dstIp)
+                                putInt("port", entry.dstPort)
+                                putInt("len", entry.length)
+                                putString("dir", entry.direction)
+                            }
+                            ctx.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
+                                .emit("onTrafficPacket", params)
+                        } catch (_: Exception) {}
+                    }
 
-                // Register live packet callback → emit RN event
-                TrafficVpnService.onPacketCallback = { entry ->
-                    try {
-                        val params = Arguments.createMap().apply {
-                            putDouble("ts", entry.timestamp.toDouble())
-                            putString("protocol", entry.protocol)
-                            putString("src", entry.srcIp)
-                            putString("dst", entry.dstIp)
-                            putString("host", KnownPorts.resolve(entry.dstPort) ?: entry.dstIp)
-                            putInt("port", entry.dstPort)
-                            putInt("len", entry.length)
-                            putString("dir", entry.direction)
-                        }
-                        ctx.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
-                            .emit("onTrafficPacket", params)
-                    } catch (_: Exception) {}
+                    val intent = Intent(ctx, TrafficVpnService::class.java).apply {
+                        action = TrafficVpnService.ACTION_START
+                        putExtra(TrafficVpnService.EXTRA_PKG, targetPackage)
+                    }
+                    activity.startService(intent)
+                    promise.resolve("started")
+                } catch (e: Exception) {
+                    promise.reject("START_ERROR", e.message)
                 }
-
-                promise.resolve("started")
-            } catch (e: Exception) {
-                promise.reject("START_ERROR", e.message)
             }
         }
     }

@@ -91,9 +91,10 @@ class TrafficVpnService : VpnService() {
         try {
             val builder = Builder()
                 .setSession("FridaCtl Traffic")
-                .addAddress("10.0.0.1", 32)
+                .addAddress("10.0.0.2", 24)
                 .addRoute("0.0.0.0", 0)
                 .addDnsServer("8.8.8.8")
+                .addDnsServer("1.1.1.1")
                 .setMtu(1500)
                 .setBlocking(true)
 
@@ -101,22 +102,35 @@ class TrafficVpnService : VpnService() {
             if (targetPackage.isNotEmpty()) {
                 try {
                     builder.addAllowedApplication(targetPackage)
-                    // Always allow our own app
                     builder.addAllowedApplication(packageName)
                 } catch (e: Exception) {
-                    Log.w(TAG, "addAllowedApplication failed: ${e.message}")
+                    Log.w(TAG, "addAllowedApplication failed, capturing all: ${e.message}")
+                    // Don't filter by app — capture everything instead of crashing
                 }
             }
 
-            vpnInterface = builder.establish()
+            val iface = builder.establish()
+            if (iface == null) {
+                Log.e(TAG, "establish() returned null — VPN permission missing or revoked")
+                isRunning.set(false)
+                stopSelf()
+                return
+            }
+
+            vpnInterface = iface
             running = true
             isRunning.set(true)
             capturedPackets.clear()
 
-            readerThread = Thread { readPackets() }.also { it.start() }
+            readerThread = Thread { readPackets() }.apply {
+                name = "TrafficVpnReader"
+                isDaemon = true
+                start()
+            }
 
         } catch (e: Exception) {
             Log.e(TAG, "startVpn error: ${e.message}")
+            isRunning.set(false)
             stopSelf()
         }
     }
@@ -130,18 +144,32 @@ class TrafficVpnService : VpnService() {
         while (running) {
             try {
                 val len = inputStream.read(packet)
-                if (len <= 0) continue
+                if (len <= 0) {
+                    Thread.sleep(1)
+                    continue
+                }
 
-                val buf = ByteBuffer.wrap(packet, 0, len)
-                parseIpPacket(buf, len)
+                // Parse — never let a bad packet crash the loop
+                try {
+                    val buf = ByteBuffer.wrap(packet, 0, len)
+                    parseIpPacket(buf, len)
+                } catch (pe: Exception) {
+                    Log.v(TAG, "parse error (ignored): ${pe.message}")
+                }
 
-                // Forward packet back so device still works
-                outputStream.write(packet, 0, len)
+                // Forward packet back so internet still works
+                try {
+                    outputStream.write(packet, 0, len)
+                } catch (we: Exception) {
+                    Log.v(TAG, "write error: ${we.message}")
+                }
 
             } catch (e: InterruptedException) {
                 break
             } catch (e: Exception) {
-                if (running) Log.w(TAG, "packet read error: ${e.message}")
+                if (running) Log.w(TAG, "read error: ${e.message}")
+                // Small back-off to avoid tight error loop
+                try { Thread.sleep(5) } catch (_: InterruptedException) { break }
             }
         }
     }
