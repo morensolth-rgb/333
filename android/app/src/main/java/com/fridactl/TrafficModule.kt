@@ -1,7 +1,6 @@
 package com.fridactl
 
 import android.content.Intent
-import android.net.VpnService
 import com.facebook.react.bridge.*
 import com.facebook.react.modules.core.DeviceEventManagerModule
 import org.json.JSONArray
@@ -10,61 +9,65 @@ class TrafficModule(private val ctx: ReactApplicationContext) : ReactContextBase
 
     override fun getName() = "TrafficModule"
 
-    // ── VPN permission check ───────────────────────────────────────────────────
+    // ── VPN permission — launched via Activity so system dialog appears ────────
     @ReactMethod
     fun prepareVpn(promise: Promise) {
-        try {
-            val intent = VpnService.prepare(ctx)
-            if (intent == null) {
-                // Already granted
-                promise.resolve("granted")
-            } else {
-                // Need to launch activity — caller handles this via the intent
-                promise.resolve("needs_permission")
-            }
-        } catch (e: Exception) {
-            promise.reject("VPN_PREPARE_ERROR", e.message)
+        val activity = ctx.currentActivity as? MainActivity
+        if (activity == null) {
+            promise.reject("NO_ACTIVITY", "Activity not available")
+            return
+        }
+        activity.requestVpnPermission { granted ->
+            if (granted) promise.resolve("granted")
+            else promise.reject("VPN_DENIED", "VPN permission denied by user")
         }
     }
 
     // ── Start capture ──────────────────────────────────────────────────────────
     @ReactMethod
     fun startCapture(targetPackage: String, promise: Promise) {
-        try {
-            // Check if VPN permission is granted
-            val vpnIntent = VpnService.prepare(ctx)
-            if (vpnIntent != null) {
-                promise.reject("VPN_PERMISSION", "VPN permission not granted. Please allow VPN in the dialog first.")
-                return
+        val activity = ctx.currentActivity as? MainActivity
+        if (activity == null) {
+            promise.reject("NO_ACTIVITY", "Activity not available")
+            return
+        }
+
+        // Always request through Activity so the system dialog shows up
+        activity.requestVpnPermission { granted ->
+            if (!granted) {
+                promise.reject("VPN_DENIED", "VPN permission denied")
+                return@requestVpnPermission
             }
 
-            val intent = Intent(ctx, TrafficVpnService::class.java).apply {
-                action = TrafficVpnService.ACTION_START
-                putExtra(TrafficVpnService.EXTRA_PKG, targetPackage)
-            }
-            ctx.startService(intent)
+            try {
+                val intent = Intent(ctx, TrafficVpnService::class.java).apply {
+                    action = TrafficVpnService.ACTION_START
+                    putExtra(TrafficVpnService.EXTRA_PKG, targetPackage)
+                }
+                ctx.startService(intent)
 
-            // Register live packet callback → emit RN event
-            TrafficVpnService.onPacketCallback = { entry ->
-                try {
-                    val params = Arguments.createMap().apply {
-                        putDouble("ts", entry.timestamp.toDouble())
-                        putString("protocol", entry.protocol)
-                        putString("src", entry.srcIp)
-                        putString("dst", entry.dstIp)
-                        putString("host", KnownPorts.resolve(entry.dstPort) ?: entry.dstIp)
-                        putInt("port", entry.dstPort)
-                        putInt("len", entry.length)
-                        putString("dir", entry.direction)
-                    }
-                    ctx.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
-                        .emit("onTrafficPacket", params)
-                } catch (_: Exception) {}
-            }
+                // Register live packet callback → emit RN event
+                TrafficVpnService.onPacketCallback = { entry ->
+                    try {
+                        val params = Arguments.createMap().apply {
+                            putDouble("ts", entry.timestamp.toDouble())
+                            putString("protocol", entry.protocol)
+                            putString("src", entry.srcIp)
+                            putString("dst", entry.dstIp)
+                            putString("host", KnownPorts.resolve(entry.dstPort) ?: entry.dstIp)
+                            putInt("port", entry.dstPort)
+                            putInt("len", entry.length)
+                            putString("dir", entry.direction)
+                        }
+                        ctx.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
+                            .emit("onTrafficPacket", params)
+                    } catch (_: Exception) {}
+                }
 
-            promise.resolve("started")
-        } catch (e: Exception) {
-            promise.reject("START_ERROR", e.message)
+                promise.resolve("started")
+            } catch (e: Exception) {
+                promise.reject("START_ERROR", e.message)
+            }
         }
     }
 

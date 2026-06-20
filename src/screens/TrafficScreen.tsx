@@ -103,23 +103,17 @@ export default function TrafficScreen() {
     }
     try {
       setLoading(true);
-      // Check VPN permission
-      const perm = await TrafficModule.prepareVpn();
-      if (perm === 'needs_permission') {
-        Alert.alert(
-          'VPN Permission Required',
-          'Android will show a VPN permission dialog. Please accept it to start capturing.',
-          [{ text: 'OK' }]
-        );
-        setLoading(false);
-        return;
-      }
       setPackets([]);
       setStats({ total: 0, bytes: 0, tcp: 0, udp: 0 });
-      const result = await TrafficModule.startCapture(selectedPkg);
+      // startCapture handles VPN permission internally via Activity
+      await TrafficModule.startCapture(selectedPkg);
       setCapturing(true);
     } catch (e: any) {
-      Alert.alert('Error', e?.message || 'Failed to start capture');
+      if (e?.code === 'VPN_DENIED') {
+        Alert.alert('Permission Denied', 'VPN permission is required to capture traffic.');
+      } else {
+        Alert.alert('Error', e?.message || 'Failed to start capture');
+      }
     } finally {
       setLoading(false);
     }
