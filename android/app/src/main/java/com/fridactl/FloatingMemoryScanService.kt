@@ -133,18 +133,22 @@ class FloatingMemoryScanService : Service() {
      */
     private fun extractBinary(): String {
         val outFile = File(filesDir, "gg-mem")
-        try {
+        return try {
             assets.open(BINARY_NAME).use { input ->
                 FileOutputStream(outFile).use { output ->
                     input.copyTo(output)
                 }
             }
-            // Make executable via root
-            Shell.cmd("chmod 755 ${outFile.absolutePath}").exec()
+            // chmod +x via root shell
+            val chmodResult = Shell.cmd("chmod 755 '${outFile.absolutePath}'").exec()
+            if (!chmodResult.isSuccess) {
+                mainHandler.post { log("✗ chmod failed on gg-mem") }
+            }
+            outFile.absolutePath
         } catch (e: Exception) {
-            // Binary missing — fallback will be caught at scan time
+            mainHandler.post { log("✗ Extract failed: ${e.message}") }
+            ""
         }
-        return outFile.absolutePath
     }
 
     // ─── PID resolution ───────────────────────────────────────────────────────
@@ -169,15 +173,19 @@ class FloatingMemoryScanService : Service() {
      */
     private fun runGgMem(vararg args: String): List<String> {
         if (ggMemPath.isEmpty() || !File(ggMemPath).exists()) {
-            // Try re-extracting
             ggMemPath = extractBinary()
-            if (!File(ggMemPath).exists()) {
-                mainHandler.post { log("✗ gg-mem binary not found — rebuild the app") }
+            if (ggMemPath.isEmpty() || !File(ggMemPath).exists()) {
+                mainHandler.post { log("✗ gg-mem not found in assets") }
                 return emptyList()
             }
         }
-        val cmd = "$ggMemPath ${args.joinToString(" ")}"
+        val cmd = "'$ggMemPath' ${args.joinToString(" ")}"
         val result = Shell.cmd(cmd).exec()
+        // Show stderr in log if failed
+        if (!result.isSuccess && result.err.isNotEmpty()) {
+            val err = result.err.take(3).joinToString(" | ")
+            mainHandler.post { log("✗ gg-mem: $err") }
+        }
         return result.out
     }
 
