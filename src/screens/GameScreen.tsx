@@ -520,8 +520,7 @@ function MemoryTab() {
       <View style={[s.card, {borderColor: C.green2}]}>
         <Text style={[s.cardTitle, {color: C.green}]}>🎮 GameGuardian-Style Memory Scanner</Text>
         <Text style={[s.txt, {marginBottom: 6, lineHeight: 18}]}>
-          {'A draggable overlay window floats above the running game.
-' +
+          {'A draggable overlay window floats above the running game.\n' +
            'Scan for values, narrow them down with NEXT SCAN, then edit or freeze.'}
         </Text>
         <View style={{flexDirection:'row', flexWrap:'wrap', gap:6, marginBottom:4}}>
@@ -551,8 +550,7 @@ function MemoryTab() {
           autoCorrect={false}
         />
         <Text style={[s.mono, {color: C.dim, fontSize: 10, marginBottom: 8}]}>
-          {'Launch the game first, then open the overlay.
-The overlay will stay visible while you play.'}
+          {'Launch the game first, then open the overlay.\nThe overlay will stay visible while you play.'}
         </Text>
       </View>
 
@@ -581,9 +579,7 @@ The overlay will stay visible while you play.'}
             <View style={[s.card, {borderColor: C.green, marginBottom: 8}]}>
               <Text style={[s.cardTitle, {color: C.green}]}>✓ Overlay is Active</Text>
               <Text style={[s.txt, {marginBottom: 8}]}>
-                The scanner window is floating above your game.{'
-'}
-                Switch to the game — the overlay stays on top.
+                {'The scanner window is floating above your game.\nSwitch to the game — the overlay stays on top.'}
               </Text>
             </View>
             <TouchableOpacity
@@ -891,9 +887,7 @@ function AntiDetTab() {
         const sc = SCRIPT_LIBRARY.find(s => s.id === sid);
         return sc ? `// ── ${sc.title} ──
 ${sc.code}` : '';
-      }).filter(Boolean).join('
-
-');
+      }).filter(Boolean).join('\n\n');
 
       addLog(`📝 Injecting ${profile.scripts.length} scripts into ${pkg}`);
       const result = await rootBridge.runScript(pkg.trim(), combined, 'pid');
