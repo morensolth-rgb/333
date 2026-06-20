@@ -19,6 +19,7 @@ class MainApplication : Application(), ReactApplication {
                 PackageList(this).packages.apply {
                     add(RootBridgePackage())
                     add(RepackPackage())
+                    add(TrafficPackage())
                 }
             override fun getJSMainModuleName(): String = "index"
             override fun getUseDeveloperSupport(): Boolean = BuildConfig.DEBUG

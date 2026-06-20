@@ -4,6 +4,7 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.BIND_VPN_SERVICE" />
 
     <queries>
         <intent>
@@ -40,5 +41,13 @@
       <service
         android:name=".FloatingLogService"
         android:exported="false" />
+      <service
+        android:name=".TrafficVpnService"
+        android:exported="false"
+        android:permission="android.permission.BIND_VPN_SERVICE">
+        <intent-filter>
+          <action android:name="android.net.VpnService" />
+        </intent-filter>
+      </service>
     </application>
 </manifest>
