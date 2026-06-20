@@ -34,6 +34,102 @@ const DEFAULT_SCRIPT = `Java.perform(function() {
 
 const SCRIPTS_KEY = 'scriptsList';
 
+// ── Built-in script library ───────────────────────────────────────────────────
+type BuiltinScript = {id: string; name: string; tag: string; code: string};
+
+const BUILTIN_SCRIPTS: BuiltinScript[] = [
+  {
+    id: 'builtin_appsflyer',
+    name: 'AppsFlyer Bypass',
+    tag: 'Analytics',
+    code: `// AppsFlyer Event Monitor & Rename
+// Hooks logEvent — intercepts event name + params in real time.
+// Edit AF_RENAME_MAP below to rename events before they fire:
+//   e.g. { "af_purchase": "af_view_item" }
+var AF_RENAME_MAP = {};
+
+Java.perform(function () {
+  try {
+    var AFL = Java.use("com.appsflyer.AppsFlyerLib");
+
+    // logEvent(Context, String eventName, Map eventValues)
+    AFL.logEvent.overload(
+      "android.content.Context",
+      "java.lang.String",
+      "java.util.Map"
+    ).implementation = function (ctx, eventName, eventValues) {
+      var params = "{}";
+      try { params = JSON.stringify(eventValues); } catch (_) {}
+
+      send("[AF] event=" + eventName + " params=" + params);
+
+      var renamed = AF_RENAME_MAP[eventName] !== undefined
+        ? AF_RENAME_MAP[eventName]
+        : eventName;
+
+      if (renamed !== eventName) {
+        send("[AF] renamed => " + renamed);
+      }
+
+      this.logEvent(ctx, renamed, eventValues);
+    };
+
+    send("[AF] logEvent hook active");
+  } catch (e) {
+    send("[AF] ERROR: " + e.message);
+  }
+});`,
+  },
+  {
+    id: 'builtin_unity_il2cpp_log',
+    name: 'Unity IL2CPP Logger',
+    tag: 'Unity',
+    code: `// Unity IL2CPP — hook Debug.Log to capture all Unity logs
+Java.perform(function () {
+  try {
+    var UnityPlayer = Java.use("com.unity3d.player.UnityPlayer");
+    send("[Unity] UnityPlayer found: " + UnityPlayer);
+  } catch (e) {
+    send("[Unity] UnityPlayer not found: " + e.message);
+  }
+});
+
+// Also hook via native — intercept il2cpp_resolve_icall or mono_log
+Interceptor.attach(Module.findExportByName(null, "il2cpp_resolve_icall"), {
+  onEnter: function (args) {
+    var name = args[0].readCString();
+    if (name && name.indexOf("Debug") !== -1) {
+      send("[IL2CPP] icall: " + name);
+    }
+  }
+});`,
+  },
+  {
+    id: 'builtin_ssl_unpin',
+    name: 'SSL Unpin (OkHttp3)',
+    tag: 'Network',
+    code: `// Disable OkHttp3 certificate pinning
+Java.perform(function () {
+  try {
+    var CertificatePinner = Java.use("okhttp3.CertificatePinner");
+    CertificatePinner.check.overload("java.lang.String", "java.util.List")
+      .implementation = function (hostname, peerCertificates) {
+        send("[SSL] Pinning bypassed for: " + hostname);
+        return;
+      };
+    CertificatePinner.check.overload("java.lang.String", "[Ljava.security.cert.Certificate;")
+      .implementation = function (hostname, certs) {
+        send("[SSL] Pinning bypassed for: " + hostname);
+        return;
+      };
+    send("[SSL] OkHttp3 pin bypass active");
+  } catch (e) {
+    send("[SSL] OkHttp3 not found: " + e.message);
+  }
+});`,
+  },
+];
+
 const eventEmitter = new NativeEventEmitter(NativeModules.RootBridge);
 
 type InjectMode = 'pid' | 'name' | 'spawn';
@@ -495,11 +591,36 @@ export default function ScriptScreen() {
         <View style={m.overlay}>
           <View style={m.sheet}>
             <View style={m.sheetHeader}>
-              <Text style={m.sheetTitle}>SAVED SCRIPTS</Text>
+              <Text style={m.sheetTitle}>SCRIPTS LIBRARY</Text>
               <TouchableOpacity onPress={() => setScriptsModal(false)}>
                 <Text style={m.closeBtn}>✕</Text>
               </TouchableOpacity>
             </View>
+
+            {/* Built-in scripts */}
+            <Text style={m.sectionLabel}>▸ BUILT-IN</Text>
+            {BUILTIN_SCRIPTS.map(item => (
+              <TouchableOpacity
+                key={item.id}
+                style={m.scriptItem}
+                onPress={() => { setScript(item.code); setScriptsModal(false); }}
+              >
+                <View style={{flex: 1}}>
+                  <View style={{flexDirection: 'row', alignItems: 'center', gap: 7}}>
+                    <Text style={m.scriptNameText}>{item.name}</Text>
+                    <View style={m.tagBadge}>
+                      <Text style={m.tagText}>{item.tag}</Text>
+                    </View>
+                  </View>
+                  <Text style={m.scriptPreview} numberOfLines={1}>
+                    {item.code.replace(/\n/g, ' ').trim()}
+                  </Text>
+                </View>
+              </TouchableOpacity>
+            ))}
+
+            {/* User saved scripts */}
+            <Text style={[m.sectionLabel, {marginTop: 12}]}>▸ SAVED ({savedScripts.length})</Text>
             {savedScripts.length === 0 ? (
               <Text style={m.empty}>No saved scripts yet</Text>
             ) : (
@@ -811,5 +932,26 @@ const m = StyleSheet.create({
     justifyContent: 'space-between',
     alignItems: 'center',
     marginBottom: 14,
+  },
+  sectionLabel: {
+    color: '#334',
+    fontFamily: 'monospace',
+    fontSize: 10,
+    letterSpacing: 1,
+    marginBottom: 6,
+    marginTop: 2,
+  },
+  tagBadge: {
+    backgroundColor: '#001a0d',
+    borderWidth: 1,
+    borderColor: '#00ff8840',
+    borderRadius: 4,
+    paddingHorizontal: 5,
+    paddingVertical: 1,
+  },
+  tagText: {
+    color: '#00ff88',
+    fontFamily: 'monospace',
+    fontSize: 9,
   },
 });
