@@ -83,6 +83,7 @@ export default function ScriptScreen() {
   const [cloudError, setCloudError] = useState('');
   const [overlayActive, setOverlayActive] = useState(false);
   const scrollRef = useRef<ScrollView>(null);
+  const flatListRef = useRef<FlatList>(null);
   const listenerRef = useRef<any>(null);
   const runningRef = useRef(false);  // mirror of `running` accessible in AppState callback
 
@@ -253,8 +254,11 @@ export default function ScriptScreen() {
 
   const addOut = (msg: string) => {
     const ts = new Date().toLocaleTimeString();
-    setOutput(prev => [...prev.slice(-300), `[${ts}] ${msg}`]);
-    setTimeout(() => scrollRef.current?.scrollToEnd({animated: false}), 50);
+    setOutput(prev => {
+      const next = [...prev, `[${ts}] ${msg}`];
+      // Keep last 500 lines max — prevents memory buildup on heavy scripts
+      return next.length > 500 ? next.slice(next.length - 500) : next;
+    });
   };
 
   const stopScript = async () => {
@@ -458,26 +462,32 @@ export default function ScriptScreen() {
             </TouchableOpacity>
           )}
         </View>
-        <ScrollView ref={scrollRef} style={s.outScroll}>
-          {filteredOutput.length === 0 ? (
-            <Text style={s.outEmpty}>
-              {searchQuery ? 'No matches' : 'No output yet'}
-            </Text>
-          ) : (
-            filteredOutput.map((l, i) => (
+        {filteredOutput.length === 0 ? (
+          <Text style={s.outEmpty}>{searchQuery ? 'No matches' : 'No output yet'}</Text>
+        ) : (
+          <FlatList
+            ref={flatListRef}
+            data={filteredOutput}
+            keyExtractor={(_, i) => String(i)}
+            style={s.outScroll}
+            // Auto-scroll to bottom when new logs arrive
+            onContentSizeChange={() => flatListRef.current?.scrollToEnd({animated: false})}
+            // Virtualized — only renders visible rows, never freezes
+            initialNumToRender={30}
+            maxToRenderPerBatch={30}
+            windowSize={10}
+            removeClippedSubviews
+            getItemLayout={(_, index) => ({length: 18, offset: 18 * index, index})}
+            renderItem={({item}) => (
               <TouchableOpacity
-                key={i}
-                onLongPress={() => {
-                  Clipboard.setString(l);
-                  Alert.alert('Copied', 'Line copied to clipboard');
-                }}
+                onLongPress={() => { Clipboard.setString(item); Alert.alert('Copied', 'Line copied'); }}
                 activeOpacity={0.7}
               >
-                <Text style={[s.outLine, l.includes('✗') && s.outErr]}>{l}</Text>
+                <Text style={[s.outLine, item.includes('✗') && s.outErr]}>{item}</Text>
               </TouchableOpacity>
-            ))
-          )}
-        </ScrollView>
+            )}
+          />
+        )}
       </View>
 
       {/* Scripts Manager Modal */}
