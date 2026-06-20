@@ -13,8 +13,9 @@ import ScriptScreen      from './src/screens/ScriptScreen';
 import ConsoleScreen     from './src/screens/ConsoleScreen';
 import AnalyzerScreen    from './src/screens/AnalyzerScreen';
 import LicenseScreen, {LICENSE_KEY_STORAGE, LICENSE_SERVER} from './src/screens/LicenseScreen';
-import CommunityScreen from './src/screens/CommunityScreen';
-import GameScreen      from './src/screens/GameScreen';
+import CommunityScreen  from './src/screens/CommunityScreen';
+import GameScreen       from './src/screens/GameScreen';
+import HackGamesScreen  from './src/screens/HackGamesScreen';
 
 const Tab   = createBottomTabNavigator();
 const Stack = createNativeStackNavigator();
@@ -161,6 +162,10 @@ export default function App() {
           <Tab.Screen
             name="Game" component={GameScreen}
             options={{title: 'Game', tabBarIcon: ({color}) => <TabIcon name="🎮" color={color} />}}
+          />
+          <Tab.Screen
+            name="HackGames" component={HackGamesScreen}
+            options={{title: 'Hack Games', tabBarIcon: ({color}) => <TabIcon name="🕹" color={color} />}}
           />
           <Tab.Screen
             name="Community" component={CommunityScreen}
