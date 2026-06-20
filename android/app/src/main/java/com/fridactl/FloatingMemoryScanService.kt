@@ -1,10 +1,12 @@
 package com.fridactl
 
+import android.annotation.SuppressLint
 import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.graphics.Color
 import android.graphics.PixelFormat
+import android.graphics.Typeface
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
@@ -12,54 +14,80 @@ import android.os.Looper
 import android.text.InputType
 import android.view.Gravity
 import android.view.MotionEvent
+import android.view.View
 import android.view.WindowManager
 import android.widget.*
 import com.topjohnwu.superuser.Shell
+import org.json.JSONArray
+import org.json.JSONObject
 
 /**
- * FloatingMemoryScanService — GameGuardian-style overlay for memory scanning.
- * Floats above running games. Allows scanning /proc/pid/mem for int32/float/string values,
- * editing matched addresses, and freezing values — all while the game runs in the background.
+ * FloatingMemoryScanService — GameGuardian-style overlay that floats
+ * above all other apps (including games). Draggable title bar.
  *
- * Requires SYSTEM_ALERT_WINDOW (already granted in AndroidManifest).
+ * Flow:
+ *   1. Start service with ACTION_SHOW + EXTRA_PKG
+ *   2. Overlay appears: pkg header, value input, type chips, mode chips,
+ *      SEARCH button, results list, per-result WRITE + FREEZE, close btn
+ *   3. Scan runs frida-inject on the target process via shell (same path as RootBridgeModule)
+ *   4. Results populate a scrollable list
+ *   5. Tap result → bottom panel appears: write value + WRITE / FREEZE / ✕
  */
 class FloatingMemoryScanService : Service() {
 
     companion object {
-        const val ACTION_SHOW   = "com.fridactl.MEMSCAN_SHOW"
-        const val ACTION_HIDE   = "com.fridactl.MEMSCAN_HIDE"
-        const val EXTRA_PKG     = "pkg"
+        const val ACTION_SHOW = "com.fridactl.FMEM_SHOW"
+        const val ACTION_HIDE = "com.fridactl.FMEM_HIDE"
+        const val EXTRA_PKG   = "pkg"
 
         var instance: FloatingMemoryScanService? = null
 
-        data class MemHit(val addr: String, var value: String, val region: String)
+        // Colours (match FridaCtl dark theme)
+        private const val GREEN  = "#00ff88"
+        private const val BG     = "#E00d0d0d"
+        private const val CARD   = "#CC111111"
+        private const val DIM    = "#666666"
+        private const val YELLOW = "#FFD700"
+        private const val RED    = "#ff4444"
+        private const val BORDER = "#1a3a2a"
     }
 
+    // ─── State ────────────────────────────────────────────────────────────────
     private var wm: WindowManager? = null
     private var rootView: LinearLayout? = null
     private var visible = false
-    private val handler = Handler(Looper.getMainLooper())
 
-    // UI refs
-    private var tvStatus: TextView? = null
-    private var etPkg: EditText? = null
-    private var etValue: EditText? = null
-    private var rgType: RadioGroup? = null
-    private var resultsContainer: LinearLayout? = null
-    private var scrollResults: ScrollView? = null
-
-    // State
-    private var currentPkg: String = ""
-    private var currentPid: String = ""
-    private var scanType: String = "int32"  // int32 / float / string
-    private var hits: MutableList<MemHit> = mutableListOf()
-    private val frozenAddrs: MutableMap<String, String> = mutableMapOf()  // addr → value
-    private var freezeRunnable: Runnable? = null
-
-    // Drag
+    // Drag state
     private var initX = 0; private var initY = 0
     private var initTouchX = 0f; private var initTouchY = 0f
 
+    // Scan state
+    private var targetPkg = ""
+    private var targetPid = ""
+    private var scanType  = "int32"      // int32 | float | double | string
+    private var scanMode  = "exact"      // exact | changed | increased | decreased
+    private var scanCount = 0
+    private var results   = mutableListOf<ScanResult>()
+    private var frozenMap = mutableMapOf<String, FreezeJob>()   // addr → job
+
+    // UI refs
+    private var pkgLabel:      TextView?    = null
+    private var scanValueEt:   EditText?    = null
+    private var editValueEt:   EditText?    = null
+    private var logTv:         TextView?    = null
+    private var resultsLayout: LinearLayout? = null
+    private var actionPanel:   LinearLayout? = null
+    private var selectedAddr:  String?       = null
+    private var typeChips:     MutableMap<String, TextView> = mutableMapOf()
+    private var modeChips:     MutableMap<String, TextView> = mutableMapOf()
+    private var searchBtn:     TextView?    = null
+    private var scanCountTv:   TextView?    = null
+    private val mainHandler   = Handler(Looper.getMainLooper())
+
+    data class ScanResult(val addr: String, var value: String, var frozen: Boolean = false)
+    data class FreezeJob(val addr: String, var value: String, val handler: Handler, val runnable: Runnable)
+
+    // ─── Service lifecycle ────────────────────────────────────────────────────
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
@@ -74,9 +102,11 @@ class FloatingMemoryScanService : Service() {
             ACTION_SHOW -> {
                 val pkg = intent.getStringExtra(EXTRA_PKG) ?: ""
                 if (pkg.isNotBlank()) {
-                    currentPkg = pkg
-                    handler.post { etPkg?.setText(pkg) }
+                    targetPkg = pkg
+                    pkgLabel?.text = "📦 $pkg"
                 }
+                // resolve PID in background
+                Thread { resolvePid() }.start()
                 showOverlay()
             }
             ACTION_HIDE -> hideOverlay()
@@ -84,40 +114,81 @@ class FloatingMemoryScanService : Service() {
         return START_NOT_STICKY
     }
 
-    // ─────────────────────────── BUILD VIEW ────────────────────────────────────
+    override fun onDestroy() {
+        stopAllFreezes()
+        hideOverlay()
+        instance = null
+        super.onDestroy()
+    }
 
+    // ─── Build the entire overlay view ────────────────────────────────────────
+    @SuppressLint("ClickableViewAccessibility")
     private fun buildView() {
         rootView = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.parseColor("#F0080808"))
+            setBackgroundColor(Color.parseColor("#E00d0d0d"))
             setPadding(0, 0, 0, 0)
         }
 
-        // ── Title bar (draggable) ──────────────────────────────────────────────
-        val titleBar = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setBackgroundColor(Color.parseColor("#CC00ff88"))
-            setPadding(10, 6, 10, 6)
-        }
-        val tvTitle = TextView(this).apply {
-            text = "🧠 MemScan"
-            setTextColor(Color.BLACK)
-            textSize = 11f
-            typeface = android.graphics.Typeface.MONOSPACE
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-        }
-        val btnClose = TextView(this).apply {
-            text = "✕"
-            setTextColor(Color.BLACK)
-            textSize = 14f
-            setPadding(14, 0, 6, 0)
-            setOnClickListener { hideOverlay() }
-        }
-        titleBar.addView(tvTitle)
-        titleBar.addView(btnClose)
+        // ── Title bar (draggable) ──────────────────────────────────────────
+        val titleBar = makeTitleBar()
+        rootView!!.addView(titleBar)
 
+        // ── Package label ──────────────────────────────────────────────────
+        pkgLabel = TextView(this).apply {
+            text = "📦 No package set"
+            setTextColor(Color.parseColor(DIM))
+            textSize = 10f
+            typeface = Typeface.MONOSPACE
+            setPadding(10, 6, 10, 6)
+            setBackgroundColor(Color.parseColor("#CC0a0a0a"))
+        }
+        rootView!!.addView(pkgLabel)
+
+        // ── Type chips ────────────────────────────────────────────────────
+        rootView!!.addView(makeTypeRow())
+
+        // ── Mode chips ────────────────────────────────────────────────────
+        rootView!!.addView(makeModeRow())
+
+        // ── Value input + SEARCH ──────────────────────────────────────────
+        rootView!!.addView(makeInputRow())
+
+        // ── Scan count + NEW SCAN button ──────────────────────────────────
+        rootView!!.addView(makeScanInfoRow())
+
+        // ── Results scroll ────────────────────────────────────────────────
+        val scrollView = ScrollView(this).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
+            setBackgroundColor(Color.parseColor("#CC080808"))
+        }
+        resultsLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+        scrollView.addView(resultsLayout)
+        rootView!!.addView(scrollView)
+
+        // ── Action panel (write/freeze — shown when addr tapped) ─────────
+        actionPanel = makeActionPanel()
+        actionPanel!!.visibility = View.GONE
+        rootView!!.addView(actionPanel)
+
+        // ── Log bar ───────────────────────────────────────────────────────
+        logTv = TextView(this).apply {
+            text = "[ Ready ]"
+            setTextColor(Color.parseColor(DIM))
+            textSize = 9f
+            typeface = Typeface.MONOSPACE
+            setPadding(10, 4, 10, 6)
+            setBackgroundColor(Color.parseColor("#CC050505"))
+        }
+        rootView!!.addView(logTv)
+
+        // ── Drag listener on title bar ────────────────────────────────────
         titleBar.setOnTouchListener { _, ev ->
-            val lp = rootView!!.layoutParams as? WindowManager.LayoutParams ?: return@setOnTouchListener false
+            val lp = rootView!!.layoutParams as? WindowManager.LayoutParams
+                ?: return@setOnTouchListener false
             when (ev.action) {
                 MotionEvent.ACTION_DOWN -> {
                     initX = lp.x; initY = lp.y
@@ -131,502 +202,732 @@ class FloatingMemoryScanService : Service() {
             }
             true
         }
+    }
 
-        // ── Body ──────────────────────────────────────────────────────────────
-        val body = LinearLayout(this).apply {
+    @SuppressLint("ClickableViewAccessibility")
+    private fun makeTitleBar(): LinearLayout {
+        val bar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setBackgroundColor(Color.parseColor("#CC003322"))
+            setPadding(10, 8, 8, 8)
+        }
+        val title = TextView(this).apply {
+            text = "🧠 Memory Scanner"
+            setTextColor(Color.parseColor(GREEN))
+            textSize = 12f
+            typeface = Typeface.MONOSPACE
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        val closeBtn = TextView(this).apply {
+            text = "  ✕  "
+            setTextColor(Color.parseColor(RED))
+            textSize = 14f
+            typeface = Typeface.MONOSPACE
+            setOnClickListener { hideOverlay() }
+        }
+        bar.addView(title)
+        bar.addView(closeBtn)
+        return bar
+    }
+
+    private fun makeTypeRow(): HorizontalScrollView {
+        val scroll = HorizontalScrollView(this).apply {
+            setPadding(6, 6, 6, 0)
+            setBackgroundColor(Color.TRANSPARENT)
+        }
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+        }
+        val types = listOf("int32" to "Dword", "float" to "Float", "double" to "Double",
+                           "int64" to "Qword", "string" to "String")
+        for ((val_, lbl) in types) {
+            val chip = makeChip(lbl, val_ == scanType)
+            chip.setOnClickListener {
+                scanType = val_
+                typeChips.values.forEach { resetChip(it) }
+                activateChip(chip)
+            }
+            typeChips[val_] = chip
+            row.addView(chip)
+        }
+        scroll.addView(row)
+        return scroll
+    }
+
+    private fun makeModeRow(): HorizontalScrollView {
+        val scroll = HorizontalScrollView(this).apply {
+            setPadding(6, 4, 6, 4)
+            setBackgroundColor(Color.TRANSPARENT)
+        }
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+        }
+        val modes = listOf(
+            "exact"     to "= Exact",
+            "changed"   to "≠ Changed",
+            "increased" to "↑ Up",
+            "decreased" to "↓ Down",
+            "unknown"   to "? Any"
+        )
+        for ((val_, lbl) in modes) {
+            val chip = makeChip(lbl, val_ == scanMode)
+            chip.setOnClickListener {
+                scanMode = val_
+                modeChips.values.forEach { resetChip(it) }
+                activateChip(chip)
+            }
+            modeChips[val_] = chip
+            row.addView(chip)
+        }
+        scroll.addView(row)
+        return scroll
+    }
+
+    private fun makeInputRow(): LinearLayout {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(8, 0, 8, 6)
+        }
+        scanValueEt = EditText(this).apply {
+            hint = "Value to scan"
+            setHintTextColor(Color.parseColor(DIM))
+            setTextColor(Color.WHITE)
+            textSize = 13f
+            typeface = Typeface.MONOSPACE
+            setBackgroundColor(Color.parseColor("#CC1a1a1a"))
+            setPadding(10, 8, 10, 8)
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL or InputType.TYPE_NUMBER_FLAG_SIGNED
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginEnd = 6
+            }
+        }
+        searchBtn = TextView(this).apply {
+            text = "🔍 SCAN"
+            setTextColor(Color.parseColor(GREEN))
+            textSize = 11f
+            typeface = Typeface.MONOSPACE
+            setBackgroundColor(Color.parseColor("#CC001a0d"))
+            setPadding(14, 10, 14, 10)
+            setOnClickListener { onScanClicked() }
+        }
+        row.addView(scanValueEt)
+        row.addView(searchBtn!!)
+        return row
+    }
+
+    private fun makeScanInfoRow(): LinearLayout {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(10, 0, 8, 6)
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        scanCountTv = TextView(this).apply {
+            text = ""
+            setTextColor(Color.parseColor(DIM))
+            textSize = 9.5f
+            typeface = Typeface.MONOSPACE
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        val newBtn = TextView(this).apply {
+            text = "NEW"
+            setTextColor(Color.parseColor(DIM))
+            textSize = 10f
+            typeface = Typeface.MONOSPACE
+            setPadding(10, 6, 10, 6)
+            setOnClickListener { resetScan() }
+        }
+        row.addView(scanCountTv)
+        row.addView(newBtn)
+        return row
+    }
+
+    private fun makeActionPanel(): LinearLayout {
+        val panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.parseColor("#CC0a0a0a"))
             setPadding(10, 8, 10, 8)
         }
-
-        // Package input
-        val tvPkgLabel = TextView(this).apply {
-            text = "PACKAGE"
-            setTextColor(Color.parseColor("#00ff88"))
-            textSize = 9f
-            typeface = android.graphics.Typeface.MONOSPACE
-        }
-        etPkg = EditText(this).apply {
-            hint = "com.game.package"
-            setHintTextColor(Color.parseColor("#444444"))
-            setTextColor(Color.WHITE)
+        val addrTv = TextView(this).apply {
+            tag = "addrTv"
+            text = "▶ ─"
+            setTextColor(Color.parseColor(GREEN))
             textSize = 10f
-            typeface = android.graphics.Typeface.MONOSPACE
-            background = null
-            setPadding(0, 2, 0, 4)
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
-            setSingleLine(true)
-            if (currentPkg.isNotBlank()) setText(currentPkg)
+            typeface = Typeface.MONOSPACE
         }
-
-        // Type selector
-        val tvTypeLabel = TextView(this).apply {
-            text = "TYPE"
-            setTextColor(Color.parseColor("#00ff88"))
-            textSize = 9f
-            typeface = android.graphics.Typeface.MONOSPACE
-        }
-        rgType = RadioGroup(this).apply {
-            orientation = RadioGroup.HORIZONTAL
-        }
-        listOf("int32", "float", "string").forEachIndexed { i, t ->
-            val rb = RadioButton(this).apply {
-                text = t
-                setTextColor(Color.parseColor("#cccccc"))
-                textSize = 9.5f
-                typeface = android.graphics.Typeface.MONOSPACE
-                isChecked = (i == 0)
-                setOnClickListener { scanType = t }
-                setPadding(0, 0, 16, 0)
-            }
-            rgType!!.addView(rb)
-        }
-
-        // Value input
-        val tvValLabel = TextView(this).apply {
-            text = "VALUE"
-            setTextColor(Color.parseColor("#00ff88"))
-            textSize = 9f
-            typeface = android.graphics.Typeface.MONOSPACE
-        }
-        etValue = EditText(this).apply {
-            hint = "e.g. 1000"
-            setHintTextColor(Color.parseColor("#444444"))
+        editValueEt = EditText(this).apply {
+            hint = "New value"
+            setHintTextColor(Color.parseColor(DIM))
             setTextColor(Color.WHITE)
-            textSize = 11f
-            typeface = android.graphics.Typeface.MONOSPACE
-            background = null
-            setPadding(0, 2, 0, 4)
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
-            setSingleLine(true)
+            textSize = 12f
+            typeface = Typeface.MONOSPACE
+            setBackgroundColor(Color.parseColor("#CC1a1a1a"))
+            setPadding(8, 6, 8, 6)
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL or InputType.TYPE_NUMBER_FLAG_SIGNED
         }
-
-        // Status
-        tvStatus = TextView(this).apply {
-            text = "Ready"
-            setTextColor(Color.parseColor("#888888"))
-            textSize = 9f
-            typeface = android.graphics.Typeface.MONOSPACE
-            setPadding(0, 2, 0, 2)
-        }
-
-        // Scan / Next buttons
         val btnRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            setPadding(0, 4, 0, 4)
-        }
-        val btnScan = makeButton("SCAN") { doScan(false) }
-        val btnNext = makeButton("NEXT SCAN") { doScan(true) }
-        val btnClear = makeButton("CLR") { clearResults() }
-        btnRow.addView(btnScan)
-        btnRow.addView(space(6))
-        btnRow.addView(btnNext)
-        btnRow.addView(space(6))
-        btnRow.addView(btnClear)
-
-        // Divider
-        val divider = android.view.View(this).apply {
-            setBackgroundColor(Color.parseColor("#1a1a1a"))
-            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 1)
-        }
-
-        // Results scroll
-        scrollResults = ScrollView(this).apply {
             layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                220
-            )
-        }
-        resultsContainer = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(0, 4, 0, 4)
-        }
-        scrollResults!!.addView(resultsContainer)
-
-        body.addView(tvPkgLabel)
-        body.addView(etPkg)
-        body.addView(tvTypeLabel)
-        body.addView(rgType)
-        body.addView(tvValLabel)
-        body.addView(etValue)
-        body.addView(tvStatus)
-        body.addView(btnRow)
-        body.addView(divider)
-        body.addView(scrollResults)
-
-        rootView!!.addView(titleBar)
-        rootView!!.addView(body)
-    }
-
-    private fun makeButton(label: String, onClick: () -> Unit): TextView {
-        return TextView(this).apply {
-            text = label
-            setTextColor(Color.parseColor("#00ff88"))
-            textSize = 9.5f
-            typeface = android.graphics.Typeface.MONOSPACE
-            background = android.graphics.drawable.GradientDrawable().apply {
-                setStroke(1, Color.parseColor("#00ff88"))
-                cornerRadius = 3f
-                setColor(Color.TRANSPARENT)
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                topMargin = 6
             }
-            setPadding(10, 5, 10, 5)
-            setOnClickListener { onClick() }
         }
-    }
-
-    private fun space(dp: Int): android.view.View {
-        return android.view.View(this).apply {
-            layoutParams = LinearLayout.LayoutParams(dp, 1)
-        }
-    }
-
-    // ─────────────────────────── SCAN LOGIC ────────────────────────────────────
-
-    private fun doScan(narrowDown: Boolean) {
-        val pkg = etPkg?.text?.toString()?.trim() ?: ""
-        val value = etValue?.text?.toString()?.trim() ?: ""
-        if (pkg.isEmpty()) { setStatus("Enter package name"); return }
-        if (value.isEmpty()) { setStatus("Enter value to search"); return }
-
-        currentPkg = pkg
-        setStatus("Resolving PID...")
-
-        Thread {
-            try {
-                // Resolve PID
-                val pidOut = Shell.cmd("pidof '$pkg' 2>/dev/null | tr ' ' '\\n' | head -1").exec()
-                    .out.firstOrNull()?.trim() ?: ""
-                if (pidOut.isEmpty() || !pidOut.all { it.isDigit() }) {
-                    setStatus("Process not running: $pkg"); return@Thread
-                }
-                currentPid = pidOut
-                setStatus("Scanning PID $pidOut...")
-
-                val newHits = mutableListOf<MemHit>()
-
-                if (scanType == "string") {
-                    // String scan via dd + grep over heap regions
-                    val mapsOut = Shell.cmd(
-                        "cat /proc/$pidOut/maps 2>/dev/null | grep -E 'heap|\\[anon\\]' | head -20"
-                    ).exec().out
-                    for (line in mapsOut) {
-                        if (line.isBlank()) continue
-                        val range = line.split("\\s+".toRegex()).firstOrNull() ?: continue
-                        val parts = range.split("-")
-                        if (parts.size != 2) continue
-                        val startHex = parts[0]; val endHex = parts[1]
-                        try {
-                            val startDec = startHex.toLong(16)
-                            val endDec = endHex.toLong(16)
-                            val size = endDec - startDec
-                            if (size <= 0 || size > 20 * 1024 * 1024) continue
-                            val grepOut = Shell.cmd(
-                                "dd if=/proc/$pidOut/mem bs=1 skip=$startDec count=$size 2>/dev/null | " +
-                                "strings 2>/dev/null | grep -i '${value}' | head -5"
-                            ).exec().out
-                            for (match in grepOut) {
-                                if (match.isNotBlank()) {
-                                    newHits.add(MemHit(startHex, match.trim(), "[string in heap]"))
-                                }
-                            }
-                        } catch (_: Exception) {}
-                    }
-                } else {
-                    // int32 / float scan via Frida-generated script (we generate and inject via shell)
-                    val numVal = if (scanType == "int32") value.toIntOrNull() ?: 0
-                                 else value.toFloatOrNull() ?: 0f
-                    // Use /proc/pid/mem + known writable regions
-                    val mapsOut = Shell.cmd(
-                        "cat /proc/$pidOut/maps 2>/dev/null | grep 'rw' | " +
-                        "grep -v -E 'vvar|vdso|vsyscall' | head -40"
-                    ).exec().out
-
-                    for (line in mapsOut) {
-                        if (line.isBlank()) continue
-                        val cols = line.split("\\s+".toRegex())
-                        val range = cols.firstOrNull() ?: continue
-                        val parts = range.split("-")
-                        if (parts.size != 2) continue
-                        try {
-                            val startDec = parts[0].toLong(16)
-                            val endDec   = parts[1].toLong(16)
-                            val size = endDec - startDec
-                            if (size <= 0 || size > 10 * 1024 * 1024) continue
-                            val regionName = cols.lastOrNull() ?: "[anon]"
-
-                            // Use xxd/hexdump to read binary and grep for byte pattern
-                            val bytePattern = if (scanType == "int32") {
-                                val v = numVal as Int
-                                // little-endian 4 bytes
-                                "%02x%02x%02x%02x".format(
-                                    v and 0xFF, (v shr 8) and 0xFF,
-                                    (v shr 16) and 0xFF, (v shr 24) and 0xFF
-                                )
-                            } else {
-                                // float to little-endian IEEE 754
-                                val bits = java.lang.Float.floatToRawIntBits(numVal as Float)
-                                "%02x%02x%02x%02x".format(
-                                    bits and 0xFF, (bits shr 8) and 0xFF,
-                                    (bits shr 16) and 0xFF, (bits shr 24) and 0xFF
-                                )
-                            }
-
-                            // xxd output: address: bytes  ascii
-                            val hexOut = Shell.cmd(
-                                "dd if=/proc/$pidOut/mem bs=1 skip=$startDec count=$size 2>/dev/null | " +
-                                "xxd 2>/dev/null | grep '$bytePattern' | head -10"
-                            ).exec().out
-
-                            for (matchLine in hexOut) {
-                                if (matchLine.isBlank()) continue
-                                // xxd gives offset in the dump, not real address
-                                val offsetHex = matchLine.split(":").firstOrNull()?.trim() ?: continue
-                                val offset = try { offsetHex.toLong(16) } catch (_: Exception) { 0L }
-                                val realAddr = (startDec + offset).toString(16)
-                                if (narrowDown) {
-                                    if (hits.any { it.addr == realAddr }) {
-                                        newHits.add(MemHit(realAddr, value, regionName))
-                                    }
-                                } else {
-                                    newHits.add(MemHit(realAddr, value, regionName))
-                                }
-                                if (newHits.size >= 50) break
-                            }
-                        } catch (_: Exception) {}
-                        if (newHits.size >= 50) break
-                    }
-                }
-
-                hits = newHits
-                val count = newHits.size
-                setStatus("Found $count match${if (count == 1) "" else "es"}")
-                handler.post { renderResults() }
-
-            } catch (e: Exception) {
-                setStatus("Error: ${e.message}")
-            }
-        }.start()
-    }
-
-    private fun clearResults() {
-        hits.clear()
-        frozenAddrs.clear()
-        freezeRunnable?.let { handler.removeCallbacks(it) }
-        handler.post { resultsContainer?.removeAllViews(); setStatus("Cleared") }
-    }
-
-    private fun renderResults() {
-        resultsContainer?.removeAllViews()
-        if (hits.isEmpty()) return
-
-        for (hit in hits.take(30)) {
-            val row = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                setPadding(0, 3, 0, 3)
-            }
-
-            val tvAddr = TextView(this).apply {
-                text = "0x${hit.addr}"
-                setTextColor(Color.parseColor("#00ff88"))
-                textSize = 9f
-                typeface = android.graphics.Typeface.MONOSPACE
-                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.2f)
-            }
-            val tvVal = TextView(this).apply {
-                text = hit.value
-                setTextColor(Color.parseColor("#ffcc00"))
-                textSize = 9f
-                typeface = android.graphics.Typeface.MONOSPACE
-                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 0.8f)
-            }
-            val btnEdit = makeSmallBtn("EDIT") { showEditDialog(hit) }
-            val isFrozen = frozenAddrs.containsKey(hit.addr)
-            val btnFreeze = makeSmallBtn(if (isFrozen) "UNFRZ" else "FRZ",
-                if (isFrozen) Color.parseColor("#ff4444") else Color.parseColor("#555555")
-            ) { toggleFreeze(hit) }
-
-            row.addView(tvAddr)
-            row.addView(tvVal)
-            row.addView(btnEdit)
-            row.addView(space(4))
-            row.addView(btnFreeze)
-            resultsContainer?.addView(row)
-        }
-
-        if (hits.size > 30) {
-            val tvMore = TextView(this).apply {
-                text = "+${hits.size - 30} more..."
-                setTextColor(Color.parseColor("#555555"))
-                textSize = 9f
-                typeface = android.graphics.Typeface.MONOSPACE
-                setPadding(0, 4, 0, 0)
-            }
-            resultsContainer?.addView(tvMore)
-        }
-    }
-
-    private fun makeSmallBtn(label: String, color: Int = Color.parseColor("#00ff88"), onClick: () -> Unit): TextView {
-        return TextView(this).apply {
-            text = label
-            setTextColor(color)
-            textSize = 8.5f
-            typeface = android.graphics.Typeface.MONOSPACE
-            background = android.graphics.drawable.GradientDrawable().apply {
-                setStroke(1, color)
-                cornerRadius = 2f
-                setColor(Color.TRANSPARENT)
-            }
-            setPadding(6, 3, 6, 3)
-            setOnClickListener { onClick() }
-        }
-    }
-
-    // ─────────────────────────── EDIT / FREEZE ─────────────────────────────────
-
-    private fun showEditDialog(hit: MemHit) {
-        // Can't show AlertDialog from a Service — use inline EditText popup inside overlay
-        val overlay = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.parseColor("#F0111111"))
-            setPadding(10, 8, 10, 8)
-        }
-        val tvLabel = TextView(this).apply {
-            text = "New value for 0x${hit.addr}:"
-            setTextColor(Color.WHITE)
-            textSize = 10f
-            typeface = android.graphics.Typeface.MONOSPACE
-        }
-        val etNew = EditText(this).apply {
-            setText(hit.value)
-            setTextColor(Color.WHITE)
+        val writeBtn = TextView(this).apply {
+            text = "WRITE"
+            setTextColor(Color.parseColor(GREEN))
             textSize = 11f
-            typeface = android.graphics.Typeface.MONOSPACE
-            background = null
-            inputType = InputType.TYPE_CLASS_TEXT
-            setSingleLine(true)
+            typeface = Typeface.MONOSPACE
+            setBackgroundColor(Color.parseColor("#CC001a0d"))
+            setPadding(12, 8, 12, 8)
+            gravity = Gravity.CENTER
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = 4 }
+            setOnClickListener { doWrite() }
         }
-        val btnRow2 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        val btnOk = makeButton("WRITE") {
-            val newVal = etNew.text.toString().trim()
-            if (newVal.isNotBlank()) {
-                hit.value = newVal
-                writeMemory(hit.addr, newVal)
-            }
-            rootView?.removeView(overlay)
+        val freezeBtn = TextView(this).apply {
+            tag = "freezeBtn"
+            text = "❄ FREEZE"
+            setTextColor(Color.parseColor(YELLOW))
+            textSize = 11f
+            typeface = Typeface.MONOSPACE
+            setBackgroundColor(Color.parseColor("#CC1a1400"))
+            setPadding(12, 8, 12, 8)
+            gravity = Gravity.CENTER
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = 4 }
+            setOnClickListener { doToggleFreeze() }
         }
-        val btnCancel = makeButton("CANCEL") { rootView?.removeView(overlay) }
-        btnRow2.addView(btnOk); btnRow2.addView(space(8)); btnRow2.addView(btnCancel)
-        overlay.addView(tvLabel); overlay.addView(etNew); overlay.addView(btnRow2)
-        rootView?.addView(overlay)
-    }
-
-    private fun writeMemory(addr: String, newVal: String) {
-        val pid = currentPid
-        if (pid.isBlank()) { setStatus("No PID — scan first"); return }
-        setStatus("Writing 0x$addr = $newVal...")
-        Thread {
-            try {
-                val decAddr = addr.toLong(16)
-                val bytes = when (scanType) {
-                    "int32" -> {
-                        val v = newVal.toInt()
-                        byteArrayOf(
-                            (v and 0xFF).toByte(), ((v shr 8) and 0xFF).toByte(),
-                            ((v shr 16) and 0xFF).toByte(), ((v shr 24) and 0xFF).toByte()
-                        )
-                    }
-                    "float" -> {
-                        val bits = java.lang.Float.floatToRawIntBits(newVal.toFloat())
-                        byteArrayOf(
-                            (bits and 0xFF).toByte(), ((bits shr 8) and 0xFF).toByte(),
-                            ((bits shr 16) and 0xFF).toByte(), ((bits shr 24) and 0xFF).toByte()
-                        )
-                    }
-                    else -> newVal.toByteArray()
-                }
-                // Write via /proc/pid/mem using dd
-                val hexBytes = bytes.joinToString("") { "\\x%02x".format(it) }
-                val result = Shell.cmd(
-                    "printf '$hexBytes' | dd of=/proc/$pid/mem bs=1 seek=$decAddr count=${bytes.size} conv=notrunc 2>/dev/null && echo OK"
-                ).exec().out.firstOrNull()?.trim() ?: "?"
-                setStatus("Write: $result @ 0x$addr")
-                handler.post { renderResults() }
-            } catch (e: Exception) {
-                setStatus("Write error: ${e.message}")
-            }
-        }.start()
-    }
-
-    private fun toggleFreeze(hit: MemHit) {
-        if (frozenAddrs.containsKey(hit.addr)) {
-            frozenAddrs.remove(hit.addr)
-            setStatus("Unfroze 0x${hit.addr}")
-        } else {
-            frozenAddrs[hit.addr] = hit.value
-            setStatus("Froze 0x${hit.addr} = ${hit.value}")
-            startFreezeLoop()
-        }
-        handler.post { renderResults() }
-    }
-
-    private fun startFreezeLoop() {
-        freezeRunnable?.let { handler.removeCallbacks(it) }
-        freezeRunnable = object : Runnable {
-            override fun run() {
-                if (frozenAddrs.isEmpty()) return
-                for ((addr, value) in frozenAddrs.toMap()) {
-                    writeMemory(addr, value)
-                }
-                handler.postDelayed(this, 1500)
+        val closeBtn = TextView(this).apply {
+            text = "✕"
+            setTextColor(Color.parseColor(DIM))
+            textSize = 13f
+            typeface = Typeface.MONOSPACE
+            setPadding(12, 8, 10, 8)
+            setOnClickListener {
+                selectedAddr = null
+                actionPanel?.visibility = View.GONE
             }
         }
-        handler.postDelayed(freezeRunnable!!, 1500)
+        btnRow.addView(writeBtn)
+        btnRow.addView(freezeBtn)
+        btnRow.addView(closeBtn)
+
+        panel.addView(addrTv)
+        panel.addView(editValueEt!!)
+        panel.addView(btnRow)
+        return panel
     }
 
-    // ─────────────────────────── OVERLAY SHOW/HIDE ─────────────────────────────
+    // ─── Chip helpers ─────────────────────────────────────────────────────────
+    private fun makeChip(label: String, active: Boolean): TextView {
+        return TextView(this).apply {
+            text = label
+            textSize = 10f
+            typeface = Typeface.MONOSPACE
+            setPadding(12, 6, 12, 6)
+            setTextColor(Color.parseColor(if (active) GREEN else DIM))
+            setBackgroundColor(Color.parseColor(if (active) "#CC001a0d" else "#CC111111"))
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { marginEnd = 4 }
+        }
+    }
+    private fun resetChip(tv: TextView) {
+        tv.setTextColor(Color.parseColor(DIM))
+        tv.setBackgroundColor(Color.parseColor("#CC111111"))
+    }
+    private fun activateChip(tv: TextView) {
+        tv.setTextColor(Color.parseColor(GREEN))
+        tv.setBackgroundColor(Color.parseColor("#CC001a0d"))
+    }
 
+    // ─── Window management ────────────────────────────────────────────────────
     private fun makeLayoutParams(): WindowManager.LayoutParams {
         val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
         else
             @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
+
         return WindowManager.LayoutParams(
-            560, WindowManager.LayoutParams.WRAP_CONTENT,
+            560, 680,
             type,
             WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
             WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = 30; y = 200
+            x = 20; y = 80
         }
     }
 
     fun showOverlay() {
-        if (visible) return
-        try {
-            wm?.addView(rootView, makeLayoutParams())
-            visible = true
-            setStatus("Ready — enter package + value")
-        } catch (e: Exception) {
-            e.printStackTrace()
+        mainHandler.post {
+            if (visible) return@post
+            try {
+                wm?.addView(rootView, makeLayoutParams())
+                visible = true
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
         }
     }
 
     fun hideOverlay() {
-        if (!visible) return
-        try { wm?.removeView(rootView) } catch (_: Exception) {}
-        visible = false
-        freezeRunnable?.let { handler.removeCallbacks(it) }
+        mainHandler.post {
+            if (!visible) return@post
+            try { wm?.removeView(rootView) } catch (_: Exception) {}
+            visible = false
+        }
     }
 
-    private fun setStatus(msg: String) {
-        handler.post { tvStatus?.text = msg }
+    // ─── PID resolution ───────────────────────────────────────────────────────
+    private fun resolvePid(): String {
+        if (targetPid.isNotBlank() && targetPid.all { it.isDigit() }) return targetPid
+        if (targetPkg.isBlank()) return ""
+        val out = Shell.cmd("pidof '${targetPkg}' 2>/dev/null | tr ' ' '\\n' | head -1").exec()
+            .out.firstOrNull()?.trim() ?: ""
+        if (out.isNotBlank()) {
+            targetPid = out
+            mainHandler.post { log("PID resolved: $out") }
+        }
+        return out
     }
 
-    override fun onDestroy() {
-        hideOverlay()
-        freezeRunnable?.let { handler.removeCallbacks(it) }
-        instance = null
-        super.onDestroy()
+    // ─── Scan ─────────────────────────────────────────────────────────────────
+    private fun onScanClicked() {
+        val value = scanValueEt?.text?.toString()?.trim() ?: ""
+        if (value.isEmpty() && scanMode == "exact") {
+            log("✗ Enter a value first")
+            return
+        }
+        setBusy(true)
+        if (scanCount == 0) {
+            Thread { doFirstScan(value) }.start()
+        } else {
+            Thread { doNextScan(value) }.start()
+        }
+    }
+
+    private fun doFirstScan(value: String) {
+        try {
+            val pid = resolvePid()
+            if (pid.isEmpty()) { mainHandler.post { log("✗ Process not found — launch game first"); setBusy(false) }; return }
+            mainHandler.post { log("[SCAN #1] type=$scanType val=$value") }
+
+            val script = buildScanScript(value, emptyList())
+            val raw = runFrida(pid, script)
+            val parsed = parseResults(raw)
+
+            mainHandler.post {
+                results.clear()
+                results.addAll(parsed)
+                scanCount = 1
+                renderResults()
+                updateScanCount()
+                log("✓ Found ${parsed.size} addresses")
+                setBusy(false)
+            }
+        } catch (e: Exception) {
+            mainHandler.post { log("✗ ${e.message}"); setBusy(false) }
+        }
+    }
+
+    private fun doNextScan(value: String) {
+        try {
+            val pid = resolvePid()
+            if (pid.isEmpty()) { mainHandler.post { log("✗ Process not found"); setBusy(false) }; return }
+            mainHandler.post { log("[NEXT #${scanCount + 1}] val=$value mode=$scanMode") }
+
+            val addrs = results.map { it.addr }
+            val script = buildNextScanScript(value, addrs)
+            val raw = runFrida(pid, script)
+            val parsed = parseResults(raw)
+
+            mainHandler.post {
+                results.clear()
+                results.addAll(parsed)
+                scanCount++
+                renderResults()
+                updateScanCount()
+                log("✓ Narrowed to ${parsed.size} addresses")
+                setBusy(false)
+            }
+        } catch (e: Exception) {
+            mainHandler.post { log("✗ ${e.message}"); setBusy(false) }
+        }
+    }
+
+    // ─── Build scan Frida script ───────────────────────────────────────────────
+    private fun buildScanScript(value: String, prevAddrs: List<String>): String {
+        val readFn   = readFnFor(scanType)
+        val pattern  = buildPattern(value)
+        return """
+(function(){
+  var results = [];
+  Process.enumerateRanges({protection:"rw-",coalesce:true}).forEach(function(r){
+    if(r.size < 4) return;
+    try {
+      Memory.scan(r.base, r.size, "$pattern", {
+        onMatch: function(addr){
+          try { results.push({addr: addr.toString(), value: String(addr.$readFn)}); } catch(e){}
+          if(results.length >= 300) return "stop";
+        },
+        onError: function(){},
+        onComplete: function(){}
+      });
+    } catch(e){}
+  });
+  send({type:"scan_results", results: results});
+})();"""
+    }
+
+    private fun buildNextScanScript(value: String, addrs: List<String>): String {
+        val readFn = readFnFor(scanType)
+        val addrJson = addrs.take(200).joinToString(",") { "\"$it\"" }
+        val targetExpr = when (scanType) {
+            "string" -> "\"$value\""
+            "float"  -> value.toFloatOrNull()?.toString() ?: "0"
+            "double" -> value.toDoubleOrNull()?.toString() ?: "0"
+            "int64"  -> value.toLongOrNull()?.toString() ?: "0"
+            else     -> value.toIntOrNull()?.toString() ?: "0"
+        }
+        val mode = scanMode
+        return """
+(function(){
+  var addrs = [$addrJson];
+  var target = $targetExpr;
+  var results = [];
+  addrs.forEach(function(hexAddr){
+    try {
+      var ptr = ptr64(hexAddr);
+      var v = ptr.$readFn;
+      var pass = false;
+      if("$mode"==="exact")     pass = String(v)===String(target);
+      else if("$mode"==="changed")   pass = String(v)!==String(target);
+      else if("$mode"==="increased") pass = Number(v)>Number(target);
+      else if("$mode"==="decreased") pass = Number(v)<Number(target);
+      else pass = true;
+      if(pass) results.push({addr: hexAddr, value: String(v)});
+    } catch(e){}
+  });
+  send({type:"scan_results", results: results});
+})();"""
+    }
+
+    private fun readFnFor(type: String) = when (type) {
+        "float"  -> "readFloat()"
+        "double" -> "readDouble()"
+        "int64"  -> "readS64().toNumber()"
+        "string" -> "readCString()"
+        else     -> "readInt()"   // int32
+    }
+
+    private fun buildPattern(value: String): String {
+        return when (scanType) {
+            "int32" -> {
+                val v = value.toIntOrNull() ?: 0
+                val ab = java.nio.ByteBuffer.allocate(4).order(java.nio.ByteOrder.LITTLE_ENDIAN).putInt(v).array()
+                ab.joinToString(" ") { it.toInt().and(0xFF).toString(16).padStart(2, '0') }
+            }
+            "float" -> {
+                val v = value.toFloatOrNull() ?: 0f
+                val bits = java.lang.Float.floatToIntBits(v)
+                val ab = java.nio.ByteBuffer.allocate(4).order(java.nio.ByteOrder.LITTLE_ENDIAN).putInt(bits).array()
+                ab.joinToString(" ") { it.toInt().and(0xFF).toString(16).padStart(2, '0') }
+            }
+            "double" -> {
+                val v = value.toDoubleOrNull() ?: 0.0
+                val bits = java.lang.Double.doubleToLongBits(v)
+                val ab = java.nio.ByteBuffer.allocate(8).order(java.nio.ByteOrder.LITTLE_ENDIAN).putLong(bits).array()
+                ab.joinToString(" ") { it.toInt().and(0xFF).toString(16).padStart(2, '0') }
+            }
+            "string" -> value.toByteArray(Charsets.UTF_8).joinToString(" ") {
+                it.toInt().and(0xFF).toString(16).padStart(2, '0')
+            }
+            else -> {
+                val v = value.toLongOrNull() ?: 0L
+                val ab = java.nio.ByteBuffer.allocate(8).order(java.nio.ByteOrder.LITTLE_ENDIAN).putLong(v).array()
+                ab.joinToString(" ") { it.toInt().and(0xFF).toString(16).padStart(2, '0') }
+            }
+        }
+    }
+
+    // ─── Run Frida via shell (same approach as RootBridgeModule) ─────────────
+    private fun runFrida(pid: String, script: String): String {
+        val ctx = applicationContext
+        val fridaInject = "${ctx.applicationInfo.nativeLibraryDir}/libfrida-inject.so"
+        val scriptPath  = "${ctx.filesDir}/mem_scan_tmp.js"
+
+        // Write script file via root
+        val tmpLocal = java.io.File(ctx.filesDir, "mem_scan_tmp.js")
+        tmpLocal.writeText(script)
+        Shell.cmd("cp '${tmpLocal.absolutePath}' '$scriptPath' && chmod 644 '$scriptPath'").exec()
+
+        val cmd = "'$fridaInject' -p $pid -s '$scriptPath' 2>&1"
+        val r = Shell.cmd(cmd).exec()
+        tmpLocal.delete()
+        return r.out.joinToString("\n")
+    }
+
+    // ─── Parse results from Frida output ─────────────────────────────────────
+    private fun parseResults(raw: String): List<ScanResult> {
+        return try {
+            val match = Regex("""\{"type":"scan_results","results":\[[\s\S]*?\]\}""").find(raw)
+                ?: return emptyList()
+            val obj = JSONObject(match.value)
+            val arr: JSONArray = obj.getJSONArray("results")
+            (0 until arr.length()).map { i ->
+                val item = arr.getJSONObject(i)
+                ScanResult(item.getString("addr"), item.getString("value"))
+            }
+        } catch (_: Exception) { emptyList() }
+    }
+
+    // ─── WRITE ────────────────────────────────────────────────────────────────
+    private fun doWrite() {
+        val addr = selectedAddr ?: return
+        val value = editValueEt?.text?.toString()?.trim() ?: return
+        if (value.isEmpty()) { log("✗ Enter value to write"); return }
+        setBusy(true)
+        Thread {
+            try {
+                val pid = resolvePid()
+                val writeFn = when (scanType) {
+                    "float"  -> "writeFloat($value)"
+                    "double" -> "writeDouble($value)"
+                    "int64"  -> "writeS64($value)"
+                    "string" -> "writeUtf8String(\"$value\")"
+                    else     -> "writeInt($value)"
+                }
+                val script = """(function(){
+  var ptr = ptr64("$addr");
+  ptr.$writeFn;
+  send({type:"write_ok", addr:"$addr", value:"$value"});
+})();"""
+                runFrida(pid, script)
+                mainHandler.post {
+                    val res = results.find { it.addr == addr }
+                    res?.value = value
+                    renderResults()
+                    log("✓ Written $value → $addr")
+                    setBusy(false)
+                }
+            } catch (e: Exception) {
+                mainHandler.post { log("✗ ${e.message}"); setBusy(false) }
+            }
+        }.start()
+    }
+
+    // ─── FREEZE / UNFREEZE ────────────────────────────────────────────────────
+    private fun doToggleFreeze() {
+        val addr = selectedAddr ?: return
+        if (frozenMap.containsKey(addr)) {
+            doUnfreeze(addr)
+        } else {
+            doFreeze(addr)
+        }
+    }
+
+    private fun doFreeze(addr: String) {
+        val value = editValueEt?.text?.toString()?.trim() ?: return
+        if (value.isEmpty()) { log("✗ Enter value to freeze at"); return }
+        log("[FREEZE] $addr = $value")
+        val handler = Handler(Looper.getMainLooper())
+        val runnable = object : Runnable {
+            override fun run() {
+                Thread {
+                    try {
+                        val pid = resolvePid()
+                        val writeFn = when (scanType) {
+                            "float"  -> "writeFloat($value)"
+                            "double" -> "writeDouble($value)"
+                            "int64"  -> "writeS64($value)"
+                            "string" -> "writeUtf8String(\"$value\")"
+                            else     -> "writeInt($value)"
+                        }
+                        val script = """(function(){
+  var ptr = ptr64("$addr"); ptr.$writeFn;
+})();"""
+                        runFrida(pid, script)
+                    } catch (_: Exception) {}
+                }.start()
+                if (frozenMap.containsKey(addr)) handler.postDelayed(this, 500)
+            }
+        }
+        frozenMap[addr] = FreezeJob(addr, value, handler, runnable)
+        handler.post(runnable)
+        results.find { it.addr == addr }?.frozen = true
+        renderResults()
+        updateFreezeBtn(true)
+        log("✓ Frozen $addr at $value")
+    }
+
+    private fun doUnfreeze(addr: String) {
+        frozenMap.remove(addr)
+        results.find { it.addr == addr }?.frozen = false
+        renderResults()
+        updateFreezeBtn(false)
+        log("ℹ Unfrozen $addr")
+    }
+
+    private fun stopAllFreezes() {
+        frozenMap.clear()
+    }
+
+    // ─── Render results list ──────────────────────────────────────────────────
+    @SuppressLint("ClickableViewAccessibility")
+    private fun renderResults() {
+        val layout = resultsLayout ?: return
+        layout.removeAllViews()
+
+        if (results.isEmpty()) {
+            val empty = TextView(this).apply {
+                text = if (scanCount == 0)
+                    "Enter a value and press SCAN"
+                else
+                    "No addresses — try next scan"
+                setTextColor(Color.parseColor(DIM))
+                textSize = 11f
+                typeface = Typeface.MONOSPACE
+                gravity = Gravity.CENTER
+                setPadding(0, 30, 0, 0)
+            }
+            layout.addView(empty)
+            return
+        }
+
+        for (res in results.take(100)) {  // show max 100 in list
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                setPadding(10, 8, 10, 8)
+                setBackgroundColor(
+                    if (res.addr == selectedAddr) Color.parseColor("#CC0a1f12")
+                    else Color.TRANSPARENT
+                )
+            }
+            // frozen dot
+            val dot = View(this).apply {
+                layoutParams = LinearLayout.LayoutParams(8, 8).apply {
+                    gravity = Gravity.CENTER_VERTICAL; marginEnd = 8; topMargin = 2
+                }
+                setBackgroundColor(Color.parseColor(
+                    if (res.frozen) YELLOW else if (res.addr == selectedAddr) GREEN else DIM))
+            }
+            val addrTv = TextView(this).apply {
+                text = res.addr
+                setTextColor(Color.parseColor(GREEN))
+                textSize = 10f
+                typeface = Typeface.MONOSPACE
+                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.4f)
+            }
+            val valTv = TextView(this).apply {
+                text = res.value
+                setTextColor(Color.WHITE)
+                textSize = 11f
+                typeface = Typeface.MONOSPACE
+                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            }
+            val frzTv = TextView(this).apply {
+                text = if (res.frozen) "❄" else ""
+                setTextColor(Color.parseColor(YELLOW))
+                textSize = 11f
+                typeface = Typeface.MONOSPACE
+                setPadding(4, 0, 0, 0)
+            }
+            row.addView(dot)
+            row.addView(addrTv)
+            row.addView(valTv)
+            row.addView(frzTv)
+
+            row.setOnClickListener {
+                selectedAddr = if (selectedAddr == res.addr) null else res.addr
+                renderResults()
+                if (selectedAddr != null) {
+                    showActionPanel(res)
+                } else {
+                    actionPanel?.visibility = View.GONE
+                }
+            }
+            layout.addView(row)
+
+            // divider
+            val div = View(this).apply {
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, 1)
+                setBackgroundColor(Color.parseColor(BORDER))
+            }
+            layout.addView(div)
+        }
+
+        if (results.size > 100) {
+            val moreTv = TextView(this).apply {
+                text = "  … +${results.size - 100} more (narrow with NEXT SCAN)"
+                setTextColor(Color.parseColor(DIM))
+                textSize = 9f
+                typeface = Typeface.MONOSPACE
+                setPadding(10, 6, 10, 6)
+            }
+            layout.addView(moreTv)
+        }
+    }
+
+    private fun showActionPanel(res: ScanResult) {
+        val panel = actionPanel ?: return
+        panel.visibility = View.VISIBLE
+        val addrTv = panel.findViewWithTag<TextView?>("addrTv")
+        addrTv?.text = "▶ ${res.addr}  |  val: ${res.value}"
+        editValueEt?.setText(res.value)
+        updateFreezeBtn(res.frozen)
+    }
+
+    private fun updateFreezeBtn(frozen: Boolean) {
+        val btn = actionPanel?.findViewWithTag<TextView?>("freezeBtn") ?: return
+        if (frozen) {
+            btn.text = "● UNFRZ"
+            btn.setTextColor(Color.parseColor(DIM))
+            btn.setBackgroundColor(Color.parseColor("#CC1a1a1a"))
+        } else {
+            btn.text = "❄ FREEZE"
+            btn.setTextColor(Color.parseColor(YELLOW))
+            btn.setBackgroundColor(Color.parseColor("#CC1a1400"))
+        }
+    }
+
+    // ─── Helpers ──────────────────────────────────────────────────────────────
+    private fun resetScan() {
+        results.clear()
+        scanCount = 0
+        selectedAddr = null
+        stopAllFreezes()
+        mainHandler.post {
+            renderResults()
+            updateScanCount()
+            actionPanel?.visibility = View.GONE
+            scanValueEt?.setText("")
+            log("── Scan reset ──")
+        }
+    }
+
+    private fun updateScanCount() {
+        scanCountTv?.text = if (scanCount > 0)
+            "Scan #$scanCount · ${results.size} addr"
+        else ""
+        searchBtn?.text = if (scanCount == 0) "🔍 SCAN" else "🔍 NEXT (${results.size})"
+    }
+
+    private fun setBusy(busy: Boolean) {
+        mainHandler.post {
+            searchBtn?.isEnabled = !busy
+            searchBtn?.setTextColor(Color.parseColor(if (busy) DIM else GREEN))
+        }
+    }
+
+    private fun log(msg: String) {
+        mainHandler.post {
+            logTv?.text = msg
+            logTv?.setTextColor(Color.parseColor(when {
+                msg.startsWith("✗") -> RED
+                msg.startsWith("✓") -> GREEN
+                else -> DIM
+            }))
+        }
     }
 }

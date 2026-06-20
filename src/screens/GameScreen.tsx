@@ -475,320 +475,56 @@ const ANTI_CHEAT_SIGS: {pattern: string; label: string; severity: 'high'|'medium
 ];
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// MEMORY TAB  (Floating Overlay — GameGuardian style)
+// MEMORY TAB — launches GameGuardian-style native overlay
 // ═══════════════════════════════════════════════════════════════════════════════
-// ═══════════════════════════════════════════════════════════════════════════════
-// MEMORY TAB  — GameGuardian-style scanner (in-app UI + native overlay)
-// ═══════════════════════════════════════════════════════════════════════════════
-
-type ScanType  = 'int32' | 'float' | 'double' | 'int64' | 'string';
-type ScanMode  = 'exact' | 'changed' | 'increased' | 'decreased' | 'unknown';
-interface MemAddr {
-  addr: string;   // hex address
-  prev: string;   // value before last scan
-  cur:  string;   // current value
-  frozen: boolean;
-}
-
-const SCAN_TYPES: { label: string; value: ScanType }[] = [
-  { label: 'Dword (int32)',  value: 'int32'  },
-  { label: 'Float',          value: 'float'  },
-  { label: 'Double',         value: 'double' },
-  { label: 'Qword (int64)',  value: 'int64'  },
-  { label: 'String (UTF-8)', value: 'string' },
-];
-
-const SCAN_MODES: { label: string; value: ScanMode }[] = [
-  { label: '= Exact value',    value: 'exact'     },
-  { label: '≠ Changed',        value: 'changed'   },
-  { label: '↑ Increased',      value: 'increased' },
-  { label: '↓ Decreased',      value: 'decreased' },
-  { label: '? Unknown value',  value: 'unknown'   },
-];
-
-/* Generates a Frida script that scans process memory for a value */
-/* Generates a Frida script that writes a value to an address */
-function buildMemWriteScript(addr: string, value: string, type: ScanType): string {
-  const writeFn = type === 'int32'  ? `writeInt(${value})`
-                : type === 'float'  ? `writeFloat(${value})`
-                : type === 'double' ? `writeDouble(${value})`
-                : type === 'int64'  ? `writeS64(${value})`
-                : `writeUtf8String("${value}")`;
-  return `(function(){
-  var ptr = ptr64("${addr}");
-  ptr.${writeFn};
-  send({type: "write_ok", addr: "${addr}", value: "${value}"});
-})();`;
-}
-
-/* Generates a Frida freeze script (write loop every 200ms) */
-function buildFreezeScript(addr: string, value: string, type: ScanType): string {
-  const writeFn = type === 'int32'  ? `writeInt(${value})`
-                : type === 'float'  ? `writeFloat(${value})`
-                : type === 'double' ? `writeDouble(${value})`
-                : type === 'int64'  ? `writeS64(${value})`
-                : `writeUtf8String("${value}")`;
-  return `(function(){
-  var ptr = ptr64("${addr}");
-  var iid = setInterval(function(){
-    try { ptr.${writeFn}; } catch(e){ clearInterval(iid); }
-  }, 200);
-  send({type: "freeze_ok", addr: "${addr}"});
-})();`;
-}
 
 function MemoryTab() {
   const [pkg,         setPkg]         = useState('');
   const [pid,         setPid]         = useState('');
-  const [scanValue,   setScanValue]   = useState('');
-  const [editValue,   setEditValue]   = useState('');
-  const [scanType,    setScanType]    = useState<ScanType>('int32');
-  const [scanMode,    setScanMode]    = useState<ScanMode>('exact');
-  const [results,     setResults]     = useState<MemAddr[]>([]);
-  const [prevAddrs,   setPrevAddrs]   = useState<string[]>([]);
-  const [scanCount,   setScanCount]   = useState(0);
-  const [busy,        setBusy]        = useState<string|null>(null);
-  const [log,         setLog]         = useState<string[]>([]);
-  const [selAddr,     setSelAddr]     = useState<string|null>(null);
-  const [showTypePicker, setShowTypePicker] = useState(false);
-  const [showModePicker, setShowModePicker] = useState(false);
+  const [overlayActive, setOverlayActive] = useState(false);
+  const [busy,        setBusy]        = useState(false);
+  const [statusMsg,   setStatusMsg]   = useState('');
 
-  const addLog = (s: string) => setLog(p => [s, ...p.slice(0, 60)]);
-
-  /* ── Resolve PID ─────────────────────────────────────────────────────────── */
-  const resolvePid = async (): Promise<string> => {
-    if (pid.trim() && /^\d+$/.test(pid.trim())) return pid.trim();
-    if (!pkg.trim()) throw new Error('Enter package name or PID');
-    const out = await rootBridge.execShell(`pidof '${pkg.trim()}' 2>/dev/null | tr ' ' '\\n' | head -1`);
-    const p = out.replace('ERR:', '').trim();
-    if (!p || !/^\d+$/.test(p)) throw new Error('Process not running — launch the game first');
-    setPid(p);
-    return p;
-  };
-
-  /* ── FIRST SCAN ──────────────────────────────────────────────────────────── */
-  const doFirstScan = async () => {
-    if (!scanValue.trim() && scanMode === 'exact') { Alert.alert('Enter a value to scan'); return; }
-    setBusy('scan');
-    addLog(`[SCAN #1] value=${scanValue} type=${scanType} mode=${scanMode}`);
+  const launchOverlay = async () => {
+    if (!pkg.trim()) { Alert.alert('Package required', 'Enter the target game package name first.'); return; }
+    setBusy(true);
+    setStatusMsg('Starting overlay…');
     try {
-      const p = await resolvePid();
-      // Use /proc/pid/maps + shell grep for initial fast scan on int32/float
-      if (scanType === 'int32') {
-        // convert value to little-endian hex pattern
-        const v = parseInt(scanValue);
-        if (isNaN(v)) throw new Error('Invalid integer value');
-        const ab = new ArrayBuffer(4);
-        new DataView(ab).setInt32(0, v, true);
-        const pattern = Array.from(new Uint8Array(ab)).map(b => b.toString(16).padStart(2, '0')).join(' ');
-        // scan via Frida script
-        const script = `(function(){
-  var target = ${v};
-  var results = [];
-  Process.enumerateRanges({protection:"rw-",coalesce:true}).forEach(function(r){
-    if(r.size < 4) return;
-    try {
-      Memory.scan(r.base, r.size, "${pattern}", {
-        onMatch: function(addr){
-          try { results.push({addr: addr.toString(), value: String(addr.readInt())}); } catch(e){}
-          if(results.length >= 500) return "stop";
-        },
-        onError: function(){},
-        onComplete: function(){}
-      });
-    } catch(e){}
-  });
-  send({type:"scan_results", results: results});
-})();`;
-        const raw = await rootBridge.runScript(pkg.trim() || p, script, 'pid');
-        const parsed = parseResults(raw);
-        setResults(parsed);
-        setPrevAddrs(parsed.map(r => r.addr));
-        setScanCount(1);
-        addLog(`✓ Found ${parsed.length} addresses`);
-      } else if (scanType === 'float') {
-        const v = parseFloat(scanValue);
-        if (isNaN(v)) throw new Error('Invalid float value');
-        const ab = new ArrayBuffer(4);
-        new DataView(ab).setFloat32(0, v, true);
-        const pattern = Array.from(new Uint8Array(ab)).map(b => b.toString(16).padStart(2, '0')).join(' ');
-        const script = `(function(){
-  var results = [];
-  Process.enumerateRanges({protection:"rw-",coalesce:true}).forEach(function(r){
-    if(r.size < 4) return;
-    try {
-      Memory.scan(r.base, r.size, "${pattern}", {
-        onMatch: function(addr){
-          try { results.push({addr: addr.toString(), value: String(addr.readFloat())}); } catch(e){}
-          if(results.length >= 500) return "stop";
-        },
-        onError: function(){},
-        onComplete: function(){}
-      });
-    } catch(e){}
-  });
-  send({type:"scan_results", results: results});
-})();`;
-        const raw = await rootBridge.runScript(pkg.trim() || p, script, 'pid');
-        const parsed = parseResults(raw);
-        setResults(parsed);
-        setPrevAddrs(parsed.map(r => r.addr));
-        setScanCount(1);
-        addLog(`✓ Found ${parsed.length} addresses`);
-      } else {
-        // string / double / int64 — shell grep via /proc/pid/maps
-        const out = await rootBridge.execShell(
-          `cat /proc/${p}/maps 2>/dev/null | grep 'rw' | awk '{print $1}' | head -20`
-        );
-        addLog(`Regions: ${out.trim().split('\n').length}`);
-        setResults([]);
-        setScanCount(1);
-        addLog('ℹ String/Double/int64 scan: use FRIDA INJECT for advanced scan');
-      }
+      await rootBridge.startMemoryOverlay(pkg.trim());
+      setOverlayActive(true);
+      setStatusMsg('✓ Overlay launched — switch to the game');
     } catch (e: any) {
-      addLog('✗ ' + (e.message || String(e)));
+      setStatusMsg('✗ ' + (e?.message || String(e)));
     } finally {
-      setBusy(null);
+      setBusy(false);
     }
   };
 
-  /* ── NEXT SCAN ───────────────────────────────────────────────────────────── */
-  const doNextScan = async () => {
-    if (results.length === 0) { Alert.alert('Run first scan first'); return; }
-    if (!scanValue.trim() && scanMode === 'exact') { Alert.alert('Enter new value'); return; }
-    setBusy('next');
-    addLog(`[NEXT SCAN #${scanCount + 1}] value=${scanValue} mode=${scanMode}`);
+  const stopOverlay = async () => {
     try {
-      const p = await resolvePid();
-      const addrs = results.map(r => r.addr);
-      // re-read each address and filter
-      const addrList = addrs.slice(0, 200).join(' ');
-      const script = `(function(){
-  var addrs = [${addrs.slice(0, 200).map(a => `"${a}"`).join(',')}];
-  var target = ${scanType === 'string' ? `"${scanValue}"` : (scanType === 'float' ? parseFloat(scanValue) : parseInt(scanValue))};
-  var mode   = "${scanMode}";
-  var results = [];
-  addrs.forEach(function(hexAddr){
-    try {
-      var ptr = ptr64(hexAddr);
-      var v = ${
-        scanType === 'int32'  ? 'ptr.readInt()'  :
-        scanType === 'float'  ? 'ptr.readFloat()' :
-        scanType === 'double' ? 'ptr.readDouble()' :
-        scanType === 'int64'  ? 'ptr.readS64().toNumber()' :
-        'ptr.readCString()'
-      };
-      var pass = false;
-      if      (mode === "exact")     pass = String(v) === String(target);
-      else if (mode === "changed")   pass = String(v) !== String(target);
-      else if (mode === "increased") pass = Number(v) > Number(target);
-      else if (mode === "decreased") pass = Number(v) < Number(target);
-      else if (mode === "unknown")   pass = true;
-      if(pass) results.push({addr: hexAddr, value: String(v)});
-    } catch(e){}
-  });
-  send({type:"scan_results", results: results});
-})();`;
-      const raw = await rootBridge.runScript(pkg.trim() || p, script, 'pid');
-      const parsed = parseResults(raw);
-      setResults(parsed);
-      setPrevAddrs(parsed.map(r => r.addr));
-      setScanCount(c => c + 1);
-      addLog(`✓ Narrowed to ${parsed.length} addresses`);
+      await rootBridge.stopMemoryOverlay();
+      setOverlayActive(false);
+      setStatusMsg('Overlay stopped');
     } catch (e: any) {
-      addLog('✗ ' + (e.message || String(e)));
-    } finally {
-      setBusy(null);
+      setStatusMsg('✗ ' + (e?.message || String(e)));
     }
   };
 
-  /* ── WRITE VALUE ─────────────────────────────────────────────────────────── */
-  const doWrite = async (addr: string) => {
-    if (!editValue.trim()) { Alert.alert('Enter value to write'); return; }
-    setBusy('write_' + addr);
-    addLog(`[WRITE] ${addr} ← ${editValue}`);
-    try {
-      const p = await resolvePid();
-      const script = buildMemWriteScript(addr, editValue, scanType);
-      await rootBridge.runScript(pkg.trim() || p, script, 'pid');
-      addLog(`✓ Written ${editValue} → ${addr}`);
-      setResults(prev => prev.map(r => r.addr === addr ? {...r, cur: editValue} : r));
-    } catch (e: any) {
-      addLog('✗ ' + (e.message || String(e)));
-    } finally {
-      setBusy(null);
-    }
-  };
-
-  /* ── FREEZE ──────────────────────────────────────────────────────────────── */
-  const doFreeze = async (addr: string) => {
-    if (!editValue.trim()) { Alert.alert('Enter value to freeze at'); return; }
-    setBusy('frz_' + addr);
-    addLog(`[FREEZE] ${addr} = ${editValue} (200ms loop)`);
-    try {
-      const p = await resolvePid();
-      const script = buildFreezeScript(addr, editValue, scanType);
-      await rootBridge.runScript(pkg.trim() || p, script, 'pid');
-      addLog(`✓ Frozen ${addr} at ${editValue}`);
-      setResults(prev => prev.map(r => r.addr === addr ? {...r, frozen: true, cur: editValue} : r));
-    } catch (e: any) {
-      addLog('✗ ' + (e.message || String(e)));
-    } finally {
-      setBusy(null);
-    }
-  };
-
-  /* ── UNFREEZE ────────────────────────────────────────────────────────────── */
-  const doUnfreeze = async (addr: string) => {
-    addLog(`[UNFREEZE] ${addr}`);
-    setResults(prev => prev.map(r => r.addr === addr ? {...r, frozen: false} : r));
-    addLog('ℹ Relaunch script to fully stop freeze loop');
-  };
-
-  /* ── RESET SCAN ──────────────────────────────────────────────────────────── */
-  const doReset = () => {
-    setResults([]);
-    setPrevAddrs([]);
-    setScanCount(0);
-    setScanValue('');
-    setSelAddr(null);
-    addLog('── Scan reset ──');
-  };
-
-  /* ── Parse Frida output ──────────────────────────────────────────────────── */
-  function parseResults(raw: string): MemAddr[] {
-    try {
-      const match = raw.match(/\{[^}]*"results"\s*:\s*\[[\s\S]*?\]\s*\}/);
-      if (!match) return [];
-      const obj = JSON.parse(match[0]);
-      return (obj.results || []).map((r: any) => ({
-        addr: r.addr, prev: r.value, cur: r.value, frozen: false,
-      }));
-    } catch {
-      return [];
-    }
-  }
-
-  const selectedResult = results.find(r => r.addr === selAddr) || null;
-
-  /* ── RENDER ──────────────────────────────────────────────────────────────── */
   return (
-    <View style={{flex: 1, backgroundColor: C.bg}}>
-      {/* ── TOP BAR: package / pid ─────────────────────────────────────────── */}
-      <View style={{
-        flexDirection: 'row', alignItems: 'center', gap: 6,
-        paddingHorizontal: 10, paddingVertical: 8,
-        borderBottomWidth: 1, borderBottomColor: C.border,
-      }}>
+    <View style={{flex: 1, backgroundColor: C.bg, padding: 16}}>
+
+      {/* ── Package + PID ──────────────────────────────────────────────────── */}
+      <Text style={[s.mono, {color: C.dim, fontSize: 10, marginBottom: 4}]}>TARGET PROCESS</Text>
+      <View style={{flexDirection: 'row', gap: 8, marginBottom: 12}}>
         <TextInput
-          style={[s.input, {flex: 1, marginBottom: 0, fontSize: 12}]}
-          placeholder="Package  (com.game.xyz)"
+          style={[s.input, {flex: 1, marginBottom: 0}]}
+          placeholder="com.game.package"
           placeholderTextColor={C.dim}
           value={pkg} onChangeText={setPkg}
           autoCapitalize="none" autoCorrect={false}
         />
         <TextInput
-          style={[s.input, {width: 70, marginBottom: 0, fontSize: 12}]}
+          style={[s.input, {width: 72, marginBottom: 0}]}
           placeholder="PID"
           placeholderTextColor={C.dim}
           value={pid} onChangeText={setPid}
@@ -796,222 +532,70 @@ function MemoryTab() {
         />
       </View>
 
-      {/* ── SCAN VALUE + TYPE + MODE ───────────────────────────────────────── */}
+      {/* ── Overlay status pill ────────────────────────────────────────────── */}
       <View style={{
-        padding: 8, gap: 6,
-        borderBottomWidth: 1, borderBottomColor: C.border,
+        flexDirection: 'row', alignItems: 'center', gap: 8,
+        backgroundColor: C.card, borderRadius: 6, padding: 10, marginBottom: 20,
+        borderWidth: 1, borderColor: overlayActive ? C.green : C.border,
       }}>
-        {/* value row */}
-        <View style={{flexDirection: 'row', gap: 6, alignItems: 'center'}}>
-          <TextInput
-            style={[s.input, {flex: 1, marginBottom: 0}]}
-            placeholder={scanMode === 'unknown' ? 'Unknown — skip' : 'Value to scan'}
-            placeholderTextColor={C.dim}
-            value={scanValue} onChangeText={setScanValue}
-            keyboardType={scanType === 'string' ? 'default' : 'numeric'}
-          />
-          {/* type selector */}
-          <TouchableOpacity
-            style={[s.btn, {paddingHorizontal: 10, paddingVertical: 8}]}
-            onPress={() => setShowTypePicker(true)}
-          >
-            <Text style={[s.mono, {color: C.green, fontSize: 11}]}>
-              {SCAN_TYPES.find(t => t.value === scanType)?.label ?? scanType}{'  ▼'}
-            </Text>
-          </TouchableOpacity>
-        </View>
-
-        {/* mode selector row */}
-        <ScrollView horizontal showsHorizontalScrollIndicator={false}>
-          {SCAN_MODES.map(m => (
-            <TouchableOpacity
-              key={m.value}
-              style={[
-                s.chip,
-                {marginRight: 6, paddingHorizontal: 10},
-                scanMode === m.value && {backgroundColor: C.green2, borderColor: C.green},
-              ]}
-              onPress={() => setScanMode(m.value)}
-            >
-              <Text style={[s.chipTxt, {color: scanMode === m.value ? C.green : C.dim}]}>
-                {m.label}
-              </Text>
-            </TouchableOpacity>
-          ))}
-        </ScrollView>
-
-        {/* SCAN / NEXT SCAN / RESET buttons */}
-        <View style={{flexDirection: 'row', gap: 6}}>
-          <TouchableOpacity
-            style={[s.btn, {flex: 2, backgroundColor: '#001a0d', borderColor: C.green}]}
-            onPress={scanCount === 0 ? doFirstScan : doNextScan}
-            disabled={!!busy}
-          >
-            {busy === 'scan' || busy === 'next'
-              ? <ActivityIndicator color={C.green} size="small" />
-              : <Text style={[s.btnTxt, {color: C.green, fontSize: 13}]}>
-                  {scanCount === 0 ? '🔍  SEARCH' : `🔍  NEXT SCAN  (${results.length})`}
-                </Text>
-            }
-          </TouchableOpacity>
-          {scanCount > 0 && (
-            <TouchableOpacity
-              style={[s.btn, {paddingHorizontal: 14, borderColor: C.dim}]}
-              onPress={doReset}
-            >
-              <Text style={[s.btnTxt, {color: C.dim}]}>NEW</Text>
-            </TouchableOpacity>
-          )}
-        </View>
-        {scanCount > 0 && (
-          <Text style={[s.mono, {color: C.dim, fontSize: 10}]}>
-            Scan #{scanCount} · {results.length} addresses found
-          </Text>
-        )}
+        <View style={{
+          width: 10, height: 10, borderRadius: 5,
+          backgroundColor: overlayActive ? C.green : C.dim,
+        }}/>
+        <Text style={[s.mono, {fontSize: 11, color: overlayActive ? C.green : C.dim, flex: 1}]}>
+          {overlayActive ? 'OVERLAY ACTIVE — floating above game' : 'OVERLAY INACTIVE'}
+        </Text>
       </View>
 
-      {/* ── RESULTS LIST ───────────────────────────────────────────────────── */}
-      <FlatList
-        style={{flex: 1}}
-        data={results}
-        keyExtractor={item => item.addr}
-        ListEmptyComponent={() => (
-          <View style={{alignItems: 'center', paddingTop: 40}}>
-            <Text style={[s.mono, {color: C.dim, fontSize: 12}]}>
-              {scanCount === 0
-                ? 'Enter a value and press SEARCH'
-                : 'No results — try NEXT SCAN with a new value'}
+      {/* ── LAUNCH button ─────────────────────────────────────────────────── */}
+      <TouchableOpacity
+        style={[s.btn, {
+          paddingVertical: 18,
+          backgroundColor: '#001a0d',
+          borderColor: C.green,
+          borderWidth: 1.5,
+          borderRadius: 8,
+          alignItems: 'center',
+          marginBottom: 12,
+          opacity: busy ? 0.5 : 1,
+        }]}
+        onPress={overlayActive ? stopOverlay : launchOverlay}
+        disabled={busy}
+      >
+        {busy
+          ? <ActivityIndicator color={C.green} />
+          : <Text style={[s.mono, {color: C.green, fontSize: 15, letterSpacing: 1}]}>
+              {overlayActive ? '⏹  STOP OVERLAY' : '🎮  LAUNCH OVERLAY'}
             </Text>
-          </View>
-        )}
-        renderItem={({item}) => {
-          const isSel = selAddr === item.addr;
-          return (
-            <TouchableOpacity
-              style={{
-                paddingHorizontal: 12, paddingVertical: 8,
-                borderBottomWidth: 1, borderBottomColor: C.border,
-                backgroundColor: isSel ? '#0a1f12' : 'transparent',
-                flexDirection: 'row', alignItems: 'center',
-              }}
-              onPress={() => setSelAddr(isSel ? null : item.addr)}
-            >
-              {/* frozen indicator */}
-              <View style={{width: 8, height: 8, borderRadius: 4, marginRight: 8,
-                backgroundColor: item.frozen ? C.yellow : (isSel ? C.green : C.dim)}} />
-              {/* address */}
-              <Text style={[s.mono, {color: C.green, fontSize: 11, width: 130}]}>
-                {item.addr}
-              </Text>
-              {/* value */}
-              <Text style={[s.mono, {color: C.white, fontSize: 12, flex: 1}]}>
-                {item.cur}
-              </Text>
-              {item.frozen && (
-                <Text style={[s.mono, {color: C.yellow, fontSize: 10}]}>❄ FRZ</Text>
-              )}
-            </TouchableOpacity>
-          );
-        }}
-      />
+        }
+      </TouchableOpacity>
 
-      {/* ── SELECTED ADDRESS ACTION PANEL ──────────────────────────────────── */}
-      {selAddr && (
-        <View style={{
-          borderTopWidth: 1, borderTopColor: C.green,
-          backgroundColor: '#0a0a0a', padding: 10,
-        }}>
-          <Text style={[s.mono, {color: C.green, fontSize: 11, marginBottom: 6}]}>
-            ▶ {selAddr}  |  current: {selectedResult?.cur ?? '?'}
-          </Text>
-          <View style={{flexDirection: 'row', gap: 6, marginBottom: 6}}>
-            <TextInput
-              style={[s.input, {flex: 1, marginBottom: 0, fontSize: 13}]}
-              placeholder="New value"
-              placeholderTextColor={C.dim}
-              value={editValue}
-              onChangeText={setEditValue}
-              keyboardType={scanType === 'string' ? 'default' : 'numeric'}
-            />
-          </View>
-          <View style={{flexDirection: 'row', gap: 6}}>
-            <TouchableOpacity
-              style={[s.btn, {flex: 1, borderColor: C.green, backgroundColor: '#001a0d'}]}
-              onPress={() => doWrite(selAddr)}
-              disabled={!!busy}
-            >
-              {busy?.startsWith('write_') ? <ActivityIndicator color={C.green} size="small"/>
-                : <Text style={[s.btnTxt, {color: C.green}]}>WRITE</Text>}
-            </TouchableOpacity>
-            {!(selectedResult?.frozen) ? (
-              <TouchableOpacity
-                style={[s.btn, {flex: 1, borderColor: C.yellow}]}
-                onPress={() => doFreeze(selAddr)}
-                disabled={!!busy}
-              >
-                {busy?.startsWith('frz_') ? <ActivityIndicator color={C.yellow} size="small"/>
-                  : <Text style={[s.btnTxt, {color: C.yellow}]}>❄ FREEZE</Text>}
-              </TouchableOpacity>
-            ) : (
-              <TouchableOpacity
-                style={[s.btn, {flex: 1, borderColor: C.dim}]}
-                onPress={() => doUnfreeze(selAddr)}
-              >
-                <Text style={[s.btnTxt, {color: C.dim}]}>UNFREEZE</Text>
-              </TouchableOpacity>
-            )}
-            <TouchableOpacity
-              style={[s.btn, {paddingHorizontal: 12, borderColor: C.dim}]}
-              onPress={() => { setSelAddr(null); }}
-            >
-              <Text style={[s.btnTxt, {color: C.dim}]}>✕</Text>
-            </TouchableOpacity>
-          </View>
-        </View>
+      {/* ── Status ─────────────────────────────────────────────────────────── */}
+      {statusMsg !== '' && (
+        <Text style={[s.mono, {
+          fontSize: 11, textAlign: 'center',
+          color: statusMsg.startsWith('✗') ? C.red
+               : statusMsg.startsWith('✓') ? C.green
+               : C.dim,
+        }]}>
+          {statusMsg}
+        </Text>
       )}
 
-      {/* ── LOG ────────────────────────────────────────────────────────────── */}
-      {log.length > 0 && (
-        <View style={{
-          borderTopWidth: 1, borderTopColor: C.border,
-          backgroundColor: '#050505', maxHeight: 90, padding: 8,
-        }}>
-          <ScrollView>
-            {log.slice(0, 8).map((l, i) => (
-              <Text key={i} style={[s.mono, {fontSize: 10,
-                color: l.startsWith('✗') ? C.red : l.startsWith('✓') ? C.green : C.dim}]}>
-                {l}
-              </Text>
-            ))}
-          </ScrollView>
-        </View>
-      )}
+      {/* ── How-to tip ─────────────────────────────────────────────────────── */}
+      <View style={{marginTop: 32, gap: 8}}>
+        <Text style={[s.mono, {color: C.dim, fontSize: 10}]}>HOW TO USE</Text>
+        {[
+          '1. Enter the target game's package name',
+          '2. Launch the game first so it's running',
+          '3. Tap LAUNCH OVERLAY — the scanner window appears on top',
+          '4. Switch to the game — overlay stays visible',
+          '5. Scan value → narrow with Next Scan → tap address → WRITE / FREEZE',
+        ].map((tip, i) => (
+          <Text key={i} style={[s.mono, {color: C.dim, fontSize: 11}]}>{tip}</Text>
+        ))}
+      </View>
 
-      {/* ── TYPE PICKER MODAL ──────────────────────────────────────────────── */}
-      <Modal visible={showTypePicker} transparent animationType="slide" onRequestClose={() => setShowTypePicker(false)}>
-        <View style={{flex:1, backgroundColor:'rgba(0,0,0,0.7)', justifyContent:'flex-end'}}>
-          <View style={{backgroundColor:C.card, borderTopWidth:1, borderTopColor:C.green}}>
-            <View style={[s.row, {padding:12, borderBottomWidth:1, borderBottomColor:C.border}]}>
-              <Text style={[s.cardTitle, {flex:1, marginBottom:0, color:C.green}]}>Value Type</Text>
-              <TouchableOpacity onPress={() => setShowTypePicker(false)}>
-                <Text style={{color:C.red, fontSize:18}}>✕</Text>
-              </TouchableOpacity>
-            </View>
-            {SCAN_TYPES.map(t => (
-              <TouchableOpacity
-                key={t.value}
-                style={{padding:14, borderBottomWidth:1, borderBottomColor:C.border,
-                  backgroundColor: scanType === t.value ? C.green2 : 'transparent'}}
-                onPress={() => { setScanType(t.value); setShowTypePicker(false); }}
-              >
-                <Text style={[s.mono, {color: scanType === t.value ? C.green : C.txt, fontSize: 13}]}>
-                  {scanType === t.value ? '▶ ' : '  '}{t.label}
-                </Text>
-              </TouchableOpacity>
-            ))}
-          </View>
-        </View>
-      </Modal>
     </View>
   );
 }
