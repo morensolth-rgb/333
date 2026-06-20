@@ -1,8 +1,12 @@
 /*
  * gg-mem — GameGuardian-style memory tool for FridaCtl
  *
- * Uses ptrace + /proc/pid/mem to read/write/scan game memory safely.
+ * Uses ptrace + process_vm_readv/writev syscalls to read/write game memory.
  * ptrace ATTACH stops the game thread cleanly (no freeze/stutter).
+ *
+ * NOTE: process_vm_readv/writev are invoked via syscall() directly because
+ * the Android NDK does not expose them in its libc headers for minSdk < 23.
+ * We define them manually using the Linux syscall numbers for arm64.
  *
  * Usage:
  *   gg-mem scan   <pid> <type> <value>           -> prints: ADDR VALUE per line
@@ -27,6 +31,32 @@
 #include <sys/wait.h>
 #include <sys/uio.h>
 #include <sys/types.h>
+#include <sys/syscall.h>
+
+/* ─── process_vm_readv/writev via syscall (NDK doesn't expose these) ──────── */
+/* ARM64 syscall numbers */
+#ifndef __NR_process_vm_readv
+#define __NR_process_vm_readv  270
+#endif
+#ifndef __NR_process_vm_writev
+#define __NR_process_vm_writev 271
+#endif
+
+static ssize_t gg_process_vm_readv(pid_t pid,
+                                    const struct iovec *lvec, unsigned long liovcnt,
+                                    const struct iovec *rvec, unsigned long riovcnt,
+                                    unsigned long flags) {
+    return (ssize_t)syscall(__NR_process_vm_readv, (long)pid,
+                            lvec, liovcnt, rvec, riovcnt, flags);
+}
+
+static ssize_t gg_process_vm_writev(pid_t pid,
+                                     const struct iovec *lvec, unsigned long liovcnt,
+                                     const struct iovec *rvec, unsigned long riovcnt,
+                                     unsigned long flags) {
+    return (ssize_t)syscall(__NR_process_vm_writev, (long)pid,
+                            lvec, liovcnt, rvec, riovcnt, flags);
+}
 
 #define MAX_RESULTS   500
 #define MAX_REGION_MB 64
@@ -85,18 +115,17 @@ static void ptrace_detach(pid_t pid) {
     ptrace(PTRACE_DETACH, pid, NULL, NULL);
 }
 
-/* ─── /proc/pid/mem read via process_vm_readv ─────────────────────────────── */
+/* ─── Memory read/write via syscall wrappers ──────────────────────────────── */
 static ssize_t mem_read(pid_t pid, uintptr_t addr, void *buf, size_t len) {
     struct iovec local  = { buf, len };
     struct iovec remote = { (void*)addr, len };
-    ssize_t n = process_vm_readv(pid, &local, 1, &remote, 1, 0);
-    return n;
+    return gg_process_vm_readv(pid, &local, 1, &remote, 1, 0);
 }
 
 static ssize_t mem_write(pid_t pid, uintptr_t addr, const void *buf, size_t len) {
     struct iovec local  = { (void*)buf, len };
     struct iovec remote = { (void*)addr, len };
-    return process_vm_writev(pid, &local, 1, &remote, 1, 0);
+    return gg_process_vm_writev(pid, &local, 1, &remote, 1, 0);
 }
 
 /* ─── maps parser ─────────────────────────────────────────────────────────── */
