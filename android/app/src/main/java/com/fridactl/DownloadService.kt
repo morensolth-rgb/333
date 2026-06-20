@@ -82,12 +82,32 @@ class DownloadService : Service() {
         }
     }
 
+    // ─── arch detection ──────────────────────────────────────────────────────
+
+    /**
+     * Returns the frida android arch suffix (e.g. "android-arm64") based on
+     * the device's primary ABI.  Falls back to arm64 if unknown.
+     */
+    private fun fridaArch(): String {
+        val abi = Build.SUPPORTED_ABIS.firstOrNull() ?: "arm64-v8a"
+        return when {
+            abi.startsWith("arm64")   -> "android-arm64"
+            abi.startsWith("armeabi") -> "android-arm"
+            abi == "x86_64"           -> "android-x86_64"
+            abi.startsWith("x86")     -> "android-x86"
+            else                      -> "android-arm64"   // safe fallback
+        }
+    }
+
     // ─── main download logic (runs on background Thread) ────────────────────
 
     private fun doDownload(version: String) {
-        val tmp = filesDir.absolutePath
+        val tmp  = filesDir.absolutePath
         val base = "https://github.com/frida/frida/releases/download/$version"
-        val log = StringBuilder()
+        val arch = fridaArch()
+        val log  = StringBuilder()
+
+        log.appendLine("▶ detected arch: $arch")
 
         // ── frida-server — .xz only (no .gz on GitHub releases) ─────────────
         if (!File(FRIDA_DEST).exists() || File(FRIDA_DEST).length() < 1024) {
@@ -96,7 +116,7 @@ class DownloadService : Service() {
             val bin = "$tmp/frida-server.bin"
             try {
                 downloadFile(
-                    "$base/frida-server-$version-android-arm64.xz", dl
+                    "$base/frida-server-$version-$arch.xz", dl
                 ) { emitProgress("frida-server", it) }
                 extractXzShell(dl, bin)
                 cleanup(dl)
@@ -113,14 +133,14 @@ class DownloadService : Service() {
         }
 
         // ── frida-inject — replaces "frida" CLI (not published for Android) ──
-        // Binary name on GitHub: frida-inject-VERSION-android-arm64.xz
+        // Binary name on GitHub: frida-inject-VERSION-android-ARCH.xz
         if (!File(FRIDA_CLI_DEST).exists() || File(FRIDA_CLI_DEST).length() < 1024) {
             log.appendLine("▶ frida-inject $version")
             val dl  = "$tmp/frida-inject.dl"
             val bin = "$tmp/frida-inject.bin"
             try {
                 downloadFile(
-                    "$base/frida-inject-$version-android-arm64.xz", dl
+                    "$base/frida-inject-$version-$arch.xz", dl
                 ) { emitProgress("frida-inject", it) }
                 extractXzShell(dl, bin)
                 cleanup(dl)
