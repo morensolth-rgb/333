@@ -586,8 +586,8 @@ function MemoryTab() {
       <View style={{marginTop: 32, gap: 8}}>
         <Text style={[s.mono, {color: C.dim, fontSize: 10}]}>HOW TO USE</Text>
         {[
-          '1. Enter the target game's package name',
-          '2. Launch the game first so it's running',
+          "1. Enter the target game's package name",
+          "2. Launch the game first so it's running",
           '3. Tap LAUNCH OVERLAY — the scanner window appears on top',
           '4. Switch to the game — overlay stays visible',
           '5. Scan value → narrow with Next Scan → tap address → WRITE / FREEZE',
