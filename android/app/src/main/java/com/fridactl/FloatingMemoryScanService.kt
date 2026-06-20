@@ -85,7 +85,7 @@ class FloatingMemoryScanService : Service() {
     private val mainHandler   = Handler(Looper.getMainLooper())
 
     data class ScanResult(val addr: String, var value: String, var frozen: Boolean = false)
-    data class FreezeJob(val addr: String, var value: String, val handler: Handler, val runnable: Runnable)
+    data class FreezeJob(val addr: String, var value: String)
 
     // ─── Service lifecycle ────────────────────────────────────────────────────
     override fun onBind(intent: Intent?): IBinder? = null
@@ -730,46 +730,83 @@ class FloatingMemoryScanService : Service() {
         val value = editValueEt?.text?.toString()?.trim() ?: return
         if (value.isEmpty()) { log("✗ Enter value to freeze at"); return }
         log("[FREEZE] $addr = $value")
-        val handler = Handler(Looper.getMainLooper())
-        val runnable = object : Runnable {
-            override fun run() {
-                Thread {
-                    try {
-                        val pid = resolvePid()
-                        val writeFn = when (scanType) {
-                            "float"  -> "writeFloat($value)"
-                            "double" -> "writeDouble($value)"
-                            "int64"  -> "writeS64($value)"
-                            "string" -> "writeUtf8String(\"$value\")"
-                            else     -> "writeInt($value)"
-                        }
-                        val script = """(function(){
-  var ptr = ptr64("$addr"); ptr.$writeFn;
-})();"""
-                        runFrida(pid, script)
-                    } catch (_: Exception) {}
-                }.start()
-                if (frozenMap.containsKey(addr)) handler.postDelayed(this, 500)
-            }
+
+        // Inject a self-looping Frida script that stays alive inside the process.
+        // Uses setInterval — no repeated frida-inject launches, zero game stutter.
+        val writeFn = when (scanType) {
+            "float"  -> "writeFloat($value)"
+            "double" -> "writeDouble($value)"
+            "int64"  -> "writeS64($value)"
+            "string" -> "writeUtf8String(\"$value\")"
+            else     -> "writeInt($value)"
         }
-        frozenMap[addr] = FreezeJob(addr, value, handler, runnable)
-        handler.post(runnable)
-        results.find { it.addr == addr }?.frozen = true
-        renderResults()
-        updateFreezeBtn(true)
-        log("✓ Frozen $addr at $value")
+        val freezeScript = """
+(function(){
+  var ptr = ptr64("$addr");
+  var iv = setInterval(function(){
+    try { ptr.$writeFn; } catch(e){ clearInterval(iv); }
+  }, 50);
+  recv("unfreeze_${addr.replace("0x","")}", function(){ clearInterval(iv); send({type:"unfrozen",addr:"$addr"}); });
+  send({type:"frozen",addr:"$addr"});
+})();"""
+
+        Thread {
+            try {
+                val pid = resolvePid()
+                if (pid.isEmpty()) { mainHandler.post { log("✗ Process not found") }; return@Thread }
+                runFrida(pid, freezeScript)
+                // Mark frozen only after script confirms
+                mainHandler.post {
+                    results.find { it.addr == addr }?.frozen = true
+                    frozenMap[addr] = FreezeJob(addr, value)
+                    renderResults()
+                    updateFreezeBtn(true)
+                    log("✓ Frozen $addr at $value (in-process loop)")
+                }
+            } catch (e: Exception) {
+                mainHandler.post { log("✗ Freeze failed: ${e.message}") }
+            }
+        }.start()
     }
 
     private fun doUnfreeze(addr: String) {
+        // Send unfreeze message into the running Frida script
+        val addrClean = addr.replace("0x","")
+        val unfreezScript = """
+(function(){
+  send({type:"unfreeze_req", channel:"unfreeze_$addrClean"});
+})();"""
+        Thread {
+            try {
+                val pid = resolvePid()
+                if (pid.isNotEmpty()) runFrida(pid, unfreezScript)
+            } catch (_: Exception) {}
+        }.start()
+
         frozenMap.remove(addr)
         results.find { it.addr == addr }?.frozen = false
-        renderResults()
-        updateFreezeBtn(false)
-        log("ℹ Unfrozen $addr")
+        mainHandler.post {
+            renderResults()
+            updateFreezeBtn(false)
+            log("ℹ Unfrozen $addr")
+        }
     }
 
     private fun stopAllFreezes() {
+        // Unfreeze all in background
+        val addrs = frozenMap.keys.toList()
         frozenMap.clear()
+        if (addrs.isEmpty()) return
+        Thread {
+            try {
+                val pid = resolvePid()
+                if (pid.isEmpty()) return@Thread
+                addrs.forEach { addr ->
+                    val addrClean = addr.replace("0x","")
+                    runFrida(pid, "(function(){ send({type:'unfreeze_req',channel:'unfreeze_$addrClean'}); })();")
+                }
+            } catch (_: Exception) {}
+        }.start()
     }
 
     // ─── Render results list ──────────────────────────────────────────────────
