@@ -15,7 +15,7 @@ import {
   AppState,
   AppStateStatus,
 } from 'react-native';
-import {useFocusEffect} from '@react-navigation/native';
+import {useFocusEffect, useRoute} from '@react-navigation/native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import {rootBridge} from '../native/RootBridge';
 import {LICENSE_KEY_STORAGE, LICENSE_EMAIL_STORAGE} from './LicenseScreen';
@@ -66,6 +66,7 @@ const cloudHeaders = (
 });
 
 export default function ScriptScreen() {
+  const route = useRoute<any>();
   const [script, setScript] = useState(DEFAULT_SCRIPT);
   const [target, setTarget] = useState('');
   const [running, setRunning] = useState(false);
@@ -109,7 +110,14 @@ export default function ScriptScreen() {
         if (pkg) setTarget(pkg);
       });
       loadScriptsList();
-    }, []),
+      // Prefill from GameScreen script library
+      if (route.params?.prefillCode) {
+        setScript(route.params.prefillCode);
+        if (route.params?.prefillTitle) {
+          setNewScriptName(route.params.prefillTitle);
+        }
+      }
+    }, [route.params?.prefillCode]),
   );
 
   useEffect(() => {
