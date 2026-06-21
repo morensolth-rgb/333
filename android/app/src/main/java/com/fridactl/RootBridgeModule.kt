@@ -844,7 +844,8 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                         emitScriptLog("⚙ Resolved process name: '$procName' (PID $cleanNamePid)")
                         // Use PID instead of name to avoid process name truncation issues (15-char limit)
                         // frida-inject -n can fail if process name > 15 chars (kernel truncates comm)
-                        cmd = "$FRIDA_CLI_DEST -D local -p $cleanNamePid --script '$scriptPath'"
+                        // --eternalize: frida-inject exits immediately but script stays loaded in process
+                        cmd = "$FRIDA_CLI_DEST -D local -p $cleanNamePid --script '$scriptPath' --eternalize"
                         modeLabel = "name→PID $cleanNamePid ($procName)"
                     }
                     else -> {   // pid
@@ -913,7 +914,9 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                             promise.reject("RUN_ERROR", "Invalid PID: '$pid'")
                             return@Thread
                         }
-                        cmd = "$FRIDA_CLI_DEST -D local -p $cleanPid --script '$scriptPath'"
+                        // --eternalize: frida-inject detaches cleanly, script stays running inside process
+                        // This prevents ptrace-stop from freezing the game after inject exits
+                        cmd = "$FRIDA_CLI_DEST -D local -p $cleanPid --script '$scriptPath' --eternalize"
                         modeLabel = "PID $cleanPid (via server)"
                     }
                 }
@@ -1159,30 +1162,44 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
             if (!promiseResolved) {
                 promiseResolved = true
                 val allEmpty = outLines.all { it.isBlank() || it.startsWith("EXIT:") || noiseRegex.containsMatchIn(it) }
-                if (allEmpty) emitScriptLog("⚠ frida-inject produced no output (binary issue?)")
-                val hint = when (realExit) {
-                    0    -> "exited cleanly (script ran and finished)"
-                    1    -> "exit 1 — wrong package name or binary version mismatch"
-                    4    -> "exit 4 — attach/spawn rejected (version mismatch or SELinux)"
-                    else -> "exit $realExit"
+                // --eternalize: frida-inject exits 0 immediately after loading script into the process.
+                // This is NOT an error — the script is running inside the target. Treat exit 0 as success.
+                if (realExit == 0) {
+                    if (allEmpty) emitScriptLog("⚠ No output captured — check logcat for script activity")
+                    emitScriptLog("✅ Script injected and running (eternalized)")
+                    promise.resolve("running:inject")
+                } else {
+                    if (allEmpty) emitScriptLog("⚠ frida-inject produced no output (binary issue?)")
+                    val hint = when (realExit) {
+                        1    -> "exit 1 — wrong package name or binary version mismatch"
+                        4    -> "exit 4 — attach/spawn rejected (version mismatch or SELinux)"
+                        else -> "exit $realExit"
+                    }
+                    promise.reject("INJECT_ERROR", hint)
                 }
-                promise.reject("INJECT_ERROR", hint)
             } else {
-                if (realExit == 0) emitScriptLog("✅ Done")
+                if (realExit == 0) emitScriptLog("✅ Script injected and running (eternalized)")
                 else emitScriptLog("⚠ exit $realExit")
             }
 
             fridaScriptPid = null
             fridaProcess   = null
 
-            // ── CRITICAL: Resume any frozen spawned process ─────────────────────
-            // If frida-inject exits (error or crash) while in spawn mode, the target process
-            // remains paused in ptrace state forever — the game appears frozen with black screen.
-            // We must resume it via frida or kill it so the user can restart normally.
-            // Strategy: send SIGCONT to all child processes of the package, then kill frida-server.
-            // Send SIGCONT to any T-state (ptrace-stopped) process so the game unfreezes
-            try { Shell.cmd("kill -CONT -1 2>/dev/null; true").exec() } catch (_: Exception) {}
-            emitScriptLog("⚙ Released any ptrace-stopped processes")
+            // ── CRITICAL: Resume any frozen spawned/attached process ───────────
+            // If frida-inject exits (error or crash) while in spawn/attach mode, the target
+            // process may remain paused in ptrace state — game appears frozen.
+            // Fix: send SIGCONT ONLY to the specific target PID extracted from cmd.
+            // NEVER use kill -CONT -1 (broadcasts to ALL processes — breaks system services).
+            val targetPidForCont = Regex("""-p\s+(\d+)""").find(cmd)?.groupValues?.get(1)
+            if (targetPidForCont != null) {
+                // SIGCONT to the target PID and its entire process group
+                try { Shell.cmd("kill -CONT $targetPidForCont 2>/dev/null; true").exec() } catch (_: Exception) {}
+                // Also unfreeze any threads in the same process group
+                try { Shell.cmd("kill -CONT -$targetPidForCont 2>/dev/null; true").exec() } catch (_: Exception) {}
+                emitScriptLog("⚙ Released ptrace-stop on PID $targetPidForCont")
+            } else {
+                emitScriptLog("⚙ No target PID found in cmd — skipping SIGCONT")
+            }
 
             // ── Kill frida-server after inject finishes ────────────────────────
             // frida-server intercepts ALL process spawns system-wide via ptrace.
