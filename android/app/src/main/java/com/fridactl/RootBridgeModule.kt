@@ -17,8 +17,11 @@ import com.facebook.react.modules.core.DeviceEventManagerModule
 import com.topjohnwu.superuser.Shell
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.BufferedInputStream
+import java.io.InputStream
+import java.io.OutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import org.apache.commons.compress.compressors.xz.XZCompressorInputStream
@@ -1199,42 +1202,155 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
     }
 
     // ─────────────────────────────────────────────
-    // XZ extraction via Apache Commons Compress stream
-    // frida releases .xz = XZ-compressed raw binary (no tar)
-    // We decode the XZ stream manually using the XZ magic bytes
+    // XZ extraction — 4 tiers, SELinux-safe
+    // Root shell handles all writes to restricted paths
+    // Java only writes to filesDir (always allowed)
     // ─────────────────────────────────────────────
     private fun extractXz(xzPath: String, outPath: String) {
         File(outPath).delete()
 
-        // Try shell xz first — uses almost zero extra RAM (kernel handles it)
-        val xzBin = Shell.cmd("which xz 2>/dev/null || which busybox 2>/dev/null").exec()
-            .out.firstOrNull()?.trim()
-
-        if (!xzBin.isNullOrBlank()) {
-            val cmd = if (xzBin.contains("busybox"))
-                "$xzBin xz -d -k -c '$xzPath' > '$outPath' 2>&1"
-            else
-                "xz -d -k -c '$xzPath' > '$outPath' 2>&1"
-            val r = Shell.cmd(cmd).exec()
-            if (File(outPath).exists() && File(outPath).length() > 1024) return
-            // shell xz failed — fall through to Java
-        }
-
-        // Fallback: Java XZ — stream mode, minimal buffering to reduce RAM pressure
-        // Process in 8KB chunks and rely on GC between chunks
-        val inBuf = BufferedInputStream(File(xzPath).inputStream(), 8192)
-        XZCompressorInputStream(inBuf, true).use { xzIn ->
-            FileOutputStream(File(outPath)).use { out ->
-                val buf = ByteArray(8192)
-                var n: Int
-                while (xzIn.read(buf).also { n = it } != -1) {
-                    out.write(buf, 0, n)
+        // ── Tier 1: shell tool reads .xz file directly ──
+        // Shell runs as root; it reads xzPath (in filesDir, world-readable) and writes to outPath
+        val tier1Cmds = listOf(
+            "xz -d -k -c '$xzPath' > '$outPath'",
+            "unxz -k -c '$xzPath' > '$outPath'",
+            "busybox xz -d -k -c '$xzPath' > '$outPath'",
+            "toybox xz -d '$xzPath' -c > '$outPath'"
+        )
+        for (cmd in tier1Cmds) {
+            try {
+                val r = Shell.cmd(cmd).exec()
+                if (File(outPath).exists() && File(outPath).length() > 1_000_000L) {
+                    android.util.Log.d("FridaCtl", "Tier1 success: $cmd")
+                    return
                 }
+                android.util.Log.w("FridaCtl", "Tier1 cmd '$cmd' failed: ${r.out + r.err}")
+            } catch (e: Exception) {
+                android.util.Log.w("FridaCtl", "Tier1 cmd '$cmd' exception: ${e.message}")
             }
         }
 
-        if (!File(outPath).exists() || File(outPath).length() < 1024)
-            throw Exception("XZ extraction produced empty file")
+        // ── Tier 2: raw shell Task — pipe .xz bytes directly into 'xz -d' stdin ──
+        // Uses Shell.execTask() which gives direct access to STDIN/STDOUT/STDERR streams
+        // Java writes raw .xz bytes to shell stdin; shell decompresses and writes to outPath
+        val xzAvail = Shell.cmd("which xz 2>/dev/null || which busybox 2>/dev/null").exec()
+            .out.firstOrNull()?.trim()
+        if (!xzAvail.isNullOrBlank()) {
+            try {
+                android.util.Log.d("FridaCtl", "Tier2: raw stdin pipe to xz -d")
+                val xzDecCmd = if (xzAvail.contains("busybox")) "busybox xz -d" else "xz -d"
+                var tier2Success = false
+                Shell.getShell().execTask { stdin: OutputStream, stdout: InputStream, stderr: InputStream ->
+                    // Write command to shell stdin
+                    stdin.write("$xzDecCmd > '$outPath'\n".toByteArray())
+                    stdin.flush()
+                    // Now pipe the .xz file bytes into stdin
+                    val buf = ByteArray(32768)
+                    FileInputStream(File(xzPath)).use { fis ->
+                        var n: Int
+                        while (fis.read(buf).also { n = it } != -1) {
+                            stdin.write(buf, 0, n)
+                        }
+                    }
+                    stdin.flush()
+                    // Send newline + exit-status check sentinel
+                    stdin.write("\necho __DONE_\$?\n".toByteArray())
+                    stdin.flush()
+                    // Read until we see __DONE_ in stdout
+                    val sb = StringBuilder()
+                    val readBuf = ByteArray(512)
+                    var attempts = 0
+                    while (!sb.contains("__DONE_") && attempts++ < 200) {
+                        Thread.sleep(100)
+                        val avail = stdout.available()
+                        if (avail > 0) {
+                            val n2 = stdout.read(readBuf, 0, minOf(avail, readBuf.size))
+                            if (n2 > 0) sb.append(String(readBuf, 0, n2))
+                        }
+                    }
+                    tier2Success = sb.contains("__DONE_0")
+                    android.util.Log.d("FridaCtl", "Tier2 raw task output: $sb")
+                }
+                if (tier2Success && File(outPath).exists() && File(outPath).length() > 1_000_000L) {
+                    android.util.Log.d("FridaCtl", "Tier2 success")
+                    return
+                }
+                android.util.Log.w("FridaCtl", "Tier2 failed — output size: ${File(outPath).length()}")
+            } catch (e: Exception) {
+                android.util.Log.w("FridaCtl", "Tier2 exception: ${e.message}")
+            }
+        }
+
+        // ── Tier 3: Java decompresses XZ → write to tmp in filesDir → root cp to dest ──
+        // Java writes decompressed binary to filesDir (always allowed)
+        // Root shell copies from filesDir to restricted destination
+        val tmpOut = File(reactApplicationContext.filesDir, "frida_tmp.bin")
+        try {
+            tmpOut.delete()
+            android.util.Log.d("FridaCtl", "Tier3: Java XZ decompress to filesDir tmp")
+            val inBuf = BufferedInputStream(FileInputStream(File(xzPath)), 32768)
+            XZCompressorInputStream(inBuf, true).use { xzIn ->
+                FileOutputStream(tmpOut).use { out ->
+                    val buf = ByteArray(32768)
+                    var n: Int
+                    while (xzIn.read(buf).also { n = it } != -1) {
+                        out.write(buf, 0, n)
+                    }
+                }
+            }
+            android.util.Log.d("FridaCtl", "Tier3: decompressed ${tmpOut.length()} bytes, copying via root shell")
+            // Root shell copies from filesDir to restricted path
+            val r = Shell.cmd("cp '${tmpOut.absolutePath}' '$outPath'").exec()
+            if (File(outPath).exists() && File(outPath).length() > 1_000_000L) {
+                android.util.Log.d("FridaCtl", "Tier3 cp success")
+                tmpOut.delete()
+                return
+            }
+            android.util.Log.w("FridaCtl", "Tier3 cp failed: ${r.out + r.err}")
+            // cp failed — try cat redirect via root shell
+            val r2 = Shell.cmd("cat '${tmpOut.absolutePath}' > '$outPath'").exec()
+            if (File(outPath).exists() && File(outPath).length() > 1_000_000L) {
+                android.util.Log.d("FridaCtl", "Tier3 cat success")
+                tmpOut.delete()
+                return
+            }
+            android.util.Log.w("FridaCtl", "Tier3 cat failed: ${r2.out + r2.err}")
+        } catch (e: Exception) {
+            android.util.Log.w("FridaCtl", "Tier3 exception: ${e.message}")
+        } finally {
+            tmpOut.delete()
+        }
+
+        // ── Tier 4: Java decompresses XZ → root dd reads from filesDir via shell ──
+        // Same as Tier 3 but uses dd instead of cp/cat
+        val tmpOut4 = File(reactApplicationContext.filesDir, "frida_tmp4.bin")
+        try {
+            tmpOut4.delete()
+            android.util.Log.d("FridaCtl", "Tier4: Java XZ decompress + dd copy")
+            val inBuf = BufferedInputStream(FileInputStream(File(xzPath)), 32768)
+            XZCompressorInputStream(inBuf, true).use { xzIn ->
+                FileOutputStream(tmpOut4).use { out ->
+                    val buf = ByteArray(32768)
+                    var n: Int
+                    while (xzIn.read(buf).also { n = it } != -1) {
+                        out.write(buf, 0, n)
+                    }
+                }
+            }
+            val r = Shell.cmd("dd if='${tmpOut4.absolutePath}' of='$outPath' bs=32768").exec()
+            if (File(outPath).exists() && File(outPath).length() > 1_000_000L) {
+                android.util.Log.d("FridaCtl", "Tier4 dd success")
+                tmpOut4.delete()
+                return
+            }
+            android.util.Log.w("FridaCtl", "Tier4 dd failed: ${r.out + r.err}")
+        } catch (e: Exception) {
+            android.util.Log.w("FridaCtl", "Tier4 exception: ${e.message}")
+        } finally {
+            tmpOut4.delete()
+        }
+
+        throw Exception("All XZ extraction tiers failed — check logcat for per-tier errors")
     }
 
     // ─────────────────────────────────────────────
