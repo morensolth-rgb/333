@@ -164,6 +164,101 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
     }
 
     // ─────────────────────────────────────────────
+    // Device / environment detection
+    // ─────────────────────────────────────────────
+
+    /**
+     * Real arch from /proc/cpuinfo — NOT Build.SUPPORTED_ABIS.
+     * VMs like VMOS lie about ABI. /proc/cpuinfo is the kernel truth.
+     * Returns: "arm64" | "arm" | "x86_64" | "x86"
+     */
+    private fun detectRealArch(): String {
+        // Try /proc/cpuinfo Hardware/CPU architecture field
+        val cpuinfo = try {
+            Shell.cmd("cat /proc/cpuinfo 2>/dev/null").exec().out.joinToString("\n")
+        } catch (_: Exception) { "" }
+
+        return when {
+            cpuinfo.contains("aarch64", ignoreCase = true) ||
+            cpuinfo.contains("ARMv8",   ignoreCase = true)   -> "arm64"
+
+            cpuinfo.contains("x86_64",  ignoreCase = true) ||
+            cpuinfo.contains("AMD64",   ignoreCase = true)   -> "x86_64"
+
+            // fallback: uname -m
+            else -> {
+                val uname = Shell.cmd("uname -m 2>/dev/null").exec().out.firstOrNull()?.trim() ?: ""
+                when {
+                    uname.contains("aarch64") -> "arm64"
+                    uname.contains("x86_64")  -> "x86_64"
+                    uname.contains("i686") || uname.contains("i386") -> "x86"
+                    uname.contains("arm")     -> "arm"
+                    else -> {
+                        // Last resort: Build.SUPPORTED_ABIS
+                        val abi = Build.SUPPORTED_ABIS.firstOrNull() ?: "arm64-v8a"
+                        when {
+                            abi.startsWith("arm64")   -> "arm64"
+                            abi == "x86_64"           -> "x86_64"
+                            abi.startsWith("x86")     -> "x86"
+                            else                      -> "arm"
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /** Frida download arch string from real arch */
+    private fun fridaArchFromReal(): String = when (detectRealArch()) {
+        "arm64"  -> "android-arm64"
+        "x86_64" -> "android-x86_64"
+        "x86"    -> "android-x86"
+        else     -> "android-arm"
+    }
+
+    /**
+     * Detect if running inside a VM/emulator (VMOS, NoxPlayer, BlueStacks, etc.)
+     * Returns description string or null if physical device.
+     */
+    private fun detectVmEnvironment(): String? {
+        val checks = listOf(
+            // VMOS specific
+            Shell.cmd("getprop ro.vmos.version 2>/dev/null").exec().out.firstOrNull()?.trim()
+                ?.takeIf { it.isNotBlank() }?.let { "VMOS $it" },
+            Shell.cmd("getprop ro.product.manufacturer 2>/dev/null").exec().out.firstOrNull()?.trim()
+                ?.takeIf { it.equals("VMOS", ignoreCase = true) }?.let { "VMOS" },
+            // Generic VM indicators
+            Shell.cmd("getprop ro.kernel.qemu 2>/dev/null").exec().out.firstOrNull()?.trim()
+                ?.takeIf { it == "1" }?.let { "QEMU emulator" },
+            Shell.cmd("getprop ro.build.tags 2>/dev/null").exec().out.firstOrNull()?.trim()
+                ?.takeIf { it.contains("test-keys", ignoreCase = true) }?.let { "test-keys build (VM/custom ROM)" },
+            // BlueStacks
+            Shell.cmd("ls /data/data/com.bluestacks.home 2>/dev/null").exec().isSuccess
+                .takeIf { it }?.let { "BlueStacks" },
+            // Check if it's actually an x86 kernel pretending to be arm64
+            run {
+                val realArch  = detectRealArch()
+                val buildAbi  = Build.SUPPORTED_ABIS.firstOrNull() ?: ""
+                if (realArch == "x86_64" && buildAbi.startsWith("arm")) {
+                    "x86_64 kernel with ARM ABI translation (Houdini/NDK translation layer)"
+                } else null
+            }
+        )
+        return checks.filterNotNull().firstOrNull()
+    }
+
+    /**
+     * Validate that a binary actually executes on this device.
+     * Runs `binary --version` and checks exit code.
+     */
+    private fun validateBinary(path: String): Boolean {
+        return try {
+            val r = Shell.cmd("'$path' --version 2>/dev/null").exec()
+            r.isSuccess && r.out.firstOrNull()?.trim()?.isNotBlank() == true
+        } catch (_: Exception) { false }
+    }
+
+    // ─────────────────────────────────────────────
     // frida-server lifecycle
     // ─────────────────────────────────────────────
 
@@ -171,19 +266,45 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
     fun startFridaServer(promise: Promise) {
         Thread {
             try {
+                // Detect VM environment and warn
+                val vmEnv = detectVmEnvironment()
+                if (vmEnv != null) {
+                    emitScriptLog("⚠ VM detected: $vmEnv")
+                    emitScriptLog("⚠ Frida may not work inside virtualized environments")
+                    emitScriptLog("   frida-server needs direct kernel access — VMs block this")
+                }
+
+                // Detect real arch
+                val realArch = detectRealArch()
+                emitScriptLog("📱 Arch: $realArch (from /proc/cpuinfo)")
+
                 // Try embedded asset first, then check if already at dest
                 val destFile = File(FRIDA_DEST)
                 if (!destFile.exists() || destFile.length() < 1024) {
                     try {
-                        extractAsset("frida-server-arm64", FRIDA_DEST)
+                        // Only extract arm64 asset if arch matches
+                        if (realArch == "arm64") {
+                            extractAsset("frida-server-arm64", FRIDA_DEST)
+                        } else {
+                            throw Exception("No embedded binary for $realArch — download from Home screen")
+                        }
                     } catch (e: Exception) {
-                        throw Exception("frida-server binary not found. Please download it from the Home screen first.")
+                        throw Exception("frida-server binary not found. Please download it from the Home screen first.\n(Device arch: $realArch)")
                     }
+                }
+
+                // Validate binary runs on this arch before attempting to start
+                Shell.cmd("chmod 755 $FRIDA_DEST").exec()
+                if (!validateBinary(FRIDA_DEST)) {
+                    throw Exception(
+                        "frida-server binary won't execute on this device (arch mismatch?).\n" +
+                        "Device arch: $realArch — binary may be wrong arch.\n" +
+                        "Delete and re-download from Home screen to get the correct arch."
+                    )
                 }
 
                 Shell.cmd("pkill -f frida-server 2>/dev/null; true").exec()
                 Thread.sleep(500)
-                Shell.cmd("chmod 755 $FRIDA_DEST").exec()
 
                 // Use app filesDir for log — /tmp may not exist on all devices
                 val fridaLog = "${reactApplicationContext.filesDir}/frida.log"
@@ -545,17 +666,43 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
         Thread {
             try {
                 // ── 1. Ensure frida-inject binary ─────────────────────────────
+                val realArch = detectRealArch()
+                emitScriptLog("📱 Arch: $realArch")
+
+                // Detect VM and warn
+                val vmEnv = detectVmEnvironment()
+                if (vmEnv != null) {
+                    emitScriptLog("⚠ VM: $vmEnv")
+                    emitScriptLog("   Frida requires direct kernel access — may not work in VM")
+                }
+
                 val injectFile = File(FRIDA_CLI_DEST)
                 if (!injectFile.exists() || injectFile.length() < 1024) {
                     try {
-                        extractAsset("frida-inject-arm64", FRIDA_CLI_DEST)
-                        emitScriptLog("📦 Extracted frida-inject from assets")
+                        if (realArch == "arm64") {
+                            extractAsset("frida-inject-arm64", FRIDA_CLI_DEST)
+                            emitScriptLog("📦 Extracted frida-inject (arm64) from assets")
+                        } else {
+                            promise.reject("RUN_ERROR",
+                                "frida-inject missing — download from Home screen first\n(Device arch: $realArch, need matching binary)")
+                            return@Thread
+                        }
                     } catch (_: Exception) {
-                        promise.reject("RUN_ERROR", "frida-inject binary missing — download from Home screen first")
+                        promise.reject("RUN_ERROR", "frida-inject binary missing — download from Home screen first\n(Device arch: $realArch)")
                         return@Thread
                     }
                 }
                 Shell.cmd("chmod 755 $FRIDA_CLI_DEST").exec()
+
+                // Validate binary actually runs on this device
+                if (!validateBinary(FRIDA_CLI_DEST)) {
+                    emitScriptLog("❌ frida-inject won't execute (arch mismatch or corrupt binary)")
+                    emitScriptLog("   Device: $realArch — delete binary and re-download from Home screen")
+                    promise.reject("RUN_ERROR",
+                        "frida-inject cannot execute on this device.\n" +
+                        "Arch: $realArch — re-download the correct version from Home screen.")
+                    return@Thread
+                }
 
                 // ── 1c. Version mismatch check ────────────────────────────────
                 // exit 4 is most commonly caused by frida-inject ≠ frida-server version

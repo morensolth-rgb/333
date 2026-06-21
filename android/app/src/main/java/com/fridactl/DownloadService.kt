@@ -85,15 +85,51 @@ class DownloadService : Service() {
 
     // ─── arch detection ──────────────────────────────────────────────────────
 
-    private fun fridaArch(): String {
-        val abi = Build.SUPPORTED_ABIS.firstOrNull() ?: "arm64-v8a"
+    /**
+     * Detect real arch from kernel — NOT Build.SUPPORTED_ABIS.
+     * VMs like VMOS lie about ABI. /proc/cpuinfo + uname -m = kernel truth.
+     */
+    private fun detectRealArch(): String {
+        val cpuinfo = try {
+            val p = ProcessBuilder("sh", "-c", "cat /proc/cpuinfo 2>/dev/null").start()
+            p.inputStream.bufferedReader().readText().also { p.waitFor() }
+        } catch (_: Exception) { "" }
+
         return when {
-            abi.startsWith("arm64")   -> "android-arm64"
-            abi.startsWith("armeabi") -> "android-arm"
-            abi == "x86_64"           -> "android-x86_64"
-            abi.startsWith("x86")     -> "android-x86"
-            else                      -> "android-arm64"
+            cpuinfo.contains("aarch64", ignoreCase = true) ||
+            cpuinfo.contains("ARMv8",   ignoreCase = true)   -> "arm64"
+            cpuinfo.contains("x86_64",  ignoreCase = true) ||
+            cpuinfo.contains("AMD64",   ignoreCase = true)   -> "x86_64"
+            else -> {
+                val uname = try {
+                    val p = ProcessBuilder("sh", "-c", "uname -m 2>/dev/null").start()
+                    p.inputStream.bufferedReader().readText().trim().also { p.waitFor() }
+                } catch (_: Exception) { "" }
+                when {
+                    uname.contains("aarch64") -> "arm64"
+                    uname.contains("x86_64")  -> "x86_64"
+                    uname.contains("i686") || uname.contains("i386") -> "x86"
+                    uname.contains("arm")     -> "arm"
+                    else -> {
+                        // Last resort: Build.SUPPORTED_ABIS
+                        val abi = Build.SUPPORTED_ABIS.firstOrNull() ?: "arm64-v8a"
+                        when {
+                            abi.startsWith("arm64") -> "arm64"
+                            abi == "x86_64"         -> "x86_64"
+                            abi.startsWith("x86")   -> "x86"
+                            else                    -> "arm"
+                        }
+                    }
+                }
+            }
         }
+    }
+
+    private fun fridaArch(): String = when (detectRealArch()) {
+        "arm64"  -> "android-arm64"
+        "x86_64" -> "android-x86_64"
+        "x86"    -> "android-x86"
+        else     -> "android-arm"
     }
 
     // ─── main download logic ──────────────────────────────────────────────────
@@ -106,11 +142,19 @@ class DownloadService : Service() {
         //   1. Download raw binary → filesDir  (Java always allowed to write here)
         //   2. Root shell copies it → /data/local/tmp  (bypasses SELinux on Java process)
         //   3. Root shell sets chmod 755
-        val appTmp = filesDir.absolutePath
-        val arch   = fridaArch()
-        val log    = StringBuilder()
+        val appTmp   = filesDir.absolutePath
+        val realArch = detectRealArch()
+        val arch     = fridaArch()
+        val log      = StringBuilder()
 
-        log.appendLine("▶ arch: $arch | version: $version")
+        log.appendLine("▶ real arch: $realArch → frida arch: $arch | version: $version")
+        // Warn if arch detection used fallback (VM may lie)
+        val buildAbi = Build.SUPPORTED_ABIS.firstOrNull() ?: ""
+        if ((realArch == "x86_64" && buildAbi.startsWith("arm")) ||
+            (realArch == "arm64"  && buildAbi.startsWith("x86"))) {
+            log.appendLine("⚠ ABI translation detected: kernel=$realArch, Build.ABI=$buildAbi")
+            log.appendLine("⚠ Downloading $arch binary — if it fails, device may be VM with Houdini")
+        }
 
         Shell.cmd("mkdir -p /data/local/tmp 2>/dev/null; true").exec()
 
@@ -130,14 +174,45 @@ class DownloadService : Service() {
                 copyToDestViaRoot(rawPath, FRIDA_DEST)
                 cleanup(rawPath)
                 Shell.cmd("chmod 755 '$FRIDA_DEST'").exec()
-                log.appendLine("  ✓ installed (${File(FRIDA_DEST).length()/1024}KB)")
+                val installedSize = File(FRIDA_DEST).length()
+                log.appendLine("  ✓ installed (${installedSize/1024}KB)")
+
+                // Validate binary executes on this arch
+                val verOut = try {
+                    Shell.cmd("'$FRIDA_DEST' --version 2>/dev/null").exec()
+                        .out.firstOrNull()?.trim()
+                } catch (_: Exception) { null }
+                if (verOut.isNullOrBlank()) {
+                    log.appendLine("  ❌ binary won't execute on this device!")
+                    log.appendLine("  ❌ Arch mismatch? kernel=$realArch but downloaded $arch")
+                    log.appendLine("  ❌ This device may not support this binary format")
+                    Shell.cmd("rm -f '$FRIDA_DEST'").exec()
+                    finishService(ACTION_ERROR,
+                        "frida-server downloaded but won't run on this device.\n" +
+                        "Kernel arch: $realArch | Downloaded: $arch\n" +
+                        "This may be a VM (VMOS/BlueStacks) that blocks direct kernel access.")
+                    return
+                }
+                log.appendLine("  ✓ version: $verOut")
             } catch (e: Exception) {
                 cleanup(rawPath)
                 finishService(ACTION_ERROR, "frida-server failed: ${e.message}")
                 return
             }
         } else {
-            log.appendLine("▶ frida-server OK (${File(FRIDA_DEST).length()/1024}KB)")
+            val verOut = try {
+                Shell.cmd("'$FRIDA_DEST' --version 2>/dev/null").exec().out.firstOrNull()?.trim()
+            } catch (_: Exception) { null }
+            if (verOut.isNullOrBlank()) {
+                log.appendLine("▶ frida-server exists but won't execute — re-downloading")
+                Shell.cmd("rm -f '$FRIDA_DEST'").exec()
+                // Will be downloaded on next call — for now inform user
+                finishService(ACTION_ERROR,
+                    "Existing frida-server binary is corrupt or wrong arch.\n" +
+                    "Deleted it. Please retry download.\nKernel arch: $realArch")
+                return
+            }
+            log.appendLine("▶ frida-server OK v$verOut (${File(FRIDA_DEST).length()/1024}KB)")
         }
 
         // ── frida-inject ──────────────────────────────────────────────────────
@@ -154,13 +229,33 @@ class DownloadService : Service() {
                 copyToDestViaRoot(rawPath, FRIDA_CLI_DEST)
                 cleanup(rawPath)
                 Shell.cmd("chmod 755 '$FRIDA_CLI_DEST'").exec()
-                log.appendLine("  ✓ installed (${File(FRIDA_CLI_DEST).length()/1024}KB)")
+
+                // Validate frida-inject executes
+                val injVer = try {
+                    Shell.cmd("'$FRIDA_CLI_DEST' --version 2>/dev/null").exec()
+                        .out.firstOrNull()?.trim()
+                } catch (_: Exception) { null }
+                if (injVer.isNullOrBlank()) {
+                    log.appendLine("  ⚠ frida-inject downloaded but won't execute (arch mismatch?)")
+                    log.appendLine("  ⚠ kernel=$realArch, downloaded $arch")
+                    Shell.cmd("rm -f '$FRIDA_CLI_DEST'").exec()
+                } else {
+                    log.appendLine("  ✓ installed v$injVer (${File(FRIDA_CLI_DEST).length()/1024}KB)")
+                }
             } catch (e: Exception) {
                 cleanup(rawPath)
                 log.appendLine("  ⚠ frida-inject failed (non-fatal): ${e.message}")
             }
         } else {
-            log.appendLine("▶ frida-inject OK")
+            val injVer = try {
+                Shell.cmd("'$FRIDA_CLI_DEST' --version 2>/dev/null").exec().out.firstOrNull()?.trim()
+            } catch (_: Exception) { null }
+            if (injVer.isNullOrBlank()) {
+                Shell.cmd("rm -f '$FRIDA_CLI_DEST'").exec()
+                log.appendLine("▶ frida-inject existed but won't execute — deleted (retry download)")
+            } else {
+                log.appendLine("▶ frida-inject OK v$injVer")
+            }
         }
 
         finishService(ACTION_DONE, log.toString())
