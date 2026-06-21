@@ -687,33 +687,42 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                                 "Download frida-server from Home screen, or use SPAWN mode instead.")
                             return@Thread
                         }
-                        // Try to find the process; if not running, launch it and wait
-                        var pid = resolvePid(packageName)?.trim()
-                        if (pid.isNullOrEmpty()) {
+                        // Find PID directly — do NOT use resolvePid() here because it auto-launches
+                        // We control the launch ourselves below with proper timing
+                        var pid = Shell.cmd("pidof '$packageName' 2>/dev/null | tr ' ' '\\n' | head -1")
+                            .exec().out.firstOrNull()?.trim()?.ifBlank { null }
+
+                        if (pid == null) {
+                            // App not running — launch it via monkey (most reliable launcher)
                             emitScriptLog("⚙ App not running — launching $packageName...")
-                            Shell.cmd("am start -n '$packageName' $(pm resolve-activity --brief '$packageName' 2>/dev/null | tail -1) 2>/dev/null || " +
-                                      "monkey -p '$packageName' -c android.intent.category.LAUNCHER 1 2>/dev/null; true").exec()
-                            // Wait up to 8s for the process to appear
-                            repeat(16) {
+                            Shell.cmd("monkey -p '$packageName' -c android.intent.category.LAUNCHER 1 2>/dev/null; true").exec()
+                            // Wait up to 10s for the process to appear (500ms polls)
+                            repeat(20) { i ->
                                 Thread.sleep(500)
-                                val found = resolvePid(packageName)?.trim()
-                                if (!found.isNullOrEmpty()) {
+                                val found = Shell.cmd("pidof '$packageName' 2>/dev/null | tr ' ' '\\n' | head -1")
+                                    .exec().out.firstOrNull()?.trim()?.ifBlank { null }
+                                if (found != null) {
                                     pid = found
+                                    emitScriptLog("✓ Process appeared after ${(i + 1) * 500}ms (PID $found)")
                                     return@repeat
                                 }
                             }
                         }
-                        if (pid.isNullOrEmpty()) {
+
+                        if (pid == null) {
                             promise.reject("RUN_ERROR",
-                                "Cannot find running process for $packageName — could not launch it automatically either")
+                                "Cannot find running process for $packageName — could not launch it automatically")
                             return@Thread
                         }
-                        // Give the app 1.5s to initialize before injecting
-                        emitScriptLog("⏳ Waiting for app to initialize...")
-                        Thread.sleep(1500)
+
+                        // Wait for app to fully initialize before injecting
+                        // Inject too early → app may detect frida during startup checks
+                        emitScriptLog("⏳ App found (PID $pid) — waiting 3s for initialization...")
+                        Thread.sleep(3000)
+
                         val cleanPid = pid!!.filter { it.isDigit() }
                         if (cleanPid.isEmpty()) {
-                            promise.reject("RUN_ERROR", "Invalid PID resolved: '$pid'")
+                            promise.reject("RUN_ERROR", "Invalid PID: '$pid'")
                             return@Thread
                         }
                         cmd = "$FRIDA_CLI_DEST -D local -p $cleanPid --script '$scriptPath'"
@@ -784,18 +793,23 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                 }
             } catch (_: Exception) {}
 
-            // Primary ended — if we never got output and fallback not yet tried, switch to unfiltered
+            // Primary ended — if we never got output and fallback not yet tried, switch to filtered logcat
             if (linesReceived == 0 && !usedFallback && fridaLogcatProc != null) {
                 usedFallback = true
-                emitScriptLog("⚠ No Frida-tagged output — switching to unfiltered logcat (all script output will show)")
+                emitScriptLog("⚠ No Frida-tagged output — switching to filtered logcat")
                 val proc2 = launchLogcat(fallbackCmd) ?: return@Thread
                 fridaLogcatProc = proc2
+                // Only show lines relevant to script execution — filter noise
+                val hookRx = Regex(
+                    """\[|hook|cipher|key|inject|frida|console|send|recv|error|warn|crash|memory|scan|bypass|patch""",
+                    RegexOption.IGNORE_CASE
+                )
                 try {
                     proc2.inputStream.bufferedReader().use { reader ->
                         while (true) {
                             val line = reader.readLine() ?: break
                             if (line.isBlank()) continue
-                            emitScriptLog(line)
+                            if (hookRx.containsMatchIn(line)) emitScriptLog(line)
                         }
                     }
                 } catch (_: Exception) {}
@@ -830,38 +844,27 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
         // Real frida script output (console.log) goes through logcat automatically
         Shell.cmd("rm -f '$outLog' '$errLog' 2>/dev/null; true").exec()
 
-        // frida-inject writes console.log to stdout when it detects a TTY.
-        // When stdout is a file/pipe, frida still checks isatty(stdin) and may complain.
+        // frida-inject writes console.log to stdout (piped mode) or PTY slave (TTY mode).
+        // setsid </dev/ptmx redirects stdin from PTY master — stdout still goes to the file correctly
+        // ONLY when the slave fd is open. Without a slave, frida detects no TTY and writes to stdout→file.
         //
-        // Strategy — try in order:
-        //   1. 'script -q -c CMD /dev/null' — allocates PTY, captures ALL PTY output to stdout → file
-        //   2. setsid + /dev/ptmx stdin + stdout→file (works on old device, may lose output on new)
-        //   3. bare CMD with stdout/stderr directly captured (no TTY — frida may error but output is captured)
+        // CONFIRMED WORKING STRATEGY:
+        //   Run frida-inject with stdout+stderr redirected to files — no PTY wrapper.
+        //   frida-inject will print "tcgetattr: Inappropriate ioctl" to stderr (we filter it).
+        //   console.log output goes to stdout → outLog. This is the most reliable cross-device approach.
         //
-        // We detect which tools are available and pick the best wrapper.
-        val hasScript  = Shell.cmd("which script  2>/dev/null").exec().out.firstOrNull()?.trim()?.isNotBlank() == true
-        val hasSetsid  = Shell.cmd("which setsid  2>/dev/null").exec().out.firstOrNull()?.trim()?.isNotBlank() == true
-        val hasStdbuf  = Shell.cmd("which stdbuf  2>/dev/null").exec().out.firstOrNull()?.trim()?.isNotBlank() == true
+        //   If 'script' is available, use it — it gives frida a real PTY and captures everything.
+        val hasScript = Shell.cmd("which script 2>/dev/null").exec().out.firstOrNull()?.trim()?.isNotBlank() == true
 
-        val wrapper = when {
-            hasScript -> {
-                // Best: script allocates PTY slave as CMD's stdin/stdout/stderr.
-                // ALL output (console.log, errors) goes to script's stdout → outLog
-                // -q suppresses "Script started/done" headers; /dev/null = discard typescript copy
-                emitScriptLog("🖥 Using PTY capture (script)")
-                "script -q -c \"$cmd\" /dev/null >'$outLog' 2>'$errLog'; echo \"EXIT:\$?\" >>'$outLog'"
-            }
-            hasSetsid -> {
-                // setsid: new session so frida doesn't inherit our session's controlling terminal
-                // /dev/ptmx as stdin: satisfies isatty() check; frida writes console.log to stdout
-                emitScriptLog("🖥 Using setsid PTY")
-                "setsid $cmd </dev/ptmx >'$outLog' 2>'$errLog'; echo \"EXIT:\$?\" >>'$outLog'"
-            }
-            else -> {
-                // No TTY tools — run bare; frida may warn about TTY but still outputs to stdout
-                emitScriptLog("🖥 No TTY wrapper available — bare exec")
-                "$cmd >'$outLog' 2>'$errLog'; echo \"EXIT:\$?\" >>'$outLog'"
-            }
+        val wrapper = if (hasScript) {
+            emitScriptLog("🖥 PTY capture via script")
+            // script -q -c 'CMD' /dev/null — CMD gets a real PTY slave; all output captured to script stdout → outLog
+            "script -q -c '$cmd' /dev/null >'$outLog' 2>'$errLog'; echo \"EXIT:\$?\" >>'$outLog'"
+        } else {
+            emitScriptLog("🖥 Direct capture (no PTY — tcgetattr warning is normal)")
+            // No PTY tools. frida prints tcgetattr warning to stderr (filtered below).
+            // console.log goes to stdout → outLog. Works reliably.
+            "$cmd >'$outLog' 2>&1; echo \"EXIT:\$?\" >>'$outLog'"
         }
 
         val pb = ProcessBuilder("su", "-c", wrapper)
@@ -880,7 +883,10 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
 
         var promiseResolved = false
 
-        val noiseRx = Regex("tcgetattr|isatty|not a tty|inappropriate ioctl", RegexOption.IGNORE_CASE)
+        val noiseRx = Regex(
+            "tcgetattr|isatty|not a tty|inappropriate ioctl|Script (started|done)|stty:",
+            RegexOption.IGNORE_CASE
+        )
 
         // ── Stream outLog in real-time (stdout from frida-inject — console.log + send() output) ──
         Thread {
@@ -902,23 +908,8 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
             } catch (_: Exception) {}
         }.start()
 
-        // ── Stream errLog in real-time (stderr from frida-inject — shows errors immediately) ──
-        Thread {
-            try {
-                val tailProc = ProcessBuilder("su", "-c", "tail -f '$errLog' 2>/dev/null")
-                    .redirectErrorStream(true).start()
-                try {
-                    tailProc.inputStream.bufferedReader().use { r ->
-                        while (fridaScriptPid != null || proc.isAlive) {
-                            val l = r.readLine() ?: break
-                            if (l.isBlank() || noiseRx.containsMatchIn(l)) continue
-                            emitScriptLog("- $l")
-                        }
-                    }
-                } catch (_: Exception) {}
-                try { tailProc.destroy() } catch (_: Exception) {}
-            } catch (_: Exception) {}
-        }.start()
+        // errLog not streamed separately — stderr is merged into outLog via 2>&1
+        // (when using script, errLog captures script's own stderr which is minimal)
 
         Thread {
             // Drain the process stdout (mostly empty now since we redirect to files)
@@ -931,15 +922,13 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
 
             // Now read the captured output files
             val outLines = try { java.io.File(outLog).readLines() } catch (_: Exception) { emptyList() }
-            val errLines = try { java.io.File(errLog).readLines() } catch (_: Exception) { emptyList() }
-
+            // errLog is not used separately — stderr merged into outLog via 2>&1
             val noiseRegex = Regex(
-                "tcgetattr|isatty|not a tty|inappropriate ioctl for device",
+                "tcgetattr|isatty|not a tty|inappropriate ioctl|Script (started|done)|stty:",
                 RegexOption.IGNORE_CASE
             )
 
-            // Emit stderr lines that weren't already streamed (dedup by content not possible, show all)
-            // stdout (outLog) lines — skip EXIT: and noise
+            // outLog contains both stdout + stderr (merged). Skip noise and EXIT: marker.
             for (l in outLines) {
                 if (l.isBlank()) continue
                 if (l.startsWith("EXIT:")) continue
@@ -981,7 +970,7 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
 
             if (!promiseResolved) {
                 promiseResolved = true
-                val allEmpty = outLines.all { it.isBlank() || it.startsWith("EXIT:") } && errLines.all { it.isBlank() }
+                val allEmpty = outLines.all { it.isBlank() || it.startsWith("EXIT:") || noiseRegex.containsMatchIn(it) }
                 if (allEmpty) emitScriptLog("⚠ frida-inject produced no output (binary issue?)")
                 val hint = when (realExit) {
                     0    -> "exited cleanly (script ran and finished)"
