@@ -788,11 +788,11 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                             return@Thread
                         }
                         Shell.cmd("am force-stop '$packageName' 2>/dev/null; true").exec()
-                        Thread.sleep(1500)  // wait for app to fully die before spawning
-                        emitScriptLog("🔄 Force-stopped $packageName, spawning via server...")
-                        // Use frida-server directly via frida CLI: frida -D local -f <pkg>
-                        // frida-inject -f on Android 10+ fails with SELinux even with -D local
-                        // Correct approach: write script to stdin of frida CLI or use --no-pause
+                        Thread.sleep(2000)  // wait for app to fully die before spawning
+                        emitScriptLog("🔄 Force-stopped $packageName — spawning with frida...")
+                        emitScriptLog("ℹ Spawn injects BEFORE app code runs — bypasses anti-tamper startup checks")
+                        // frida-inject -D local -f <pkg> --no-pause
+                        // This spawns the app paused, injects script, then resumes — anti-tamper never runs first
                         cmd = "$FRIDA_CLI_DEST -D local -f '$packageName' --script '$scriptPath' --no-pause"
                         modeLabel = "spawn (via server)"
                     }
@@ -835,16 +835,19 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                             return@Thread
                         }
                         // Find PID directly — do NOT use resolvePid() here because it auto-launches
-                        // We control the launch ourselves below with proper timing
                         var pid = Shell.cmd("pidof '$packageName' 2>/dev/null | tr ' ' '\\n' | head -1")
                             .exec().out.firstOrNull()?.trim()?.ifBlank { null }
 
                         if (pid == null) {
-                            // App not running — launch it via monkey (most reliable launcher)
+                            // App not running — launch via am start (more reliable than monkey for some devices)
                             emitScriptLog("⚙ App not running — launching $packageName...")
-                            Shell.cmd("monkey -p '$packageName' -c android.intent.category.LAUNCHER 1 2>/dev/null; true").exec()
-                            // Wait up to 10s for the process to appear (500ms polls)
-                            repeat(20) { i ->
+                            Shell.cmd(
+                                "am start -n \"\$(cmd package resolve-activity --brief '$packageName' 2>/dev/null | tail -1)\" 2>/dev/null; " +
+                                "monkey -p '$packageName' -c android.intent.category.LAUNCHER 1 2>/dev/null; true"
+                            ).exec()
+
+                            // Poll up to 15s for process to appear
+                            repeat(30) { i ->
                                 Thread.sleep(500)
                                 val found = Shell.cmd("pidof '$packageName' 2>/dev/null | tr ' ' '\\n' | head -1")
                                     .exec().out.firstOrNull()?.trim()?.ifBlank { null }
@@ -857,15 +860,31 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                         }
 
                         if (pid == null) {
+                            // App appeared briefly but already died — typical anti-tamper behavior
+                            // when frida-server is running in background
+                            emitScriptLog("❌ Process not found — app may have detected frida-server and quit")
+                            emitScriptLog("💡 Anti-tamper games (Coin Master, etc.) detect frida-server on startup")
+                            emitScriptLog("💡 Try SPAWN mode — it injects before the app's anti-tamper runs")
                             promise.reject("RUN_ERROR",
-                                "Cannot find running process for $packageName — could not launch it automatically")
+                                "Cannot find process for $packageName — app likely detected frida-server and quit.\n\n" +
+                                "→ Use SPAWN mode instead (injects before anti-tamper initializes)")
                             return@Thread
                         }
 
-                        // Wait for app to fully initialize before injecting
-                        // Inject too early → app may detect frida during startup checks
+                        // Wait for app to initialize before injecting
                         emitScriptLog("⏳ App found (PID $pid) — waiting 3s for initialization...")
                         Thread.sleep(3000)
+
+                        // Re-check process still alive after wait
+                        val stillAlive = Shell.cmd("pidof '$packageName' 2>/dev/null | tr ' ' '\\n' | head -1")
+                            .exec().out.firstOrNull()?.trim()?.ifBlank { null }
+                        if (stillAlive == null) {
+                            emitScriptLog("❌ App died during initialization wait — anti-tamper detected frida-server")
+                            emitScriptLog("💡 Switch to SPAWN mode for anti-cheat/anti-tamper games")
+                            promise.reject("RUN_ERROR",
+                                "App quit after launch — anti-tamper active.\n→ Use SPAWN mode instead.")
+                            return@Thread
+                        }
 
                         val cleanPid = pid!!.filter { it.isDigit() }
                         if (cleanPid.isEmpty()) {
