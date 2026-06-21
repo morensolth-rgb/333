@@ -692,8 +692,11 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                 emitScriptLog("🚀 frida-inject $modeLabel...")
                 emitScriptLog("▶ $cmd")
 
+                // Extract PID from cmd for logcat --pid filter (improves output on some devices)
+                val logcatPid = Regex("""-p\s+(\d+)""").find(cmd)?.groupValues?.get(1)?.toIntOrNull()
+
                 // ── 4. Start logcat BEFORE frida-inject so no output is missed ──
-                startPersistentLogcat()
+                startPersistentLogcat(logcatPid)
 
                 // ── 5. Launch frida-inject ────────────────────────────────────
                 runFridaProcess(cmd, promise)
@@ -705,16 +708,38 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
     }
 
     // Starts logcat BEFORE frida-inject so no early output is missed.
-    // Streams Frida-tagged lines indefinitely until stopScript() destroys fridaLogcatProc.
-    private fun startPersistentLogcat() {
+    // Strategy:
+    //   Primary  — filter by Frida/frida/FRIDA tags (works on most devices)
+    //   Fallback — if no output in 8s, switch to unfiltered logcat and grep for hook keywords
+    //              This catches devices where frida console.log routes under a different tag
+    private fun startPersistentLogcat(targetPid: Int? = null) {
         try { fridaLogcatProc?.destroy() } catch (_: Exception) {}
-        val proc = try {
-            ProcessBuilder("su", "-c",
-                "logcat -v raw -s Frida:V frida:V FRIDA:V 2>/dev/null")
-                .redirectErrorStream(true).start()
-                .also { fridaLogcatProc = it }
-        } catch (_: Exception) { null } ?: return
+        fridaLogcatProc = null
+
+        // Clear logcat buffer first so we don't get stale output
+        try { ProcessBuilder("su", "-c", "logcat -c 2>/dev/null").start().waitFor() } catch (_: Exception) {}
+
+        // Build filter string — PID filter + known Frida tags
+        val pidFilter = if (targetPid != null) "--pid=$targetPid" else ""
+        val tagFilter = "Frida:V frida:V FRIDA:V frida-server:V frida-inject:V *:S"
+
+        // Primary logcat command — tag-filtered
+        val primaryCmd = "logcat -v raw $pidFilter -s Frida:V frida:V FRIDA:V frida-server:V frida-inject:V 2>/dev/null"
+        // Fallback — unfiltered, we grep for hook output ourselves
+        val fallbackCmd = "logcat -v raw 2>/dev/null"
+
+        var linesReceived = 0
+        val startTime = System.currentTimeMillis()
+        var usedFallback = false
+
+        fun launchLogcat(cmd: String): Process? = try {
+            ProcessBuilder("su", "-c", cmd).redirectErrorStream(true).start()
+        } catch (_: Exception) { null }
+
+        var proc = launchLogcat(primaryCmd) ?: return
+        fridaLogcatProc = proc
         emitScriptLog("📡 Logcat streaming (runs until you press STOP)...")
+
         Thread {
             try {
                 proc.inputStream.bufferedReader().use { reader ->
@@ -722,12 +747,43 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                     while (true) {
                         line = reader.readLine() ?: break
                         if (line.isBlank()) continue
+
+                        linesReceived++
                         emitScriptLog(line)
                     }
                 }
             } catch (_: Exception) {}
+
+            // Primary ended — if we never got output and fallback not yet tried, switch to unfiltered
+            if (linesReceived == 0 && !usedFallback && fridaLogcatProc != null) {
+                usedFallback = true
+                emitScriptLog("⚠ No Frida-tagged output — switching to unfiltered logcat (all script output will show)")
+                val proc2 = launchLogcat(fallbackCmd) ?: return@Thread
+                fridaLogcatProc = proc2
+                try {
+                    proc2.inputStream.bufferedReader().use { reader ->
+                        var line: String?
+                        while (true) {
+                            line = reader.readLine() ?: break
+                            if (line.isBlank()) continue
+                            // Show everything — user needs to see what's happening
+                            emitScriptLog(line)
+                        }
+                    }
+                } catch (_: Exception) {}
+            }
+
             emitScriptLog("📡 Logcat stopped")
-        }.start()
+        }.also { it.isDaemon = true }.start()
+
+        // Watchdog: if no output after 8s, kill primary and let fallback take over
+        Thread {
+            Thread.sleep(8000)
+            if (linesReceived == 0 && !usedFallback && fridaLogcatProc == proc) {
+                try { proc.destroy() } catch (_: Exception) {}
+                // Thread above will detect empty output and launch fallback
+            }
+        }.also { it.isDaemon = true }.start()
     }
 
     // Runs the frida-inject command as a root Process, streams all output → FridaScriptLog
@@ -746,9 +802,39 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
         // Real frida script output (console.log) goes through logcat automatically
         Shell.cmd("rm -f '$outLog' '$errLog' 2>/dev/null; true").exec()
 
-        // setsid: new session, no controlling terminal — satisfies frida-inject TTY check
-        // stdin=/dev/null: avoids blocking; stderr→errLog for diagnosis; stdout→outLog for EXIT code
-        val wrapper = "setsid $cmd </dev/ptmx >'$outLog' 2>'$errLog'; echo \"EXIT:\$?\" >>'$outLog'"
+        // frida-inject writes console.log to stdout when it detects a TTY.
+        // When stdout is a file/pipe, frida still checks isatty(stdin) and may complain.
+        //
+        // Strategy — try in order:
+        //   1. 'script -q -c CMD /dev/null' — allocates PTY, captures ALL PTY output to stdout → file
+        //   2. setsid + /dev/ptmx stdin + stdout→file (works on old device, may lose output on new)
+        //   3. bare CMD with stdout/stderr directly captured (no TTY — frida may error but output is captured)
+        //
+        // We detect which tools are available and pick the best wrapper.
+        val hasScript  = Shell.cmd("which script  2>/dev/null").exec().out.firstOrNull()?.trim()?.isNotBlank() == true
+        val hasSetsid  = Shell.cmd("which setsid  2>/dev/null").exec().out.firstOrNull()?.trim()?.isNotBlank() == true
+        val hasStdbuf  = Shell.cmd("which stdbuf  2>/dev/null").exec().out.firstOrNull()?.trim()?.isNotBlank() == true
+
+        val wrapper = when {
+            hasScript -> {
+                // Best: script allocates PTY slave as CMD's stdin/stdout/stderr.
+                // ALL output (console.log, errors) goes to script's stdout → outLog
+                // -q suppresses "Script started/done" headers; /dev/null = discard typescript copy
+                emitScriptLog("🖥 Using PTY capture (script)")
+                "script -q -c \"$cmd\" /dev/null >'$outLog' 2>'$errLog'; echo \"EXIT:\$?\" >>'$outLog'"
+            }
+            hasSetsid -> {
+                // setsid: new session so frida doesn't inherit our session's controlling terminal
+                // /dev/ptmx as stdin: satisfies isatty() check; frida writes console.log to stdout
+                emitScriptLog("🖥 Using setsid PTY")
+                "setsid $cmd </dev/ptmx >'$outLog' 2>'$errLog'; echo \"EXIT:\$?\" >>'$outLog'"
+            }
+            else -> {
+                // No TTY tools — run bare; frida may warn about TTY but still outputs to stdout
+                emitScriptLog("🖥 No TTY wrapper available — bare exec")
+                "$cmd >'$outLog' 2>'$errLog'; echo \"EXIT:\$?\" >>'$outLog'"
+            }
+        }
 
         val pb = ProcessBuilder("su", "-c", wrapper)
         pb.redirectErrorStream(true)
