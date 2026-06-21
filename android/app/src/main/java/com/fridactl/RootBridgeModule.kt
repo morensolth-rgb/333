@@ -500,11 +500,11 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
     // The live frida-inject process — killed on stopScript
     @Volatile private var fridaProcess: Process? = null
     // The persistent logcat process — keeps running until stopScript() is called
-    // This is intentional: frida-inject exits after attach, but console.log keeps
-    // flowing to logcat for as long as the game/app is alive.
     @Volatile private var fridaLogcatProc: Process? = null
     // Legacy signal flag (used by errLog tail thread)
     @Volatile private var fridaScriptPid: String? = null
+    // Track whether WE changed SELinux to Permissive — so we can restore it after inject
+    @Volatile private var selinuxWasEnforcing: Boolean = false
 
     @ReactMethod
     fun stopScript(promise: Promise) {
@@ -527,6 +527,13 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
             try { fridaLogcatProc?.destroy() } catch (_: Exception) {}
             fridaLogcatProc = null
             try { Shell.cmd("pkill -f 'logcat.*Frida' 2>/dev/null; true").exec() } catch (_: Exception) {}
+
+            // Restore SELinux to Enforcing if we changed it
+            if (selinuxWasEnforcing) {
+                Shell.cmd("setenforce 1 2>/dev/null; true").exec()
+                selinuxWasEnforcing = false
+                emitScriptLog("🔒 SELinux restored to Enforcing")
+            }
 
             emitScriptLog("⏹ Script stopped")
             promise.resolve("stopped")
@@ -586,9 +593,9 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                 }
                 val selinux = Shell.cmd("getenforce 2>/dev/null").exec().out.firstOrNull()?.trim()
                 if (selinux != null && selinux.equals("Enforcing", ignoreCase = true)) {
-                    emitScriptLog("⚙ SELinux Enforcing → setting Permissive")
+                    selinuxWasEnforcing = true
+                    emitScriptLog("⚙ SELinux Enforcing → setting Permissive (will restore after inject)")
                     Shell.cmd("setenforce 0 2>/dev/null; true").exec()
-                    // Validate SELinux actually switched (up to 2s)
                     var seOk = false
                     repeat(20) {
                         Thread.sleep(100)
@@ -599,6 +606,8 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                     }
                     if (!seOk) emitScriptLog("⚠ SELinux did not switch to Permissive — injection may fail")
                     else emitScriptLog("✓ SELinux=Permissive confirmed")
+                } else {
+                    selinuxWasEnforcing = false
                 }
                 // Extra buffer: give kernel 300ms after all policy changes before injecting
                 Thread.sleep(300)
@@ -678,18 +687,35 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                                 "Download frida-server from Home screen, or use SPAWN mode instead.")
                             return@Thread
                         }
-                        val pid = resolvePid(packageName)?.trim() ?: run {
+                        // Try to find the process; if not running, launch it and wait
+                        var pid = resolvePid(packageName)?.trim()
+                        if (pid.isNullOrEmpty()) {
+                            emitScriptLog("⚙ App not running — launching $packageName...")
+                            Shell.cmd("am start -n '$packageName' $(pm resolve-activity --brief '$packageName' 2>/dev/null | tail -1) 2>/dev/null || " +
+                                      "monkey -p '$packageName' -c android.intent.category.LAUNCHER 1 2>/dev/null; true").exec()
+                            // Wait up to 8s for the process to appear
+                            repeat(16) {
+                                Thread.sleep(500)
+                                val found = resolvePid(packageName)?.trim()
+                                if (!found.isNullOrEmpty()) {
+                                    pid = found
+                                    return@repeat
+                                }
+                            }
+                        }
+                        if (pid.isNullOrEmpty()) {
                             promise.reject("RUN_ERROR",
-                                "Cannot find running process for $packageName — launch the app first")
+                                "Cannot find running process for $packageName — could not launch it automatically either")
                             return@Thread
                         }
-                        // Validate PID is numeric only — avoid whitespace/newline corruption
-                        val cleanPid = pid.filter { it.isDigit() }
+                        // Give the app 1.5s to initialize before injecting
+                        emitScriptLog("⏳ Waiting for app to initialize...")
+                        Thread.sleep(1500)
+                        val cleanPid = pid!!.filter { it.isDigit() }
                         if (cleanPid.isEmpty()) {
                             promise.reject("RUN_ERROR", "Invalid PID resolved: '$pid'")
                             return@Thread
                         }
-                        // -D local tells frida-inject to use frida-server instead of direct ptrace
                         cmd = "$FRIDA_CLI_DEST -D local -p $cleanPid --script '$scriptPath'"
                         modeLabel = "PID $cleanPid (via server)"
                     }
@@ -970,9 +996,15 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
             }
 
             fridaScriptPid = null
-            // NOTE: do NOT destroy logcatProc here — it keeps running until stopScript()
-            // because the injected script inside the game process is still alive and logging
             fridaProcess   = null
+            // Restore SELinux to Enforcing after inject completes
+            // (frida-inject already attached — SELinux can go back to Enforcing safely)
+            if (selinuxWasEnforcing) {
+                Shell.cmd("setenforce 1 2>/dev/null; true").exec()
+                selinuxWasEnforcing = false
+                emitScriptLog("🔒 SELinux restored to Enforcing")
+            }
+            // NOTE: do NOT destroy logcatProc here — injected script inside game is still logging
         }.start()
 
         // ── Safety timeout: 10s ───────────────────────────────────────────────
