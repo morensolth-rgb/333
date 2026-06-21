@@ -743,11 +743,9 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
         Thread {
             try {
                 proc.inputStream.bufferedReader().use { reader ->
-                    var line: String?
                     while (true) {
-                        line = reader.readLine() ?: break
+                        val line = reader.readLine() ?: break
                         if (line.isBlank()) continue
-
                         linesReceived++
                         emitScriptLog(line)
                     }
@@ -762,11 +760,9 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                 fridaLogcatProc = proc2
                 try {
                     proc2.inputStream.bufferedReader().use { reader ->
-                        var line: String?
                         while (true) {
-                            line = reader.readLine() ?: break
+                            val line = reader.readLine() ?: break
                             if (line.isBlank()) continue
-                            // Show everything — user needs to see what's happening
                             emitScriptLog(line)
                         }
                     }
