@@ -106,33 +106,38 @@ class DownloadService : Service() {
     // ─── main download logic (runs on background Thread) ────────────────────
 
     private fun doDownload(version: String) {
-        // Use /data/local/tmp as staging area — world-writable, no SELinux restrictions
-        // for root shell reads. App can write here via root shell.
-        val tmp  = TMP_DIR
-        val base = "https://github.com/frida/frida/releases/download/$version"
-        val arch = fridaArch()
-        val log  = StringBuilder()
+        // Strategy:
+        //   1. Download .xz → app filesDir (Java can always write here, no SELinux issues)
+        //   2. Extract .xz → filesDir (Java read+write, no restrictions)
+        //   3. Copy extracted binary → /data/local/tmp/ via root shell (su has access)
+        //   4. chmod 755 via root shell
+        // This avoids EACCES on devices where SELinux blocks Java writes to /data/local/tmp
+        val appTmp = filesDir.absolutePath   // always writable by app process
+        val base   = "https://github.com/frida/frida/releases/download/$version"
+        val arch   = fridaArch()
+        val log    = StringBuilder()
 
         log.appendLine("▶ detected arch: $arch")
+        log.appendLine("▶ staging dir: $appTmp")
 
-        // Ensure /data/local/tmp exists and is writable
-        Shell.cmd("mkdir -p /data/local/tmp && chmod 777 /data/local/tmp 2>/dev/null; true").exec()
+        // Ensure /data/local/tmp exists via root
+        Shell.cmd("mkdir -p /data/local/tmp 2>/dev/null; true").exec()
 
         // ── frida-server ─────────────────────────────────────────────────────
         if (!File(FRIDA_DEST).exists() || File(FRIDA_DEST).length() < 1024) {
             log.appendLine("▶ frida-server $version")
-            // Download .xz directly to /data/local/tmp — root shell can read/write freely
-            val dl  = "$tmp/frida-server.xz"
-            val bin = "$tmp/frida-server.bin"
+            val dl  = "$appTmp/frida-server.xz"   // download here — app writable
+            val bin = "$appTmp/frida-server.bin"   // extract here — app writable
             try {
-                downloadFileSu(
-                    "$base/frida-server-$version-$arch.xz", dl
-                ) { emitProgress("frida-server", it) }
+                downloadFile("$base/frida-server-$version-$arch.xz", dl) { emitProgress("frida-server", it) }
                 extractXzAny(dl, bin)
                 cleanup(dl)
-                Shell.cmd("mv '$bin' '$FRIDA_DEST' && chmod 755 '$FRIDA_DEST'").exec()
+                // Copy to /data/local/tmp via root — root shell can read filesDir
+                val r = Shell.cmd("cp '$bin' '$FRIDA_DEST' && chmod 755 '$FRIDA_DEST'").exec()
                 cleanup(bin)
-                log.appendLine("  ✓ done → $FRIDA_DEST (${File(FRIDA_DEST).length()/1024}KB)")
+                if (!r.isSuccess && !File(FRIDA_DEST).exists())
+                    throw Exception("cp to /data/local/tmp failed: ${r.out.joinToString(" ")}")
+                log.appendLine("  ✓ done (${File(FRIDA_DEST).length()/1024}KB)")
             } catch (e: Exception) {
                 cleanup(dl); cleanup(bin)
                 finishService(ACTION_ERROR, "frida-server failed: ${e.message}")
@@ -145,17 +150,15 @@ class DownloadService : Service() {
         // ── frida-inject ─────────────────────────────────────────────────────
         if (!File(FRIDA_CLI_DEST).exists() || File(FRIDA_CLI_DEST).length() < 1024) {
             log.appendLine("▶ frida-inject $version")
-            val dl  = "$tmp/frida-inject.xz"
-            val bin = "$tmp/frida-inject.bin"
+            val dl  = "$appTmp/frida-inject.xz"
+            val bin = "$appTmp/frida-inject.bin"
             try {
-                downloadFileSu(
-                    "$base/frida-inject-$version-$arch.xz", dl
-                ) { emitProgress("frida-inject", it) }
+                downloadFile("$base/frida-inject-$version-$arch.xz", dl) { emitProgress("frida-inject", it) }
                 extractXzAny(dl, bin)
                 cleanup(dl)
-                Shell.cmd("mv '$bin' '$FRIDA_CLI_DEST' && chmod 755 '$FRIDA_CLI_DEST'").exec()
+                Shell.cmd("cp '$bin' '$FRIDA_CLI_DEST' && chmod 755 '$FRIDA_CLI_DEST'").exec()
                 cleanup(bin)
-                log.appendLine("  ✓ done → $FRIDA_CLI_DEST (${File(FRIDA_CLI_DEST).length()/1024}KB)")
+                log.appendLine("  ✓ done (${File(FRIDA_CLI_DEST).length()/1024}KB)")
             } catch (e: Exception) {
                 cleanup(dl); cleanup(bin)
                 log.appendLine("  ⚠ frida-inject failed (non-fatal): ${e.message}")
@@ -170,26 +173,10 @@ class DownloadService : Service() {
     // ─── file helpers ────────────────────────────────────────────────────────
 
     private fun cleanup(path: String) {
-        try {
-            File(path).delete()
-        } catch (_: Exception) {}
-        // Also try via root in case file was written by root shell
-        try { Shell.cmd("rm -f '$path' 2>/dev/null; true").exec() } catch (_: Exception) {}
+        try { File(path).delete() } catch (_: Exception) {}
     }
 
     // ─── download ────────────────────────────────────────────────────────────
-
-    /**
-     * Download to a path under /data/local/tmp using Java HTTP.
-     * Works because /data/local/tmp is world-writable — no EACCES.
-     */
-    private fun downloadFileSu(url: String, dest: String, onProgress: (Int) -> Unit) {
-        // Ensure parent dir writable
-        val parentDir = File(dest).parent ?: TMP_DIR
-        Shell.cmd("mkdir -p '$parentDir' && chmod 777 '$parentDir' 2>/dev/null; true").exec()
-        // Download directly via Java — dest is /data/local/tmp/ which app can write
-        downloadFile(url, dest, onProgress)
-    }
 
     private fun downloadFile(url: String, dest: String, onProgress: (Int) -> Unit) {
         var currentUrl = url
