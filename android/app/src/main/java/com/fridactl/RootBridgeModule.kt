@@ -1047,15 +1047,26 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
         //   If 'script' is available, use it — it gives frida a real PTY and captures everything.
         val hasScript = Shell.cmd("which script 2>/dev/null").exec().out.firstOrNull()?.trim()?.isNotBlank() == true
 
+        // Write cmd to a temp shell script to avoid quote-collision inside 'script -c ...'
+        // e.g. cmd contains --script '/path/to/file.js' — embedding it directly in 'script -c '...' '
+        // would break: the inner single quotes terminate the outer ones early.
+        // Fix: write cmd to a real .sh file using a FileWriter (no shell quoting involved).
+        val wrapperSh = "$filesDir/fi_run.sh"
+        try {
+            java.io.FileWriter(wrapperSh).use { it.write("#!/bin/sh\n$cmd\n") }
+            Shell.cmd("chmod 755 '$wrapperSh'").exec()
+        } catch (e: Exception) {
+            promise.reject("RUN_ERROR", "Cannot write wrapper script: ${e.message}")
+            return
+        }
+
         val wrapper = if (hasScript) {
             emitScriptLog("🖥 PTY capture via script")
-            // script -q -c 'CMD' /dev/null — CMD gets a real PTY slave; all output captured to script stdout → outLog
-            "script -q -c '$cmd' /dev/null >'$outLog' 2>'$errLog'; echo \"EXIT:\$?\" >>'$outLog'"
+            // Execute via shell script file — no inline quoting issues
+            "script -q -c '$wrapperSh' /dev/null >'$outLog' 2>'$errLog'; echo \"EXIT:\$?\" >>'$outLog'"
         } else {
             emitScriptLog("🖥 Direct capture (no PTY — tcgetattr warning is normal)")
-            // No PTY tools. frida prints tcgetattr warning to stderr (filtered below).
-            // console.log goes to stdout → outLog. Works reliably.
-            "$cmd >'$outLog' 2>&1; echo \"EXIT:\$?\" >>'$outLog'"
+            "$wrapperSh >'$outLog' 2>&1; echo \"EXIT:\$?\" >>'$outLog'"
         }
 
         val pb = ProcessBuilder("su", "-c", wrapper)
