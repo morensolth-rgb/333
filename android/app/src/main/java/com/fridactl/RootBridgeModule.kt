@@ -189,8 +189,14 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                 val fridaLog = "${reactApplicationContext.filesDir}/frida.log"
                 Shell.cmd("rm -f '$fridaLog' 2>/dev/null; true").exec()
 
-                // Launch frida-server (no -D flag — not supported on all versions)
-                Shell.cmd("$FRIDA_DEST > '$fridaLog' 2>&1 &").exec()
+                // Launch frida-server in passive mode:
+                //   --ignore-crashes   : don't intercept/gate app crashes (prevents apps from hanging)
+                //   --exit-on-sigterm  : clean shutdown on kill
+                // frida-server by default does NOT enable spawn-gating unless explicitly requested via API.
+                // If apps are freezing on launch, it means something called Device.enable_spawn_gating()
+                // — we never do that, so the issue is frida-server intercepting all zygote forks.
+                // Running with no extra flags is correct; if still freezing → SELinux or kernel hook issue.
+                Shell.cmd("$FRIDA_DEST --ignore-crashes > '$fridaLog' 2>&1 &").exec()
                 Thread.sleep(3000)
 
                 if (isFridaServerRunning()) {
@@ -1041,7 +1047,11 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
         Thread.sleep(300)
         // ──────────────────────────────────────────────────────────────────
 
-        Shell.cmd("chmod 755 $FRIDA_DEST && $FRIDA_DEST --policy-softener=android > '$fridaLog' 2>&1 &").exec()
+        // --ignore-crashes: don't let frida-server gate/intercept app crashes
+        // No --policy-softener=android: that flag injects frida into zygote which causes
+        // ALL newly spawned apps to hang until frida responds — root cause of the freeze bug.
+        // Without it, frida-server only attaches when explicitly told to via frida-inject/frida CLI.
+        Shell.cmd("chmod 755 $FRIDA_DEST && $FRIDA_DEST --ignore-crashes > '$fridaLog' 2>&1 &").exec()
 
         // Poll up to 8 seconds (16 × 500ms) instead of fixed 3s sleep
         repeat(16) { i ->
