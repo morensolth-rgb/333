@@ -28,9 +28,10 @@ class DownloadService : Service() {
         private const val FRIDA_DEST     = "/data/local/tmp/frida-server"
         private const val FRIDA_CLI_DEST = "/data/local/tmp/frida-inject"
 
-        // Backend proxy — serves raw (uncompressed) frida binary via /api/frida/download
-        // No .xz extraction needed on device at all.
-        private const val BACKEND_API = "https://fridact-6mzysus-preview-4200.runable.site/api"
+        // Pre-extracted frida binaries hosted as GitHub release assets (no .xz on device!)
+        // Hosted at: github.com/morensolth-rgb/333/releases/tag/frida-{version}
+        private const val PREBUILT_BASE =
+            "https://github.com/morensolth-rgb/333/releases/download"
     }
 
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -98,28 +99,33 @@ class DownloadService : Service() {
     // ─── main download logic ──────────────────────────────────────────────────
 
     private fun doDownload(version: String) {
-        // Strategy (no XZ extraction on device):
-        //   Backend proxy fetches .xz from GitHub, decompresses it server-side,
-        //   and streams the raw binary back to us over HTTP.
-        //   We download raw binary → filesDir (Java writes OK here).
-        //   Then root shell copies it → /data/local/tmp (bypasses SELinux on Java process).
+        // Strategy: download RAW (pre-decompressed) binary from our GitHub release assets.
+        // No .xz extraction needed on device — binaries are already decompressed.
+        //
+        // Flow:
+        //   1. Download raw binary → filesDir  (Java always allowed to write here)
+        //   2. Root shell copies it → /data/local/tmp  (bypasses SELinux on Java process)
+        //   3. Root shell sets chmod 755
         val appTmp = filesDir.absolutePath
         val arch   = fridaArch()
         val log    = StringBuilder()
 
-        log.appendLine("▶ arch: $arch")
-        log.appendLine("▶ backend: $BACKEND_API")
+        log.appendLine("▶ arch: $arch | version: $version")
 
         Shell.cmd("mkdir -p /data/local/tmp 2>/dev/null; true").exec()
 
-        // ── frida-server ─────────────────────────────────────────────────────
+        // ── frida-server ──────────────────────────────────────────────────────
         if (!File(FRIDA_DEST).exists() || File(FRIDA_DEST).length() < 1024) {
-            log.appendLine("▶ downloading frida-server $version")
+            log.appendLine("▶ downloading frida-server")
             val rawPath = "$appTmp/frida-server.bin"
             try {
-                val url = "$BACKEND_API/frida/download?binary=frida-server&version=$version&arch=$arch"
+                // Raw pre-extracted binary — no XZ decompression needed
+                val url = "$PREBUILT_BASE/frida-$version/frida-server-$version-$arch"
                 downloadFile(url, rawPath) { emitProgress("frida-server", it) }
-                log.appendLine("  ✓ download: ${File(rawPath).length()/1024}KB")
+
+                val size = File(rawPath).length()
+                log.appendLine("  ✓ download: ${size/1024}KB")
+                if (size < 1_000_000) throw Exception("Downloaded file too small: $size bytes")
 
                 copyToDestViaRoot(rawPath, FRIDA_DEST)
                 cleanup(rawPath)
@@ -131,16 +137,20 @@ class DownloadService : Service() {
                 return
             }
         } else {
-            log.appendLine("▶ frida-server already present (${File(FRIDA_DEST).length()/1024}KB)")
+            log.appendLine("▶ frida-server OK (${File(FRIDA_DEST).length()/1024}KB)")
         }
 
         // ── frida-inject ──────────────────────────────────────────────────────
         if (!File(FRIDA_CLI_DEST).exists() || File(FRIDA_CLI_DEST).length() < 1024) {
-            log.appendLine("▶ downloading frida-inject $version")
+            log.appendLine("▶ downloading frida-inject")
             val rawPath = "$appTmp/frida-inject.bin"
             try {
-                val url = "$BACKEND_API/frida/download?binary=frida-inject&version=$version&arch=$arch"
+                val url = "$PREBUILT_BASE/frida-$version/frida-inject-$version-$arch"
                 downloadFile(url, rawPath) { emitProgress("frida-inject", it) }
+
+                val size = File(rawPath).length()
+                if (size < 1_000_000) throw Exception("Downloaded file too small: $size bytes")
+
                 copyToDestViaRoot(rawPath, FRIDA_CLI_DEST)
                 cleanup(rawPath)
                 Shell.cmd("chmod 755 '$FRIDA_CLI_DEST'").exec()
@@ -150,26 +160,26 @@ class DownloadService : Service() {
                 log.appendLine("  ⚠ frida-inject failed (non-fatal): ${e.message}")
             }
         } else {
-            log.appendLine("▶ frida-inject already present")
+            log.appendLine("▶ frida-inject OK")
         }
 
         finishService(ACTION_DONE, log.toString())
     }
 
     /**
-     * Copy a file from filesDir (Java-writable) → dest (root-writable) using root shell.
-     * Java never writes to /data/local/tmp — avoids all SELinux EACCES issues.
+     * Copy a file from filesDir (Java-writable) to dest (root-only) via root shell.
+     * Java never writes to /data/local/tmp — avoids all SELinux EACCES.
      *
-     * Tries multiple copy strategies in order:
-     *   1. cp (most Android devices have it)
-     *   2. cat redirect (universal)
-     *   3. dd (universal)
-     *   4. libsu Shell.cmd("cat").add(inputStream) — final fallback
+     * Tries multiple strategies:
+     *   1. cp   — most Android devices have this
+     *   2. cat  redirect — universal
+     *   3. dd   — universal  
+     *   4. libsu Shell + stdin pipe (cat > dest) — final fallback
      */
     private fun copyToDestViaRoot(srcPath: String, dest: String) {
         Shell.cmd("rm -f '$dest' 2>/dev/null; true").exec()
 
-        // Tier 1: shell copy commands (src is filesDir — root can read it)
+        // Tier 1: shell copy commands
         val copyCmds = listOf(
             "cp '$srcPath' '$dest'",
             "cat '$srcPath' > '$dest'",
@@ -183,7 +193,7 @@ class DownloadService : Service() {
             Shell.cmd("rm -f '$dest' 2>/dev/null; true").exec()
         }
 
-        // Tier 2: libsu Shell piped stdin (raw file bytes → root cat > dest)
+        // Tier 2: libsu Shell with stdin pipe (some Magisk builds handle this better)
         try {
             val fis = FileInputStream(srcPath)
             val r = Shell.cmd("cat > '$dest'").add(fis).exec()
@@ -211,7 +221,7 @@ class DownloadService : Service() {
             while (true) {
                 conn = (URL(currentUrl).openConnection() as HttpURLConnection).also {
                     it.connectTimeout = 30_000
-                    it.readTimeout    = 600_000   // 10min — large binary
+                    it.readTimeout    = 600_000   // 10 min for large binary
                     it.instanceFollowRedirects = false
                     it.setRequestProperty("User-Agent", "FridaCtl/1.0")
                     it.connect()
