@@ -656,6 +656,10 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                 emitScriptLog("🔒 SELinux restored to Enforcing")
             }
 
+            // Kill frida-server so it stops intercepting new process spawns
+            Shell.cmd("pkill -f frida-server 2>/dev/null; true").exec()
+            emitScriptLog("⚙ frida-server stopped")
+
             emitScriptLog("⏹ Script stopped")
             promise.resolve("stopped")
         }.start()
@@ -1159,6 +1163,12 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                 selinuxWasEnforcing = false
                 emitScriptLog("🔒 SELinux restored to Enforcing")
             }
+            // ── Kill frida-server after inject finishes ────────────────────────
+            // frida-server intercepts ALL process spawns system-wide via ptrace.
+            // Leaving it running causes any app launched AFTER inject to freeze on startup.
+            // Fix: kill it as soon as frida-inject exits — it's no longer needed.
+            Shell.cmd("pkill -f frida-server 2>/dev/null; true").exec()
+            emitScriptLog("⚙ frida-server stopped (prevent game freeze)")
             // NOTE: do NOT destroy logcatProc here — injected script inside game is still logging
         }.start()
 
