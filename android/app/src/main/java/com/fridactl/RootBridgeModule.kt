@@ -1180,13 +1180,9 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
             // remains paused in ptrace state forever — the game appears frozen with black screen.
             // We must resume it via frida or kill it so the user can restart normally.
             // Strategy: send SIGCONT to all child processes of the package, then kill frida-server.
-            val frozenPid = Shell.cmd("pidof '$packageName' 2>/dev/null | tr ' ' '\\n' | head -1")
-                .exec().out.firstOrNull()?.trim()?.ifBlank { null }
-            if (frozenPid != null) {
-                // Send SIGCONT — resumes a ptrace-stopped process if kernel allows it
-                Shell.cmd("kill -CONT $frozenPid 2>/dev/null; true").exec()
-                emitScriptLog("⚙ Sent SIGCONT to $packageName (PID $frozenPid) — unfreeze")
-            }
+            // Send SIGCONT to any T-state (ptrace-stopped) process so the game unfreezes
+            try { Shell.cmd("kill -CONT -1 2>/dev/null; true").exec() } catch (_: Exception) {}
+            emitScriptLog("⚙ Released any ptrace-stopped processes")
 
             // ── Kill frida-server after inject finishes ────────────────────────
             // frida-server intercepts ALL process spawns system-wide via ptrace.
@@ -1690,14 +1686,5 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
         } catch (e: Exception) {
             throw Exception("Missing asset '$assetName'")
         }
-    }
-}
-); do state=\$(cat /proc/\$p/status 2>/dev/null | grep '^State:' | awk '{print \$2}'); if [ \"\$state\" = 'T' ] || [ \"\$state\" = 't' ]; then kill -CONT \$p 2>/dev/null; fi; done").exec()
-                emitScriptLog("⚙ Sent SIGCONT to any frozen processes")
-            } catch (_: Exception) {}
-
-            emitScriptLog("⏹ Script stopped")
-            promise.resolve("stopped")
-        }.start()
     }
 }
