@@ -51,8 +51,7 @@ dependencies {
     implementation("com.facebook.react:hermes-android")
     implementation("com.github.topjohnwu.libsu:core:5.2.2")
     implementation("com.github.topjohnwu.libsu:service:5.2.2")
-    implementation("org.apache.commons:commons-compress:1.26.1")
-    implementation("org.tukaani:xz:1.9")
+    // commons-compress and xz removed — backend proxy handles decompression server-side
 }
 
 apply from: file("../../node_modules/@react-native-community/cli-platform-android/native_modules.gradle"); applyNativeModulesAppBuildGradle(project)
