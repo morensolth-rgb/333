@@ -25,8 +25,7 @@ import java.io.OutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import org.apache.commons.compress.compressors.xz.XZCompressorInputStream
-import com.chaquo.python.Python
-import com.chaquo.python.android.AndroidPlatform
+
 
 class RootBridgeModule(reactContext: ReactApplicationContext) :
     ReactContextBaseJavaModule(reactContext) {
@@ -117,11 +116,13 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
     }
 
     companion object {
-        private const val FRIDA_PORT     = 27043   // non-default port — avoids anti-tamper port scan
-        private const val FRIDA_DEST     = "/data/local/tmp/frida-server"
+        private const val FRIDA_PORT      = 27043   // non-default port — avoids anti-tamper port scan
+        private const val FRIDA_DEST      = "/data/local/tmp/frida-server"
         private const val FRIDA_FAKE_NAME = "/data/local/tmp/.fsvc"  // disguised process name
-        private const val FRIDA_CLI_DEST = "/data/local/tmp/frida-inject"   // frida-inject binary
-        private const val FRIDA_CLI2_DEST= "/data/local/tmp/frida-inject"   // alias — same binary
+        private const val FRIDA_CLI_DEST  = "/data/local/tmp/frida-inject"   // frida-inject binary
+        private const val FRIDA_CLI2_DEST = "/data/local/tmp/frida-inject"   // alias — same binary
+        private const val GADGET_DEST     = "/data/local/tmp/frida-gadget.so"
+        private const val GADGET_PORT     = 27042   // frida-gadget HTTP API default port
 
         init {
             Shell.enableVerboseLogging = false
@@ -638,9 +639,6 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
         Thread {
             fridaScriptPid = null
 
-            // Stop Python frida runner (delete sentinel file → Python loop exits)
-            Shell.cmd("rm -f '/data/local/tmp/fi_out.log.run' 2>/dev/null; true").exec()
-
             // Kill frida-inject process (legacy / fallback)
             fridaProcess?.let { p ->
                 try {
@@ -1058,147 +1056,198 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
     // Shell-quote a string for safe embedding inside single-quoted shell argument
     private fun shellQuote(s: String): String = "'" + s.replace("'", "'\"'\"'") + "'"
 
-    // Runs the frida-inject command as a root Process, streams all output → FridaScriptLog
-    // fridaArgs: raw arg list — no quoting needed; written to a sh script in /data/local/tmp.
-    // targetPid: PID of the target process, used for SIGCONT after inject exits (null for spawn).
-    // packageName: target app package, used to find spawned PID if targetPid is null.
+    // Runs frida-gadget injection via LD_PRELOAD launch + HTTP script inject.
+    // Flow:
+    //   1. Ensure gadget .so exists
+    //   2. Kill any running instance of target app
+    //   3. Launch target with LD_PRELOAD=frida-gadget.so via am start (root)
+    //   4. Poll gadget HTTP server at 127.0.0.1:27042 until it responds (up to 15s)
+    //   5. POST script JS to gadget HTTP API → /  {"type":"load","name":"hook","source":"<js>"}
+    //   6. Stream send() messages via polling GET /  {"type":"receive"}
+    //
+    // fridaArgs: used only to extract --script path. Mode/PID/server logic not needed here.
+    // targetPid: unused in gadget mode (gadget IS the server, no separate frida-server).
+    // packageName: the app to launch with LD_PRELOAD.
     private fun runFridaProcess(fridaArgs: List<String>, targetPid: String?, packageName: String, promise: Promise) {
-        // ── Chaquopy / frida Python approach ─────────────────────────────────
-        // No frida-inject CLI. We use the frida Python library directly via
-        // Chaquopy embedded Python runtime. Zero shell quoting issues.
         fridaProcess?.destroy()
         fridaProcess = null
         fridaScriptPid = null
 
-        val outLog   = "/data/local/tmp/fi_out.log"
-        val sentinel = "/data/local/tmp/fi_out.log.run"
-        Shell.cmd("rm -f '$outLog' '$sentinel' 2>/dev/null; true").exec()
-
-        // Extract scriptPath and pid from fridaArgs for Python call
-        val scriptIdx = fridaArgs.indexOf("--script")
-        val scriptPath = if (scriptIdx >= 0) fridaArgs.getOrNull(scriptIdx + 1) else null
-        val pidIdx = fridaArgs.indexOf("-p")
-        val pidStr = if (pidIdx >= 0) fridaArgs.getOrNull(pidIdx + 1) else targetPid
-
+        // ── 1. Extract scriptPath from fridaArgs ──────────────────────────────
+        val scriptIdx  = fridaArgs.indexOf("--script")
+        val scriptPath = fridaArgs.getOrNull(scriptIdx + 1)
         if (scriptPath == null) {
-            promise.reject("RUN_ERROR", "No --script path found in fridaArgs")
-            return
-        }
-        if (pidStr == null) {
-            promise.reject("RUN_ERROR", "No PID found in fridaArgs")
-            return
-        }
-        val pid = pidStr.toIntOrNull() ?: run {
-            promise.reject("RUN_ERROR", "Invalid PID: $pidStr")
+            promise.reject("RUN_ERROR", "No --script path in fridaArgs")
             return
         }
 
-        emitScriptLog("🐍 Using Chaquopy frida (no CLI)")
-        emitScriptLog("▶ attach PID=$pid  script=$scriptPath")
+        // ── 2. Ensure gadget .so exists ───────────────────────────────────────
+        val gadgetFile = File(GADGET_DEST)
+        if (!gadgetFile.exists() || gadgetFile.length() < 100_000) {
+            promise.reject("RUN_ERROR",
+                "frida-gadget.so missing — download it from the Home screen first.\n" +
+                "(Expected at $GADGET_DEST)")
+            return
+        }
+        Shell.cmd("chmod 644 '$GADGET_DEST' 2>/dev/null; true").exec()
+        emitScriptLog("✓ gadget: ${gadgetFile.length() / 1024}KB @ $GADGET_DEST")
 
-        // ── Start log tail thread (reads outLog in real-time) ─────────────────
-        val noiseRx = Regex("tcgetattr|isatty|not a tty|Script (started|done)", RegexOption.IGNORE_CASE)
-        var promiseResolved = false
+        // ── 3. Read JS script ─────────────────────────────────────────────────
+        val scriptJs = try {
+            val tmp = "${reactApplicationContext.filesDir}/hook_read_tmp.js"
+            Shell.cmd("cp '$scriptPath' '$tmp' && chmod 644 '$tmp'").exec()
+            File(tmp).readText().also { File(tmp).delete() }
+        } catch (e: Exception) {
+            promise.reject("RUN_ERROR", "Cannot read script at $scriptPath: ${e.message}")
+            return
+        }
+        emitScriptLog("📝 Script read (${scriptJs.length} chars)")
 
-        // ── Watchdog SIGCONT — prevent ptrace freeze ──────────────────────────
-        Thread {
-            for (i in 0 until 20) {
-                Thread.sleep(500)
-                if (fridaScriptPid == null) break
-                try { Shell.cmd("kill -CONT $pid 2>/dev/null; true").exec() } catch (_: Exception) {}
-            }
-        }.start()
+        // ── 4. Kill any existing instance ─────────────────────────────────────
+        Shell.cmd("am force-stop '$packageName' 2>/dev/null; true").exec()
+        Thread.sleep(1000)
 
-        // ── Tail outLog ───────────────────────────────────────────────────────
-        Thread {
+        // ── 5. Launch with LD_PRELOAD ─────────────────────────────────────────
+        // am start --es android.intent.extra.ENVIRONMENT "KEY=VALUE" only works on some ROMs.
+        // Most reliable on rooted: use env LD_PRELOAD=... monkey or wrap the process via
+        // setprop wrap.<pkg> "LD_PRELOAD=..." then launch.
+        // We use setprop wrap.* — supported on Android 8+ debug/root builds,
+        // and also try direct monkey launch with LD_PRELOAD env prefix.
+        //
+        // Strategy:
+        //   A. setprop wrap.<pkg> "LD_PRELOAD=/data/local/tmp/frida-gadget.so" then monkey
+        //   B. env LD_PRELOAD=... monkey -p <pkg> 1  (fallback)
+        emitScriptLog("🚀 Launching $packageName with LD_PRELOAD=frida-gadget.so...")
+
+        // Try strategy A: setprop wrap
+        val wrapProp = "wrap.$packageName"
+        Shell.cmd("setprop '$wrapProp' 'LD_PRELOAD=$GADGET_DEST' 2>/dev/null; true").exec()
+        val propVal = Shell.cmd("getprop '$wrapProp' 2>/dev/null").exec().out.firstOrNull()?.trim()
+        val usedWrap = propVal?.contains("frida-gadget") == true
+
+        if (usedWrap) {
+            emitScriptLog("✓ setprop wrap.$packageName set")
+            Shell.cmd("monkey -p '$packageName' -c android.intent.category.LAUNCHER 1 2>/dev/null; true").exec()
+        } else {
+            // Strategy B: env prefix
+            emitScriptLog("⚠ setprop wrap.* failed — using env LD_PRELOAD prefix")
+            Shell.cmd(
+                "env LD_PRELOAD='$GADGET_DEST' monkey -p '$packageName' -c android.intent.category.LAUNCHER 1 2>/dev/null; true"
+            ).exec()
+        }
+
+        fridaScriptPid = "running"  // mark as active for stopScript() sentinel
+
+        // ── 6. Poll gadget HTTP server until it responds ──────────────────────
+        emitScriptLog("⏳ Waiting for frida-gadget HTTP server on 127.0.0.1:$GADGET_PORT...")
+        var gadgetReady = false
+        val waitStart = System.currentTimeMillis()
+        for (i in 0 until 30) {   // 30 × 500ms = 15s max
+            Thread.sleep(500)
             try {
-                val tailProc = ProcessBuilder("su", "-c", "tail -f '$outLog' 2>/dev/null")
-                    .redirectErrorStream(true).start()
-                try {
-                    tailProc.inputStream.bufferedReader().use { r ->
-                        while (fridaScriptPid != null) {
-                            val line = r.readLine() ?: break
-                            if (line.isBlank() || noiseRx.containsMatchIn(line)) continue
-                            emitScriptLog(line)
-                            if (!promiseResolved) {
-                                val fatal = line.lowercase().let { ll ->
-                                    ll.contains("error") || ll.contains("not running") ||
-                                    ll.contains("not found") || ll.contains("permission denied")
-                                }
-                                promiseResolved = true
-                                if (fatal) promise.reject("INJECT_ERROR", line)
-                                else { emitScriptLog("✅ Script running (frida Python)"); promise.resolve("running:python") }
-                            }
-                        }
-                    }
-                } catch (_: Exception) {}
-                try { tailProc.destroy() } catch (_: Exception) {}
+                val conn = URL("http://127.0.0.1:$GADGET_PORT/").openConnection() as HttpURLConnection
+                conn.connectTimeout = 300
+                conn.readTimeout    = 300
+                conn.requestMethod  = "GET"
+                val code = conn.responseCode
+                conn.disconnect()
+                if (code in 200..499) {   // any response = gadget is up
+                    gadgetReady = true
+                    val elapsed = System.currentTimeMillis() - waitStart
+                    emitScriptLog("✓ Gadget responded in ${elapsed}ms")
+                    break
+                }
             } catch (_: Exception) {}
-        }.start()
+            if (i % 4 == 3) emitScriptLog("⏳ ${(30 - i - 1) * 500 / 1000}s left...")
+        }
 
-        // ── Resolve promise after 4s if no output yet ─────────────────────────
-        Thread {
-            Thread.sleep(4000)
-            if (!promiseResolved) {
-                promiseResolved = true
-                emitScriptLog("✅ Script running (frida Python)")
-                promise.resolve("running:python")
-            }
-        }.start()
+        if (!gadgetReady) {
+            fridaScriptPid = null
+            // Clean up wrap prop
+            if (usedWrap) Shell.cmd("setprop '$wrapProp' '' 2>/dev/null; true").exec()
+            promise.reject("INJECT_ERROR",
+                "frida-gadget did not start within 15s.\n" +
+                "Possible causes:\n" +
+                "  • LD_PRELOAD wasn't applied (ROM doesn't support setprop wrap.*)\n" +
+                "  • gadget .so is wrong arch (need arm64)\n" +
+                "  • SELinux blocked gadget from opening port 27042\n" +
+                "Check console for details.")
+            return
+        }
 
-        // ── Run frida Python in background thread ─────────────────────────────
-        val filesDir = reactApplicationContext.filesDir.absolutePath
-        fridaScriptPid = "running"
+        // ── 7. POST script to gadget ──────────────────────────────────────────
+        emitScriptLog("💉 Injecting script via HTTP...")
+        try {
+            val body = """{"type":"load","name":"hook","source":${escapeJsonString(scriptJs)}}"""
+            val conn = URL("http://127.0.0.1:$GADGET_PORT/").openConnection() as HttpURLConnection
+            conn.connectTimeout = 5000
+            conn.readTimeout    = 5000
+            conn.requestMethod  = "POST"
+            conn.doOutput       = true
+            conn.setRequestProperty("Content-Type", "application/json")
+            conn.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
+            val code    = conn.responseCode
+            val respBody = conn.inputStream.bufferedReader().readText()
+            conn.disconnect()
+            emitScriptLog("✅ Gadget POST → HTTP $code: $respBody")
+            promise.resolve("running:gadget")
+        } catch (e: Exception) {
+            fridaScriptPid = null
+            if (usedWrap) Shell.cmd("setprop '$wrapProp' '' 2>/dev/null; true").exec()
+            promise.reject("INJECT_ERROR", "POST to gadget failed: ${e.message}")
+            return
+        }
 
+        // ── 8. Poll for send() messages from script (non-blocking background) ─
         Thread {
             try {
-                if (!Python.isStarted()) {
-                    Python.start(AndroidPlatform(reactApplicationContext))
+                var lastMsgId = 0
+                while (fridaScriptPid != null) {
+                    Thread.sleep(500)
+                    try {
+                        val conn = URL("http://127.0.0.1:$GADGET_PORT/").openConnection() as HttpURLConnection
+                        conn.connectTimeout = 1000
+                        conn.readTimeout    = 1500
+                        conn.requestMethod  = "POST"
+                        conn.doOutput       = true
+                        conn.setRequestProperty("Content-Type", "application/json")
+                        conn.outputStream.use { it.write("""{"type":"receive"}""".toByteArray()) }
+                        val code = conn.responseCode
+                        if (code in 200..299) {
+                            val text = conn.inputStream.bufferedReader().readText().trim()
+                            conn.disconnect()
+                            if (text.isNotBlank() && text != "{}" && text != "[]") {
+                                emitScriptLog("📨 $text")
+                            }
+                        } else {
+                            conn.disconnect()
+                        }
+                    } catch (_: Exception) {}
                 }
-                val py = Python.getInstance()
-                val runner = py.getModule("frida_runner")
-                val result = runner.callAttr("run",
-                    "127.0.0.1", FRIDA_PORT, pid, scriptPath, outLog
-                ).toInt()
-
-                emitScriptLog("━━ frida Python exit: $result ━━")
-
-                // Dump any remaining log
-                val lines = try { Shell.cmd("cat '$outLog' 2>/dev/null").exec().out } catch (_: Exception) { emptyList() }
-                lines.filter { !it.startsWith("EXIT:") && it.isNotBlank() }.forEach { emitScriptLog("  $it") }
-
-                if (!promiseResolved) {
-                    promiseResolved = true
-                    if (result == 0) promise.resolve("running:python")
-                    else promise.reject("INJECT_ERROR", "frida Python exit $result — check log")
-                }
-            } catch (e: Exception) {
-                emitScriptLog("❌ Chaquopy error: ${e.message}")
-                if (!promiseResolved) {
-                    promiseResolved = true
-                    promise.reject("INJECT_ERROR", "Chaquopy: ${e.message}")
-                }
-            } finally {
-                // Cleanup sentinel so Python loop exits
-                Shell.cmd("rm -f '$sentinel' 2>/dev/null; true").exec()
-                fridaScriptPid = null
-                fridaProcess   = null
-
-                // Resume process
-                try { Shell.cmd("kill -CONT $pid 2>/dev/null; true").exec() } catch (_: Exception) {}
-
-                // Kill frida-server
-                Shell.cmd("pkill -f frida-server 2>/dev/null; true").exec()
-                emitScriptLog("⚙ frida-server stopped")
-
-                // Restore SELinux
-                if (selinuxWasEnforcing) {
-                    Shell.cmd("setenforce 1 2>/dev/null; true").exec()
-                    selinuxWasEnforcing = false
-                    emitScriptLog("🔒 SELinux restored")
-                }
+            } catch (_: Exception) {}
+            // Clean up wrap prop when done
+            if (usedWrap) {
+                try { Shell.cmd("setprop '$wrapProp' '' 2>/dev/null; true").exec() } catch (_: Exception) {}
             }
-        }.start()
+            emitScriptLog("📡 Gadget message poll stopped")
+        }.also { it.isDaemon = true }.start()
+    }
+
+    // Escape a Kotlin string into a JSON string literal (with surrounding quotes)
+    private fun escapeJsonString(s: String): String {
+        val sb = StringBuilder("\"")
+        for (c in s) {
+            when (c) {
+                '"'  -> sb.append("\\\"")
+                '\\' -> sb.append("\\\\")
+                '\n' -> sb.append("\\n")
+                '\r' -> sb.append("\\r")
+                '\t' -> sb.append("\\t")
+                else -> if (c.code < 0x20) sb.append("\\u%04x".format(c.code)) else sb.append(c)
+            }
+        }
+        sb.append("\"")
+        return sb.toString()
     }
 
     // Resolve PID — launch app if not running, return null if still not found

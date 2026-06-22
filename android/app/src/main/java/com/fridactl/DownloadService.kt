@@ -27,6 +27,7 @@ class DownloadService : Service() {
 
         private const val FRIDA_DEST     = "/data/local/tmp/frida-server"
         private const val FRIDA_CLI_DEST = "/data/local/tmp/frida-inject"
+        private const val GADGET_DEST    = "/data/local/tmp/frida-gadget.so"
 
         // Pre-extracted frida binaries hosted as GitHub release assets (no .xz on device!)
         // Hosted at: github.com/morensolth-rgb/333/releases/tag/frida-{version}
@@ -258,7 +259,68 @@ class DownloadService : Service() {
             }
         }
 
+        // ── frida-gadget ──────────────────────────────────────────────────────
+        // Gadget .so is downloaded as .xz — needs XZ decompression on device.
+        // We download to filesDir first, decompress via commons-compress XZ, then root-cp to dest.
+        if (!File(GADGET_DEST).exists() || File(GADGET_DEST).length() < 100_000) {
+            log.appendLine("▶ downloading frida-gadget")
+            val xzPath  = "$appTmp/frida-gadget.so.xz"
+            val binPath = "$appTmp/frida-gadget.so"
+            try {
+                val url = "$PREBUILT_BASE/frida-$version/frida-gadget-$version-$arch.so.xz"
+                downloadFile(url, xzPath) { emitProgress("frida-gadget", it / 2) }   // 0-50% for download
+
+                val xzSize = File(xzPath).length()
+                log.appendLine("  ✓ download: ${xzSize/1024}KB (compressed)")
+                if (xzSize < 100_000) throw Exception("Downloaded .xz too small: $xzSize bytes")
+
+                // Decompress XZ in Java (commons-compress) → filesDir
+                log.appendLine("  ▶ decompressing...")
+                emitProgress("frida-gadget", 55)
+                decompressXz(xzPath, binPath)
+                cleanup(xzPath)
+
+                val binSize = File(binPath).length()
+                log.appendLine("  ✓ decompressed: ${binSize/1024}KB")
+                if (binSize < 1_000_000) throw Exception("Decompressed .so too small: $binSize bytes")
+
+                emitProgress("frida-gadget", 80)
+                copyToDestViaRoot(binPath, GADGET_DEST)
+                cleanup(binPath)
+                Shell.cmd("chmod 644 '$GADGET_DEST'").exec()
+
+                val installedSize = File(GADGET_DEST).length()
+                log.appendLine("  ✓ installed (${installedSize/1024}KB)")
+                emitProgress("frida-gadget", 100)
+            } catch (e: Exception) {
+                cleanup(xzPath)
+                cleanup(binPath)
+                log.appendLine("  ⚠ frida-gadget failed (non-fatal): ${e.message}")
+                // Non-fatal — server/inject still work without gadget
+            }
+        } else {
+            log.appendLine("▶ frida-gadget OK (${File(GADGET_DEST).length()/1024}KB)")
+        }
+
         finishService(ACTION_DONE, log.toString())
+    }
+
+    /**
+     * Decompress an XZ-compressed file using Apache Commons Compress.
+     * Writes decompressed output to outPath in filesDir (Java-writable).
+     */
+    private fun decompressXz(xzPath: String, outPath: String) {
+        val buf = ByteArray(32_768)
+        org.apache.commons.compress.compressors.xz.XZCompressorInputStream(
+            java.io.BufferedInputStream(java.io.FileInputStream(xzPath), 32_768)
+        ).use { xzIn ->
+            java.io.FileOutputStream(outPath).use { out ->
+                var n: Int
+                while (xzIn.read(buf).also { n = it } != -1) {
+                    out.write(buf, 0, n)
+                }
+            }
+        }
     }
 
     /**
