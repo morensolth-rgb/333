@@ -455,12 +455,14 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
     @ReactMethod
     fun checkBinaries(promise: Promise) {
         val map = Arguments.createMap()
-        map.putBoolean("fridaServer", File(FRIDA_DEST).let { it.exists() && it.length() > 1024 })
-        map.putBoolean("fridaCli",    File(FRIDA_CLI_DEST).let { it.exists() && it.length() > 1024 })
-        map.putBoolean("fridaCli2",   File(FRIDA_CLI_DEST).let { it.exists() && it.length() > 1024 }) // same binary
+        map.putBoolean("fridaServer",  File(FRIDA_DEST).let { it.exists() && it.length() > 1024 })
+        map.putBoolean("fridaCli",     File(FRIDA_CLI_DEST).let { it.exists() && it.length() > 1024 })
+        map.putBoolean("fridaCli2",    File(FRIDA_CLI_DEST).let { it.exists() && it.length() > 1024 }) // same binary
+        map.putBoolean("fridaGadget",  File(GADGET_DEST).let { it.exists() && it.length() > 100_000 })
         map.putString("fridaServerSize", if (File(FRIDA_DEST).exists()) "${File(FRIDA_DEST).length() / 1024}KB" else "missing")
         map.putString("fridaCliSize",    if (File(FRIDA_CLI_DEST).exists()) "${File(FRIDA_CLI_DEST).length() / 1024}KB" else "missing")
         map.putString("fridaCli2Size",   if (File(FRIDA_CLI_DEST).exists()) "${File(FRIDA_CLI_DEST).length() / 1024}KB" else "missing")
+        map.putString("fridaGadgetSize", if (File(GADGET_DEST).exists()) "${File(GADGET_DEST).length() / 1024}KB" else "missing")
         promise.resolve(map)
     }
 

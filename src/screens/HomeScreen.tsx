@@ -73,15 +73,16 @@ export default function HomeScreen() {
     setSetupStatus('checking');
     try {
       const status = await rootBridge.checkBinaries();
-      if (status.fridaServer && status.fridaCli) {
-        addLog(`✓ Binaries ready — server:${status.fridaServerSize} inject:${status.fridaCliSize}`);
+      if (status.fridaServer && status.fridaCli && status.fridaGadget) {
+        addLog(`✓ Binaries ready — server:${status.fridaServerSize} inject:${status.fridaCliSize} gadget:${status.fridaGadgetSize}`);
         setSetupStatus('done');
         await AsyncStorage.setItem(BINARIES_READY_KEY, '1');
         return;
       }
       const missing = [
-        !status.fridaServer && 'frida-server',
-        !status.fridaCli    && 'frida-inject',
+        !status.fridaServer  && 'frida-server',
+        !status.fridaCli     && 'frida-inject',
+        !status.fridaGadget  && 'frida-gadget',
       ].filter(Boolean).join(', ');
 
       addLog(`▶ Missing: ${missing} — launching download service...`);
