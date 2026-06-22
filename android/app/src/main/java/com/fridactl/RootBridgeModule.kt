@@ -731,6 +731,17 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                     emitScriptLog("⚠ This WILL cause exit 4. Re-download both from the same release on Home screen.")
                 }
 
+                // Detect if frida-inject supports -H (remote host) — added in frida 16.
+                // Older builds only understand -D local. Check help output.
+                val helpOut = Shell.cmd("$FRIDA_CLI_DEST --help 2>&1 | head -30").exec().out.joinToString("\n")
+                val supportsH = helpOut.contains("-H") || helpOut.contains("--host")
+                val hostArgs = if (supportsH) listOf("-H", "127.0.0.1:$FRIDA_PORT")
+                               else           listOf("-D", "local")
+                if (!supportsH) {
+                    emitScriptLog("⚠ frida-inject version doesn't support -H, falling back to -D local")
+                    emitScriptLog("💡 Update frida-inject from Home screen for better compatibility")
+                }
+
                 // ── 1b. Disable ptrace restrictions ───────────────────────────
                 // "Unable to perform ptrace cont: I/O error" = kernel blocks ptrace
                 // Fix: set ptrace_scope=0 and set SELinux to permissive
@@ -820,7 +831,7 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
 
                         // --no-pause: resume app immediately after script loads
                         // No --eternalize: keep frida-inject alive so hooks stay active and process stays resumed
-                        fridaArgs = listOf(FRIDA_CLI_DEST, "-H", "127.0.0.1:$FRIDA_PORT", "-f", packageName,
+                        fridaArgs = listOf(FRIDA_CLI_DEST) + hostArgs + listOf("-f", packageName,
                             "--script", scriptPath, "--no-pause")
                         modeLabel = "spawn (via server)"
                     }
@@ -856,7 +867,7 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                         }
                         // Use PID instead of name to avoid process name truncation issues (15-char limit)
                         // No --eternalize: keep frida-inject alive so hooks stay active
-                        fridaArgs = listOf(FRIDA_CLI_DEST, "-H", "127.0.0.1:$FRIDA_PORT", "-p", cleanNamePid,
+                        fridaArgs = listOf(FRIDA_CLI_DEST) + hostArgs + listOf("-p", cleanNamePid,
                             "--script", scriptPath)
                         targetPid = cleanNamePid
                         modeLabel = "name→PID $cleanNamePid ($procName)"
@@ -931,7 +942,7 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                             return@Thread
                         }
                         // No --eternalize: keep frida-inject alive so process stays resumed and hooks active
-                        fridaArgs = listOf(FRIDA_CLI_DEST, "-H", "127.0.0.1:$FRIDA_PORT", "-p", cleanPid,
+                        fridaArgs = listOf(FRIDA_CLI_DEST) + hostArgs + listOf("-p", cleanPid,
                             "--script", scriptPath)
                         targetPid = cleanPid
                         modeLabel = "PID $cleanPid (via server)"
