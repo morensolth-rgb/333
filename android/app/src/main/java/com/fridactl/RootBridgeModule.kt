@@ -1101,6 +1101,20 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
         fridaProcess   = proc
         fridaScriptPid = "running"
 
+        // ── Watchdog: keep sending SIGCONT to target PID every 500ms ──────────
+        // frida attach puts process in ptrace-stop; if inject fails or exits early
+        // the process stays frozen forever. This watchdog ensures it always resumes.
+        if (targetPid != null) {
+            val watchPid = targetPid
+            Thread {
+                for (i in 0 until 20) {   // 10s total, every 500ms
+                    Thread.sleep(500)
+                    if (fridaScriptPid == null) break   // stopped by user
+                    try { Shell.cmd("kill -CONT $watchPid 2>/dev/null; true").exec() } catch (_: Exception) {}
+                }
+            }.start()
+        }
+
         var promiseResolved = false
 
         val noiseRx = Regex(
