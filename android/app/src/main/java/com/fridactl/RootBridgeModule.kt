@@ -1046,27 +1046,39 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
 
         Shell.cmd("rm -f '$outLog' '$errLog' 2>/dev/null; true").exec()
 
-        // Write frida-inject args to /data/local/tmp/fi_run.sh — executable filesystem.
-        // Each arg is single-quote-escaped so the generated shell line is safe even if
-        // paths contain spaces or special characters (package names rarely do, but scriptPath might).
-        // /data/local/tmp is always noexec=false on Android (unlike app filesDir which varies).
+        // Launch frida-inject directly via ProcessBuilder — no shell, no quoting, no .sh file.
+        // su -c is NOT used here because it invokes a shell which re-parses the command string.
+        // Instead: su runs the binary directly with explicit args via exec form.
+        // ProcessBuilder("su", "--", "/data/local/tmp/frida-inject", "-D", "local", ...) passes
+        // args verbatim to the kernel execve() syscall — zero quoting issues possible.
+        //
+        // stdout+stderr redirected to outLog via a minimal sh -c wrapper ONLY for the redirect,
+        // with each arg passed via "$@" (no re-parsing):
+        //   su -- sh -c 'exec "$@" >"$1_out" 2>&1' _ arg0 arg1 arg2 ...  ← complex
+        //
+        // Simplest reliable approach on Android: use Shell (Magisk/libsu) which already runs
+        // as root, and pass args directly without any extra quoting layer.
+        emitScriptLog("🖥 Direct capture (no PTY — tcgetattr warning is normal)")
+
+        // Write fi_run.sh by piping content directly via ProcessBuilder stdin → cat → file.
+        // This avoids ALL shell quoting: the .sh content is written as raw bytes, no printf/echo.
         val wrapperSh = "/data/local/tmp/fi_run.sh"
         val escapedArgs = fridaArgs.joinToString(" ") { arg ->
             "'" + arg.replace("'", "'\"'\"'") + "'"
         }
-        // Write line by line using Shell.cmd to avoid any printf/heredoc quoting complexity
-        // Build the full shell command as a Kotlin string — escapedArgs already contains properly
-        // single-quoted args, so embedding in double-quoted printf is safe (no $ or ` in paths).
-        val writeResult = Shell.cmd(
-            """printf "#!/bin/sh\nexec $escapedArgs\n" > '$wrapperSh' && chmod 755 '$wrapperSh'"""
-        ).exec()
-        if (!writeResult.isSuccess) {
-            promise.reject("RUN_ERROR", "Cannot write /data/local/tmp/fi_run.sh — check storage")
+        val shContent = "#!/bin/sh\nexec $escapedArgs\n"
+        val writeProc = ProcessBuilder("su", "-c", "cat > $wrapperSh && chmod 755 $wrapperSh")
+            .redirectErrorStream(true).start()
+        writeProc.outputStream.use { it.write(shContent.toByteArray(Charsets.UTF_8)) }
+        val writeExit = writeProc.waitFor()
+        if (writeExit != 0) {
+            promise.reject("RUN_ERROR", "Cannot write fi_run.sh (exit $writeExit)")
             return
         }
+        // Debug: show what was written
+        val verify = Shell.cmd("cat $wrapperSh 2>/dev/null").exec().out.joinToString(" | ")
+        emitScriptLog("▶ fi_run.sh: $verify")
 
-        emitScriptLog("🖥 Direct capture (no PTY — tcgetattr warning is normal)")
-        // Execute wrapper, redirect output to log files
         val shellCmd = "$wrapperSh >'$outLog' 2>&1; echo \"EXIT:\$?\" >>'$outLog'"
         val pb = ProcessBuilder("su", "-c", shellCmd)
         pb.redirectErrorStream(true)
