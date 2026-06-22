@@ -1181,7 +1181,7 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
         emitScriptLog("💉 Injecting script via HTTP...")
         try {
             val body = """{"type":"load","name":"hook","source":${escapeJsonString(scriptJs)}}"""
-            val conn = URL("http://127.0.0.1:$GADGET_PORT/").openConnection() as HttpURLConnection
+            val conn = URL("http://127.0.0.1:$GADGET_PORT/load").openConnection() as HttpURLConnection
             conn.connectTimeout = 5000
             conn.readTimeout    = 5000
             conn.requestMethod  = "POST"
@@ -1207,13 +1207,11 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                 while (fridaScriptPid != null) {
                     Thread.sleep(500)
                     try {
-                        val conn = URL("http://127.0.0.1:$GADGET_PORT/").openConnection() as HttpURLConnection
+                        val conn = URL("http://127.0.0.1:$GADGET_PORT/messages").openConnection() as HttpURLConnection
                         conn.connectTimeout = 1000
                         conn.readTimeout    = 1500
-                        conn.requestMethod  = "POST"
-                        conn.doOutput       = true
-                        conn.setRequestProperty("Content-Type", "application/json")
-                        conn.outputStream.use { it.write("""{"type":"receive"}""".toByteArray()) }
+                        conn.requestMethod  = "GET"
+                        conn.doOutput       = false
                         val code = conn.responseCode
                         if (code in 200..299) {
                             val text = conn.inputStream.bufferedReader().readText().trim()
