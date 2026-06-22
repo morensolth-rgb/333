@@ -22,14 +22,15 @@ android {
         versionCode 1
         versionName "1.0"
 
+        ndk {
+            abiFilters "arm64-v8a"
+        }
+
         python {
-            // Python 3.11 — matches frida-tools requirement
             version "3.11"
             pip {
                 install "frida==16.5.9"
             }
-            // arm64-v8a only — matches frida-server arch
-            abiFilters "arm64-v8a"
         }
     }
 
