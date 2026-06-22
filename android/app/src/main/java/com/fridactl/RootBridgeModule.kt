@@ -874,14 +874,14 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                             ).exec()
 
                             // Poll up to 15s for process to appear
-                            repeat(30) { i ->
+                            for (i in 0 until 30) {
                                 Thread.sleep(500)
                                 val found = Shell.cmd("pidof '$packageName' 2>/dev/null | tr ' ' '\\n' | head -1")
                                     .exec().out.firstOrNull()?.trim()?.ifBlank { null }
                                 if (found != null) {
                                     pid = found
                                     emitScriptLog("✓ Process appeared after ${(i + 1) * 500}ms (PID $found)")
-                                    return@repeat
+                                    break
                                 }
                             }
                         }
