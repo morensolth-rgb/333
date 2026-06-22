@@ -115,8 +115,9 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
     }
 
     companion object {
-        private const val FRIDA_PORT     = 27042
+        private const val FRIDA_PORT     = 27043   // non-default port — avoids anti-tamper port scan
         private const val FRIDA_DEST     = "/data/local/tmp/frida-server"
+        private const val FRIDA_FAKE_NAME = "/data/local/tmp/.fsvc"  // disguised process name
         private const val FRIDA_CLI_DEST = "/data/local/tmp/frida-inject"   // frida-inject binary
         private const val FRIDA_CLI2_DEST= "/data/local/tmp/frida-inject"   // alias — same binary
 
@@ -317,7 +318,10 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                 // If apps are freezing on launch, it means something called Device.enable_spawn_gating()
                 // — we never do that, so the issue is frida-server intercepting all zygote forks.
                 // Running with no extra flags is correct; if still freezing → SELinux or kernel hook issue.
-                Shell.cmd("$FRIDA_DEST --ignore-crashes > '$fridaLog' 2>&1 &").exec()
+                // Disguise frida-server: symlink to fake name + non-default port
+                // This bypasses anti-tamper checks that scan for "frida-server" process name or port 27042
+                Shell.cmd("ln -sf $FRIDA_DEST $FRIDA_FAKE_NAME 2>/dev/null; true").exec()
+                Shell.cmd("$FRIDA_FAKE_NAME --listen 0.0.0.0:$FRIDA_PORT --ignore-crashes > '$fridaLog' 2>&1 &").exec()
                 Thread.sleep(3000)
 
                 if (isFridaServerRunning()) {
@@ -816,7 +820,7 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
 
                         // --no-pause: resume app immediately after script loads
                         // No --eternalize: keep frida-inject alive so hooks stay active and process stays resumed
-                        fridaArgs = listOf(FRIDA_CLI_DEST, "-D", "local", "-f", packageName,
+                        fridaArgs = listOf(FRIDA_CLI_DEST, "-H", "127.0.0.1:$FRIDA_PORT", "-f", packageName,
                             "--script", scriptPath, "--no-pause")
                         modeLabel = "spawn (via server)"
                     }
@@ -846,7 +850,7 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                         emitScriptLog("⚙ Resolved process name: $procName (PID $cleanNamePid)")
                         // Use PID instead of name to avoid process name truncation issues (15-char limit)
                         // No --eternalize: keep frida-inject alive so hooks stay active
-                        fridaArgs = listOf(FRIDA_CLI_DEST, "-D", "local", "-p", cleanNamePid,
+                        fridaArgs = listOf(FRIDA_CLI_DEST, "-H", "127.0.0.1:$FRIDA_PORT", "-p", cleanNamePid,
                             "--script", scriptPath)
                         targetPid = cleanNamePid
                         modeLabel = "name→PID $cleanNamePid ($procName)"
@@ -918,7 +922,7 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                             return@Thread
                         }
                         // No --eternalize: keep frida-inject alive so process stays resumed and hooks active
-                        fridaArgs = listOf(FRIDA_CLI_DEST, "-D", "local", "-p", cleanPid,
+                        fridaArgs = listOf(FRIDA_CLI_DEST, "-H", "127.0.0.1:$FRIDA_PORT", "-p", cleanPid,
                             "--script", scriptPath)
                         targetPid = cleanPid
                         modeLabel = "PID $cleanPid (via server)"
@@ -1076,7 +1080,7 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
         // Write the wrapper script line by line
         // Write wrapper script via base64 to avoid all shell/Kotlin quoting issues with $@ and $_a
         val b64Script = "IyEvYmluL3NoCnNldCAtLQp3aGlsZSBJRlM9IHJlYWQgLXIgX2E7IGRvCiAgc2V0IC0tICIkQCIgIiRfYSIKZG9uZSA8IC9kYXRhL2xvY2FsL3RtcC9maV9hcmdzCmV4ZWMgIiRAIgo="
-        Shell.cmd("printf '%s' '$b64Script' | base64 -d > '$wrapperSh'").exec()
+        Shell.cmd("echo '$b64Script' | base64 -d > '$wrapperSh'").exec()
         Shell.cmd("chmod 755 '$wrapperSh'").exec()
 
         // Debug: show full script content and args
