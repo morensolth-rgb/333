@@ -848,6 +848,12 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                         ).exec().out.firstOrNull()?.trim()?.ifBlank { null }
                             ?: packageName  // fallback to package name
                         emitScriptLog("⚙ Resolved process name: $procName (PID $cleanNamePid)")
+                        // Wait 10s for game to fully load before injecting
+                        emitScriptLog("⏳ Waiting 10s for game to load before injecting...")
+                        for (s in 1..10) {
+                            Thread.sleep(1000)
+                            emitScriptLog("⏳ ${10 - s}s...")
+                        }
                         // Use PID instead of name to avoid process name truncation issues (15-char limit)
                         // No --eternalize: keep frida-inject alive so hooks stay active
                         fridaArgs = listOf(FRIDA_CLI_DEST, "-H", "127.0.0.1:$FRIDA_PORT", "-p", cleanNamePid,
@@ -902,8 +908,11 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                         }
 
                         // Wait for app to initialize before injecting
-                        emitScriptLog("⏳ App found (PID $pid) — waiting 3s for initialization...")
-                        Thread.sleep(3000)
+                        emitScriptLog("⏳ App found (PID $pid) — waiting 10s for game to load...")
+                        for (s in 1..10) {
+                            Thread.sleep(1000)
+                            emitScriptLog("⏳ ${10 - s}s...")
+                        }
 
                         // Re-check process still alive after wait
                         val stillAlive = Shell.cmd("pidof '$packageName' 2>/dev/null | tr ' ' '\\n' | head -1")
