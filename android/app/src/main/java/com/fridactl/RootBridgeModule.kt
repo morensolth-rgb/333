@@ -26,7 +26,6 @@ import java.net.HttpURLConnection
 import java.net.URL
 import org.apache.commons.compress.compressors.xz.XZCompressorInputStream
 
-
 class RootBridgeModule(reactContext: ReactApplicationContext) :
     ReactContextBaseJavaModule(reactContext) {
 
@@ -116,13 +115,10 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
     }
 
     companion object {
-        private const val FRIDA_PORT      = 27043   // non-default port — avoids anti-tamper port scan
-        private const val FRIDA_DEST      = "/data/local/tmp/frida-server"
-        private const val FRIDA_FAKE_NAME = "/data/local/tmp/.fsvc"  // disguised process name
-        private const val FRIDA_CLI_DEST  = "/data/local/tmp/frida-inject"   // frida-inject binary
-        private const val FRIDA_CLI2_DEST = "/data/local/tmp/frida-inject"   // alias — same binary
-        private const val GADGET_DEST     = "/data/local/tmp/frida-gadget.so"
-        private const val GADGET_PORT     = 27042   // frida-gadget HTTP API default port
+        private const val FRIDA_PORT     = 27042
+        private const val FRIDA_DEST     = "/data/local/tmp/frida-server"
+        private const val FRIDA_CLI_DEST = "/data/local/tmp/frida-inject"   // frida-inject binary
+        private const val FRIDA_CLI2_DEST= "/data/local/tmp/frida-inject"   // alias — same binary
 
         init {
             Shell.enableVerboseLogging = false
@@ -321,10 +317,7 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                 // If apps are freezing on launch, it means something called Device.enable_spawn_gating()
                 // — we never do that, so the issue is frida-server intercepting all zygote forks.
                 // Running with no extra flags is correct; if still freezing → SELinux or kernel hook issue.
-                // Disguise frida-server: symlink to fake name + non-default port
-                // This bypasses anti-tamper checks that scan for "frida-server" process name or port 27042
-                Shell.cmd("ln -sf $FRIDA_DEST $FRIDA_FAKE_NAME 2>/dev/null; true").exec()
-                Shell.cmd("$FRIDA_FAKE_NAME --listen 0.0.0.0:$FRIDA_PORT --ignore-crashes > '$fridaLog' 2>&1 &").exec()
+                Shell.cmd("$FRIDA_DEST --ignore-crashes > '$fridaLog' 2>&1 &").exec()
                 Thread.sleep(3000)
 
                 if (isFridaServerRunning()) {
@@ -455,14 +448,12 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
     @ReactMethod
     fun checkBinaries(promise: Promise) {
         val map = Arguments.createMap()
-        map.putBoolean("fridaServer",  File(FRIDA_DEST).let { it.exists() && it.length() > 1024 })
-        map.putBoolean("fridaCli",     File(FRIDA_CLI_DEST).let { it.exists() && it.length() > 1024 })
-        map.putBoolean("fridaCli2",    File(FRIDA_CLI_DEST).let { it.exists() && it.length() > 1024 }) // same binary
-        map.putBoolean("fridaGadget",  File(GADGET_DEST).let { it.exists() && it.length() > 100_000 })
+        map.putBoolean("fridaServer", File(FRIDA_DEST).let { it.exists() && it.length() > 1024 })
+        map.putBoolean("fridaCli",    File(FRIDA_CLI_DEST).let { it.exists() && it.length() > 1024 })
+        map.putBoolean("fridaCli2",   File(FRIDA_CLI_DEST).let { it.exists() && it.length() > 1024 }) // same binary
         map.putString("fridaServerSize", if (File(FRIDA_DEST).exists()) "${File(FRIDA_DEST).length() / 1024}KB" else "missing")
         map.putString("fridaCliSize",    if (File(FRIDA_CLI_DEST).exists()) "${File(FRIDA_CLI_DEST).length() / 1024}KB" else "missing")
         map.putString("fridaCli2Size",   if (File(FRIDA_CLI_DEST).exists()) "${File(FRIDA_CLI_DEST).length() / 1024}KB" else "missing")
-        map.putString("fridaGadgetSize", if (File(GADGET_DEST).exists()) "${File(GADGET_DEST).length() / 1024}KB" else "missing")
         promise.resolve(map)
     }
 
@@ -641,7 +632,7 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
         Thread {
             fridaScriptPid = null
 
-            // Kill frida-inject process (legacy / fallback)
+            // Kill frida-inject process
             fridaProcess?.let { p ->
                 try {
                     p.outputStream?.let { os ->
@@ -736,17 +727,6 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                     emitScriptLog("⚠ This WILL cause exit 4. Re-download both from the same release on Home screen.")
                 }
 
-                // Detect if frida-inject supports -H (remote host) — added in frida 16.
-                // Older builds only understand -D local. Check help output.
-                val helpOut = Shell.cmd("$FRIDA_CLI_DEST --help 2>&1 | head -30").exec().out.joinToString("\n")
-                val supportsH = helpOut.contains("-H") || helpOut.contains("--host")
-                val hostArgs = if (supportsH) listOf("-H", "127.0.0.1:$FRIDA_PORT")
-                               else           listOf("-D", "local")
-                if (!supportsH) {
-                    emitScriptLog("⚠ frida-inject version doesn't support -H, falling back to -D local")
-                    emitScriptLog("💡 Update frida-inject from Home screen for better compatibility")
-                }
-
                 // ── 1b. Disable ptrace restrictions ───────────────────────────
                 // "Unable to perform ptrace cont: I/O error" = kernel blocks ptrace
                 // Fix: set ptrace_scope=0 and set SELinux to permissive
@@ -804,11 +784,8 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                 //
                 // All modes go through frida-server for reliability
                 //
-                // fridaArgs: raw arg list passed directly to ProcessBuilder — NO shell, NO quoting issues.
-                // Spaces/special chars in paths/package names are handled safely by the JVM process API.
-                val fridaArgs: List<String>
+                val cmd: String
                 val modeLabel: String
-                var targetPid: String? = null   // PID of the target process (for SIGCONT after inject)
 
                 when (mode) {
                     "spawn" -> {
@@ -834,10 +811,11 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                         emitScriptLog("🔄 Force-stopped $packageName — spawning with frida...")
                         emitScriptLog("ℹ Spawn injects BEFORE app code runs — bypasses anti-tamper startup checks")
 
-                        // --no-pause: resume app immediately after script loads
-                        // No --eternalize: keep frida-inject alive so hooks stay active and process stays resumed
-                        fridaArgs = listOf(FRIDA_CLI_DEST) + hostArgs + listOf("-f", packageName,
-                            "--script", scriptPath, "--no-pause")
+                        // frida-inject -D local -f <pkg> --no-pause
+                        // --no-pause: resume app immediately after script loads (don't keep paused)
+                        // WITHOUT --no-pause: app stays paused forever if frida-inject dies → freeze bug
+                        // --runtime=qjs: QuickJS runtime — lighter, more compatible on locked-down devices
+                        cmd = "$FRIDA_CLI_DEST -D local -f '$packageName' --script '$scriptPath' --no-pause --runtime=qjs"
                         modeLabel = "spawn (via server)"
                     }
                     "name" -> {
@@ -863,18 +841,11 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                             "cat /proc/$cleanNamePid/cmdline 2>/dev/null | tr '\\0' '\\n' | head -1"
                         ).exec().out.firstOrNull()?.trim()?.ifBlank { null }
                             ?: packageName  // fallback to package name
-                        emitScriptLog("⚙ Resolved process name: $procName (PID $cleanNamePid)")
-                        // Wait 10s for game to fully load before injecting
-                        emitScriptLog("⏳ Waiting 10s for game to load before injecting...")
-                        for (s in 1..10) {
-                            Thread.sleep(1000)
-                            emitScriptLog("⏳ ${10 - s}s...")
-                        }
+                        emitScriptLog("⚙ Resolved process name: '$procName' (PID $cleanNamePid)")
                         // Use PID instead of name to avoid process name truncation issues (15-char limit)
-                        // No --eternalize: keep frida-inject alive so hooks stay active
-                        fridaArgs = listOf(FRIDA_CLI_DEST) + hostArgs + listOf("-p", cleanNamePid,
-                            "--script", scriptPath)
-                        targetPid = cleanNamePid
+                        // frida-inject -n can fail if process name > 15 chars (kernel truncates comm)
+                        // --eternalize: frida-inject exits immediately but script stays loaded in process
+                        cmd = "$FRIDA_CLI_DEST -D local -p $cleanNamePid --script '$scriptPath' --eternalize"
                         modeLabel = "name→PID $cleanNamePid ($procName)"
                     }
                     else -> {   // pid
@@ -899,14 +870,14 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                             ).exec()
 
                             // Poll up to 15s for process to appear
-                            for (i in 0 until 30) {
+                            repeat(30) { i ->
                                 Thread.sleep(500)
                                 val found = Shell.cmd("pidof '$packageName' 2>/dev/null | tr ' ' '\\n' | head -1")
                                     .exec().out.firstOrNull()?.trim()?.ifBlank { null }
                                 if (found != null) {
                                     pid = found
                                     emitScriptLog("✓ Process appeared after ${(i + 1) * 500}ms (PID $found)")
-                                    break
+                                    return@repeat
                                 }
                             }
                         }
@@ -924,11 +895,8 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                         }
 
                         // Wait for app to initialize before injecting
-                        emitScriptLog("⏳ App found (PID $pid) — waiting 10s for game to load...")
-                        for (s in 1..10) {
-                            Thread.sleep(1000)
-                            emitScriptLog("⏳ ${10 - s}s...")
-                        }
+                        emitScriptLog("⏳ App found (PID $pid) — waiting 3s for initialization...")
+                        Thread.sleep(3000)
 
                         // Re-check process still alive after wait
                         val stillAlive = Shell.cmd("pidof '$packageName' 2>/dev/null | tr ' ' '\\n' | head -1")
@@ -946,28 +914,24 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                             promise.reject("RUN_ERROR", "Invalid PID: '$pid'")
                             return@Thread
                         }
-                        // No --eternalize: keep frida-inject alive so process stays resumed and hooks active
-                        fridaArgs = listOf(FRIDA_CLI_DEST) + hostArgs + listOf("-p", cleanPid,
-                            "--script", scriptPath)
-                        targetPid = cleanPid
+                        // --eternalize: frida-inject detaches cleanly, script stays running inside process
+                        // This prevents ptrace-stop from freezing the game after inject exits
+                        cmd = "$FRIDA_CLI_DEST -D local -p $cleanPid --script '$scriptPath' --eternalize"
                         modeLabel = "PID $cleanPid (via server)"
                     }
                 }
 
-                // Build display string for logs (args joined, no quotes needed for display)
-                val cmdDisplay = fridaArgs.joinToString(" ")
                 emitScriptLog("🚀 frida-inject $modeLabel...")
-                emitScriptLog("▶ $cmdDisplay")
+                emitScriptLog("▶ $cmd")
 
-                // Extract PID from fridaArgs for logcat --pid filter
-                val logcatPid = targetPid?.toIntOrNull()
-                    ?: fridaArgs.indexOf("-p").takeIf { it >= 0 }?.let { fridaArgs.getOrNull(it + 1)?.toIntOrNull() }
+                // Extract PID from cmd for logcat --pid filter (improves output on some devices)
+                val logcatPid = Regex("""-p\s+(\d+)""").find(cmd)?.groupValues?.get(1)?.toIntOrNull()
 
                 // ── 4. Start logcat BEFORE frida-inject so no output is missed ──
                 startPersistentLogcat(logcatPid)
 
                 // ── 5. Launch frida-inject ────────────────────────────────────
-                runFridaProcess(fridaArgs, targetPid, packageName, promise)
+                runFridaProcess(cmd, promise)
 
             } catch (e: Exception) {
                 promise.reject("RUN_ERROR", e.message)
@@ -1055,199 +1019,218 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
         }.also { it.isDaemon = true }.start()
     }
 
-    // Shell-quote a string for safe embedding inside single-quoted shell argument
-    private fun shellQuote(s: String): String = "'" + s.replace("'", "'\"'\"'") + "'"
-
-    // Runs frida-gadget injection via LD_PRELOAD launch + HTTP script inject.
-    // Flow:
-    //   1. Ensure gadget .so exists
-    //   2. Kill any running instance of target app
-    //   3. Launch target with LD_PRELOAD=frida-gadget.so via am start (root)
-    //   4. Poll gadget HTTP server at 127.0.0.1:27042 until it responds (up to 15s)
-    //   5. POST script JS to gadget HTTP API → /  {"type":"load","name":"hook","source":"<js>"}
-    //   6. Stream send() messages via polling GET /  {"type":"receive"}
-    //
-    // fridaArgs: used only to extract --script path. Mode/PID/server logic not needed here.
-    // targetPid: unused in gadget mode (gadget IS the server, no separate frida-server).
-    // packageName: the app to launch with LD_PRELOAD.
-    private fun runFridaProcess(fridaArgs: List<String>, targetPid: String?, packageName: String, promise: Promise) {
+    // Runs the frida-inject command as a root Process, streams all output → FridaScriptLog
+    private fun runFridaProcess(cmd: String, promise: Promise) {
         fridaProcess?.destroy()
         fridaProcess = null
         fridaScriptPid = null
 
-        // ── 1. Extract scriptPath from fridaArgs ──────────────────────────────
-        val scriptIdx  = fridaArgs.indexOf("--script")
-        val scriptPath = fridaArgs.getOrNull(scriptIdx + 1)
-        if (scriptPath == null) {
-            promise.reject("RUN_ERROR", "No --script path in fridaArgs")
-            return
-        }
+        val filesDir  = reactApplicationContext.filesDir.absolutePath
+        val outLog    = "$filesDir/fi_out.log"
+        val errLog    = "$filesDir/fi_err.log"
 
-        // ── 2. Ensure gadget .so exists ───────────────────────────────────────
-        val gadgetFile = File(GADGET_DEST)
-        if (!gadgetFile.exists() || gadgetFile.length() < 100_000) {
-            promise.reject("RUN_ERROR",
-                "frida-gadget.so missing — download it from the Home screen first.\n" +
-                "(Expected at $GADGET_DEST)")
-            return
-        }
-        Shell.cmd("chmod 644 '$GADGET_DEST' 2>/dev/null; true").exec()
-        emitScriptLog("✓ gadget: ${gadgetFile.length() / 1024}KB @ $GADGET_DEST")
+        // frida-inject needs a TTY — piping stdout/stderr to a file breaks tcgetattr → EXIT:4
+        // Confirmed fix: setsid WITHOUT stdout/stderr redirect works (tested manually)
+        // We redirect stdin from /dev/null + capture stderr only for error diagnosis
+        // Real frida script output (console.log) goes through logcat automatically
+        Shell.cmd("rm -f '$outLog' '$errLog' 2>/dev/null; true").exec()
 
-        // ── 3. Read JS script ─────────────────────────────────────────────────
-        val scriptJs = try {
-            val tmp = "${reactApplicationContext.filesDir}/hook_read_tmp.js"
-            Shell.cmd("cp '$scriptPath' '$tmp' && chmod 644 '$tmp'").exec()
-            File(tmp).readText().also { File(tmp).delete() }
-        } catch (e: Exception) {
-            promise.reject("RUN_ERROR", "Cannot read script at $scriptPath: ${e.message}")
-            return
-        }
-        emitScriptLog("📝 Script read (${scriptJs.length} chars)")
-
-        // ── 4. Kill any existing instance ─────────────────────────────────────
-        Shell.cmd("am force-stop '$packageName' 2>/dev/null; true").exec()
-        Thread.sleep(1000)
-
-        // ── 5. Launch with LD_PRELOAD ─────────────────────────────────────────
-        // am start --es android.intent.extra.ENVIRONMENT "KEY=VALUE" only works on some ROMs.
-        // Most reliable on rooted: use env LD_PRELOAD=... monkey or wrap the process via
-        // setprop wrap.<pkg> "LD_PRELOAD=..." then launch.
-        // We use setprop wrap.* — supported on Android 8+ debug/root builds,
-        // and also try direct monkey launch with LD_PRELOAD env prefix.
+        // frida-inject writes console.log to stdout (piped mode) or PTY slave (TTY mode).
+        // setsid </dev/ptmx redirects stdin from PTY master — stdout still goes to the file correctly
+        // ONLY when the slave fd is open. Without a slave, frida detects no TTY and writes to stdout→file.
         //
-        // Strategy:
-        //   A. setprop wrap.<pkg> "LD_PRELOAD=/data/local/tmp/frida-gadget.so" then monkey
-        //   B. env LD_PRELOAD=... monkey -p <pkg> 1  (fallback)
-        emitScriptLog("🚀 Launching $packageName with LD_PRELOAD=frida-gadget.so...")
+        // CONFIRMED WORKING STRATEGY:
+        //   Run frida-inject with stdout+stderr redirected to files — no PTY wrapper.
+        //   frida-inject will print "tcgetattr: Inappropriate ioctl" to stderr (we filter it).
+        //   console.log output goes to stdout → outLog. This is the most reliable cross-device approach.
+        //
+        //   If 'script' is available, use it — it gives frida a real PTY and captures everything.
+        val hasScript = Shell.cmd("which script 2>/dev/null").exec().out.firstOrNull()?.trim()?.isNotBlank() == true
 
-        // Try strategy A: setprop wrap
-        val wrapProp = "wrap.$packageName"
-        Shell.cmd("setprop '$wrapProp' 'LD_PRELOAD=$GADGET_DEST' 2>/dev/null; true").exec()
-        val propVal = Shell.cmd("getprop '$wrapProp' 2>/dev/null").exec().out.firstOrNull()?.trim()
-        val usedWrap = propVal?.contains("frida-gadget") == true
-
-        if (usedWrap) {
-            emitScriptLog("✓ setprop wrap.$packageName set")
-            Shell.cmd("monkey -p '$packageName' -c android.intent.category.LAUNCHER 1 2>/dev/null; true").exec()
+        val wrapper = if (hasScript) {
+            emitScriptLog("🖥 PTY capture via script")
+            // script -q -c 'CMD' /dev/null — CMD gets a real PTY slave; all output captured to script stdout → outLog
+            "script -q -c '$cmd' /dev/null >'$outLog' 2>'$errLog'; echo \"EXIT:\$?\" >>'$outLog'"
         } else {
-            // Strategy B: env prefix
-            emitScriptLog("⚠ setprop wrap.* failed — using env LD_PRELOAD prefix")
-            Shell.cmd(
-                "env LD_PRELOAD='$GADGET_DEST' monkey -p '$packageName' -c android.intent.category.LAUNCHER 1 2>/dev/null; true"
-            ).exec()
+            emitScriptLog("🖥 Direct capture (no PTY — tcgetattr warning is normal)")
+            // No PTY tools. frida prints tcgetattr warning to stderr (filtered below).
+            // console.log goes to stdout → outLog. Works reliably.
+            "$cmd >'$outLog' 2>&1; echo \"EXIT:\$?\" >>'$outLog'"
         }
 
-        fridaScriptPid = "running"  // mark as active for stopScript() sentinel
+        val pb = ProcessBuilder("su", "-c", wrapper)
+        pb.redirectErrorStream(true)
 
-        // ── 6. Poll gadget HTTP server until it responds ──────────────────────
-        emitScriptLog("⏳ Waiting for frida-gadget HTTP server on 127.0.0.1:$GADGET_PORT...")
-        var gadgetReady = false
-        val waitStart = System.currentTimeMillis()
-        for (i in 0 until 30) {   // 30 × 500ms = 15s max
-            Thread.sleep(500)
-            try {
-                val conn = URL("http://127.0.0.1:$GADGET_PORT/").openConnection() as HttpURLConnection
-                conn.connectTimeout = 300
-                conn.readTimeout    = 300
-                conn.requestMethod  = "GET"
-                val code = conn.responseCode
-                conn.disconnect()
-                if (code in 200..499) {   // any response = gadget is up
-                    gadgetReady = true
-                    val elapsed = System.currentTimeMillis() - waitStart
-                    emitScriptLog("✓ Gadget responded in ${elapsed}ms")
-                    break
-                }
-            } catch (_: Exception) {}
-            if (i % 4 == 3) emitScriptLog("⏳ ${(30 - i - 1) * 500 / 1000}s left...")
-        }
-
-        if (!gadgetReady) {
-            fridaScriptPid = null
-            // Clean up wrap prop
-            if (usedWrap) Shell.cmd("setprop '$wrapProp' '' 2>/dev/null; true").exec()
-            promise.reject("INJECT_ERROR",
-                "frida-gadget did not start within 15s.\n" +
-                "Possible causes:\n" +
-                "  • LD_PRELOAD wasn't applied (ROM doesn't support setprop wrap.*)\n" +
-                "  • gadget .so is wrong arch (need arm64)\n" +
-                "  • SELinux blocked gadget from opening port 27042\n" +
-                "Check console for details.")
-            return
-        }
-
-        // ── 7. POST script to gadget ──────────────────────────────────────────
-        emitScriptLog("💉 Injecting script via HTTP...")
+        val proc: Process
         try {
-            val body = """{"type":"load","name":"hook","source":${escapeJsonString(scriptJs)}}"""
-            val conn = URL("http://127.0.0.1:$GADGET_PORT/load").openConnection() as HttpURLConnection
-            conn.connectTimeout = 5000
-            conn.readTimeout    = 5000
-            conn.requestMethod  = "POST"
-            conn.doOutput       = true
-            conn.setRequestProperty("Content-Type", "application/json")
-            conn.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
-            val code    = conn.responseCode
-            val respBody = conn.inputStream.bufferedReader().readText()
-            conn.disconnect()
-            emitScriptLog("✅ Gadget POST → HTTP $code: $respBody")
-            promise.resolve("running:gadget")
+            proc = pb.start()
         } catch (e: Exception) {
-            fridaScriptPid = null
-            if (usedWrap) Shell.cmd("setprop '$wrapProp' '' 2>/dev/null; true").exec()
-            promise.reject("INJECT_ERROR", "POST to gadget failed: ${e.message}")
+            promise.reject("RUN_ERROR", "Cannot start process: ${e.message}")
             return
         }
 
-        // ── 8. Poll for send() messages from script (non-blocking background) ─
+        fridaProcess   = proc
+        fridaScriptPid = "running"
+
+        var promiseResolved = false
+
+        val noiseRx = Regex(
+            "tcgetattr|isatty|not a tty|inappropriate ioctl|Script (started|done)|stty:",
+            RegexOption.IGNORE_CASE
+        )
+
+        // ── Stream outLog in real-time (stdout from frida-inject — console.log + send() output) ──
         Thread {
             try {
-                var lastMsgId = 0
-                while (fridaScriptPid != null) {
-                    Thread.sleep(500)
-                    try {
-                        val conn = URL("http://127.0.0.1:$GADGET_PORT/messages").openConnection() as HttpURLConnection
-                        conn.connectTimeout = 1000
-                        conn.readTimeout    = 1500
-                        conn.requestMethod  = "GET"
-                        conn.doOutput       = false
-                        val code = conn.responseCode
-                        if (code in 200..299) {
-                            val text = conn.inputStream.bufferedReader().readText().trim()
-                            conn.disconnect()
-                            if (text.isNotBlank() && text != "{}" && text != "[]") {
-                                emitScriptLog("📨 $text")
-                            }
-                        } else {
-                            conn.disconnect()
+                val tailProc = ProcessBuilder("su", "-c", "tail -f '$outLog' 2>/dev/null")
+                    .redirectErrorStream(true).start()
+                try {
+                    tailProc.inputStream.bufferedReader().use { r ->
+                        while (fridaScriptPid != null || proc.isAlive) {
+                            val l = r.readLine() ?: break
+                            if (l.isBlank()) continue
+                            if (l.startsWith("EXIT:")) continue
+                            if (noiseRx.containsMatchIn(l)) continue
+                            emitScriptLog(l)
                         }
-                    } catch (_: Exception) {}
-                }
+                    }
+                } catch (_: Exception) {}
+                try { tailProc.destroy() } catch (_: Exception) {}
             } catch (_: Exception) {}
-            // Clean up wrap prop when done
-            if (usedWrap) {
-                try { Shell.cmd("setprop '$wrapProp' '' 2>/dev/null; true").exec() } catch (_: Exception) {}
-            }
-            emitScriptLog("📡 Gadget message poll stopped")
-        }.also { it.isDaemon = true }.start()
-    }
+        }.start()
 
-    // Escape a Kotlin string into a JSON string literal (with surrounding quotes)
-    private fun escapeJsonString(s: String): String {
-        val sb = StringBuilder("\"")
-        for (c in s) {
-            when (c) {
-                '"'  -> sb.append("\\\"")
-                '\\' -> sb.append("\\\\")
-                '\n' -> sb.append("\\n")
-                '\r' -> sb.append("\\r")
-                '\t' -> sb.append("\\t")
-                else -> if (c.code < 0x20) sb.append("\\u%04x".format(c.code)) else sb.append(c)
+        // errLog not streamed separately — stderr is merged into outLog via 2>&1
+        // (when using script, errLog captures script's own stderr which is minimal)
+
+        Thread {
+            // Drain the process stdout (mostly empty now since we redirect to files)
+            try { proc.inputStream.bufferedReader().readText() } catch (_: Exception) {}
+
+            val exitCode = try { proc.waitFor() } catch (_: Exception) { -1 }
+
+            // Give real-time streams a moment to flush
+            Thread.sleep(500)
+
+            // Now read the captured output files
+            val outLines = try { java.io.File(outLog).readLines() } catch (_: Exception) { emptyList() }
+            // errLog is not used separately — stderr merged into outLog via 2>&1
+            val noiseRegex = Regex(
+                "tcgetattr|isatty|not a tty|inappropriate ioctl|Script (started|done)|stty:",
+                RegexOption.IGNORE_CASE
+            )
+
+            // outLog contains both stdout + stderr (merged). Skip noise and EXIT: marker.
+            for (l in outLines) {
+                if (l.isBlank()) continue
+                if (l.startsWith("EXIT:")) continue
+                if (noiseRegex.containsMatchIn(l)) continue
+                emitScriptLog(l)
+                if (!promiseResolved) {
+                    val isFatal = l.lowercase().let { ll ->
+                        ll.contains("unable to") || ll.contains("failed to") ||
+                        ll.contains("permission denied") || ll.contains("access denied") ||
+                        ll.contains("no such process") || ll.contains("error:")
+                    }
+                    if (!isFatal) { promiseResolved = true; promise.resolve("running:inject") }
+                }
             }
-        }
-        sb.append("\"")
-        return sb.toString()
+
+            // Real exit code from the EXIT: line we appended
+            val realExit = outLines.lastOrNull { it.startsWith("EXIT:") }
+                ?.removePrefix("EXIT:")?.trim()?.toIntOrNull() ?: exitCode
+
+            emitScriptLog("━━ exit: $realExit ━━")
+
+            // frida-server log
+            val fridaServerLog = "$filesDir/frida.log"
+            val srvLines = try { Shell.cmd("tail -5 '$fridaServerLog' 2>/dev/null").exec().out } catch (_: Exception) { emptyList() }
+            if (srvLines.isNotEmpty()) {
+                emitScriptLog("── frida-server log ──")
+                srvLines.forEach { emitScriptLog("  $it") }
+            }
+
+            // Diagnosis hint for exit 4
+            if (realExit == 4) {
+                emitScriptLog("💡 exit 4 = attach rejected. Check:")
+                emitScriptLog("   • frida-server and frida-inject versions must match exactly")
+                emitScriptLog("   • Run: /data/local/tmp/frida-server --version")
+                emitScriptLog("   • Run: /data/local/tmp/frida-inject --version")
+                emitScriptLog("   • SELinux must be Permissive")
+                emitScriptLog("   • Try re-downloading both binaries from same release")
+            }
+
+            if (!promiseResolved) {
+                promiseResolved = true
+                val allEmpty = outLines.all { it.isBlank() || it.startsWith("EXIT:") || noiseRegex.containsMatchIn(it) }
+                // --eternalize: frida-inject exits 0 immediately after loading script into the process.
+                // This is NOT an error — the script is running inside the target. Treat exit 0 as success.
+                if (realExit == 0) {
+                    if (allEmpty) emitScriptLog("⚠ No output captured — check logcat for script activity")
+                    emitScriptLog("✅ Script injected and running (eternalized)")
+                    promise.resolve("running:inject")
+                } else {
+                    if (allEmpty) emitScriptLog("⚠ frida-inject produced no output (binary issue?)")
+                    val hint = when (realExit) {
+                        1    -> "exit 1 — wrong package name or binary version mismatch"
+                        4    -> "exit 4 — attach/spawn rejected (version mismatch or SELinux)"
+                        else -> "exit $realExit"
+                    }
+                    promise.reject("INJECT_ERROR", hint)
+                }
+            } else {
+                if (realExit == 0) emitScriptLog("✅ Script injected and running (eternalized)")
+                else emitScriptLog("⚠ exit $realExit")
+            }
+
+            fridaScriptPid = null
+            fridaProcess   = null
+
+            // ── CRITICAL: Resume any frozen spawned/attached process ───────────
+            // If frida-inject exits (error or crash) while in spawn/attach mode, the target
+            // process may remain paused in ptrace state — game appears frozen.
+            // Fix: send SIGCONT ONLY to the specific target PID extracted from cmd.
+            // NEVER use kill -CONT -1 (broadcasts to ALL processes — breaks system services).
+            val targetPidForCont = Regex("""-p\s+(\d+)""").find(cmd)?.groupValues?.get(1)
+            if (targetPidForCont != null) {
+                // SIGCONT to the target PID and its entire process group
+                try { Shell.cmd("kill -CONT $targetPidForCont 2>/dev/null; true").exec() } catch (_: Exception) {}
+                // Also unfreeze any threads in the same process group
+                try { Shell.cmd("kill -CONT -$targetPidForCont 2>/dev/null; true").exec() } catch (_: Exception) {}
+                emitScriptLog("⚙ Released ptrace-stop on PID $targetPidForCont")
+            } else {
+                emitScriptLog("⚙ No target PID found in cmd — skipping SIGCONT")
+            }
+
+            // ── Kill frida-server after inject finishes ────────────────────────
+            // frida-server intercepts ALL process spawns system-wide via ptrace.
+            // Leaving it running causes any app launched AFTER inject to freeze on startup.
+            // Fix: kill it as soon as frida-inject exits — it's no longer needed.
+            Shell.cmd("pkill -f frida-server 2>/dev/null; true").exec()
+            emitScriptLog("⚙ frida-server stopped")
+            Thread.sleep(300)
+
+            // ── Restore SELinux AFTER killing frida-server ─────────────────────
+            if (selinuxWasEnforcing) {
+                Shell.cmd("setenforce 1 2>/dev/null; true").exec()
+                selinuxWasEnforcing = false
+                emitScriptLog("🔒 SELinux restored to Enforcing")
+            }
+            // NOTE: do NOT destroy logcatProc here — injected script inside game is still logging
+        }.start()
+
+        // ── Safety timeout: 10s ───────────────────────────────────────────────
+        Thread {
+            Thread.sleep(10000)
+            if (!promiseResolved) {
+                promiseResolved = true
+                if (fridaProcess != null) {
+                    emitScriptLog("✅ Script presumed running (timeout reached, process alive)")
+                    promise.resolve("running:timeout")
+                } else {
+                    promise.reject("INJECT_ERROR", "frida-inject did not respond within 10 seconds")
+                }
+            }
+        }.start()
     }
 
     // Resolve PID — launch app if not running, return null if still not found

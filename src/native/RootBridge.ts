@@ -10,12 +10,10 @@ export interface AppInfo {
 }
 
 export interface BinaryStatus {
-  fridaServer:  boolean;
-  fridaCli:     boolean;
-  fridaGadget:  boolean;
-  fridaServerSize:  string;
-  fridaCliSize:     string;
-  fridaGadgetSize:  string;
+  fridaServer: boolean;
+  fridaCli:    boolean;
+  fridaServerSize: string;
+  fridaCliSize:    string;
 }
 
 export const rootBridge = {
