@@ -626,11 +626,18 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
     @Volatile private var fridaScriptPid: String? = null
     // Track whether WE changed SELinux to Permissive — so we can restore it after inject
     @Volatile private var selinuxWasEnforcing: Boolean = false
+    // The package currently being injected — used by the anti-freeze watchdog
+    @Volatile private var currentTargetPkg: String? = null
 
     @ReactMethod
     fun stopScript(promise: Promise) {
         Thread {
             fridaScriptPid = null
+            val pkg = currentTargetPkg
+
+            // Stop the anti-freeze watchdog loop (we'll run a final one-shot below)
+            unfreezeTargetPkg = null
+            try { unfreezeWatchdog?.interrupt() } catch (_: Exception) {}
 
             // Kill frida-inject process
             fridaProcess?.let { p ->
@@ -649,22 +656,28 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
             fridaLogcatProc = null
             try { Shell.cmd("pkill -f 'logcat.*Frida' 2>/dev/null; true").exec() } catch (_: Exception) {}
 
-            // Restore SELinux to Enforcing if we changed it
+            // Kill frida-server so it stops intercepting new process spawns
+            Shell.cmd("pkill -f frida-server 2>/dev/null; true").exec()
+            emitScriptLog("⚙ frida-server stopped")
+
+            // ── TARGETED UNFREEZE ──────────────────────────────────────────
+            // Resume EVERY thread of the target (not kill -CONT -1, which would
+            // hit the whole system). Also kills any leftover frida tracer.
+            if (!pkg.isNullOrBlank()) {
+                unfreezeNow(pkg)
+                // Run a few more passes — detach can lag the kill on slow kernels
+                repeat(8) { Thread.sleep(200); unfreezeNow(pkg) }
+                emitScriptLog("⚙ Unfroze all threads of $pkg")
+            }
+
+            // Restore SELinux to Enforcing if we changed it (AFTER unfreeze)
             if (selinuxWasEnforcing) {
                 Shell.cmd("setenforce 1 2>/dev/null; true").exec()
                 selinuxWasEnforcing = false
                 emitScriptLog("🔒 SELinux restored to Enforcing")
             }
 
-            // Kill frida-server so it stops intercepting new process spawns
-            Shell.cmd("pkill -f frida-server 2>/dev/null; true").exec()
-            emitScriptLog("⚙ frida-server stopped")
-
-            // Unfreeze any process paused by frida spawn (send SIGCONT to T-state procs)
-            try {
-                Shell.cmd("kill -CONT -1 2>/dev/null; true").exec()
-            } catch (_: Exception) {}
-
+            currentTargetPkg = null
             emitScriptLog("⏹ Script stopped")
             promise.resolve("stopped")
         }.start()
@@ -672,6 +685,7 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
 
     @ReactMethod
     fun runScript(packageName: String, script: String, mode: String, promise: Promise) {
+        currentTargetPkg = packageName
         Thread {
             try {
                 // ── 1. Ensure frida-inject binary ─────────────────────────────
@@ -1072,6 +1086,15 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
         fridaProcess   = proc
         fridaScriptPid = "running"
 
+        // ── START ANTI-FREEZE WATCHDOG ─────────────────────────────────────
+        // Runs in parallel with inject. Continuously SIGCONTs every thread of
+        // the target and kills any leftover frida tracer, so the game can never
+        // stay stuck in ptrace-stop on any kernel. Idempotent + targeted.
+        currentTargetPkg?.let { pkg ->
+            startUnfreezeWatchdog(pkg)
+            emitScriptLog("🛡 Anti-freeze watchdog active for $pkg")
+        }
+
         var promiseResolved = false
 
         val noiseRx = Regex(
@@ -1186,19 +1209,23 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
             fridaProcess   = null
 
             // ── CRITICAL: Resume any frozen spawned/attached process ───────────
-            // If frida-inject exits (error or crash) while in spawn/attach mode, the target
-            // process may remain paused in ptrace state — game appears frozen.
-            // Fix: send SIGCONT ONLY to the specific target PID extracted from cmd.
-            // NEVER use kill -CONT -1 (broadcasts to ALL processes — breaks system services).
-            val targetPidForCont = Regex("""-p\s+(\d+)""").find(cmd)?.groupValues?.get(1)
-            if (targetPidForCont != null) {
-                // SIGCONT to the target PID and its entire process group
-                try { Shell.cmd("kill -CONT $targetPidForCont 2>/dev/null; true").exec() } catch (_: Exception) {}
-                // Also unfreeze any threads in the same process group
-                try { Shell.cmd("kill -CONT -$targetPidForCont 2>/dev/null; true").exec() } catch (_: Exception) {}
-                emitScriptLog("⚙ Released ptrace-stop on PID $targetPidForCont")
+            // When frida-inject exits (eternalize, crash, or normal), the target's
+            // threads can remain in ptrace-stop (T) on some kernels. The background
+            // watchdog (started at launch) is already SIGCONT-ing every thread, but
+            // we also run an immediate burst of full-thread unfreezes here so the
+            // game resumes instantly regardless of exit path.
+            val pkgForCont = currentTargetPkg
+            if (!pkgForCont.isNullOrBlank()) {
+                unfreezeNow(pkgForCont)
+                repeat(6) { Thread.sleep(200); unfreezeNow(pkgForCont) }
+                emitScriptLog("⚙ Released ptrace-stop on all threads of $pkgForCont")
             } else {
-                emitScriptLog("⚙ No target PID found in cmd — skipping SIGCONT")
+                // Fallback: SIGCONT just the target PID + its group (never -1)
+                val targetPidForCont = Regex("""-p\s+(\d+)""").find(cmd)?.groupValues?.get(1)
+                if (targetPidForCont != null) {
+                    try { Shell.cmd("kill -CONT $targetPidForCont 2>/dev/null; kill -CONT -$targetPidForCont 2>/dev/null; true").exec() } catch (_: Exception) {}
+                    emitScriptLog("⚙ Released ptrace-stop on PID $targetPidForCont")
+                }
             }
 
             // ── Kill frida-server after inject finishes ────────────────────────
@@ -1208,6 +1235,12 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
             Shell.cmd("pkill -f frida-server 2>/dev/null; true").exec()
             emitScriptLog("⚙ frida-server stopped")
             Thread.sleep(300)
+
+            // One more unfreeze AFTER killing frida-server (killing the server can
+            // itself leave a freshly-stopped thread on strict kernels).
+            if (!pkgForCont.isNullOrBlank()) {
+                repeat(4) { Thread.sleep(200); unfreezeNow(pkgForCont) }
+            }
 
             // ── Restore SELinux AFTER killing frida-server ─────────────────────
             if (selinuxWasEnforcing) {
@@ -1231,6 +1264,67 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                 }
             }
         }.start()
+    }
+
+    // Tracks the package whose process the watchdog keeps unfrozen.
+    @Volatile private var unfreezeTargetPkg: String? = null
+    @Volatile private var unfreezeWatchdog: Thread? = null
+
+    // ANTI-FREEZE WATCHDOG.
+    // Root cause of "game freezes on some devices": after frida attaches via
+    // ptrace and detaches (or --eternalize leaves a dangling tracer), threads
+    // can stay STOPPED (T) on some kernels. SIGCONT to the main PID is not
+    // enough — every TID under /proc/<pid>/task must be resumed. We also detect
+    // a leftover frida tracer via TracerPid and kill it so the kernel resumes.
+    private fun buildUnfreezeScript(packageName: String): String = """
+        pkg='__PKG__'
+        for p in ${'$'}(pidof "${'$'}pkg" 2>/dev/null); do
+          for tid in ${'$'}(ls /proc/${'$'}p/task 2>/dev/null); do
+            kill -CONT "${'$'}tid" 2>/dev/null
+          done
+          kill -CONT "-${'$'}p" 2>/dev/null
+          tracer=${'$'}(grep -m1 TracerPid /proc/${'$'}p/status 2>/dev/null | awk '{print ${'$'}2}')
+          if [ -n "${'$'}tracer" ] && [ "${'$'}tracer" != "0" ]; then
+            tname=${'$'}(cat /proc/${'$'}tracer/comm 2>/dev/null)
+            case "${'$'}tname" in
+              *frida*|*inject*) kill -9 "${'$'}tracer" 2>/dev/null ;;
+            esac
+          fi
+        done
+        true
+    """.trimIndent().replace("__PKG__", packageName)
+
+    private fun startUnfreezeWatchdog(packageName: String, durationMs: Long = 20000L) {
+        unfreezeTargetPkg = packageName
+        try { unfreezeWatchdog?.interrupt() } catch (_: Exception) {}
+        val script = buildUnfreezeScript(packageName)
+        val t = Thread {
+            val deadline = System.currentTimeMillis() + durationMs
+            try {
+                // Phase 1 — aggressive: fire every 250ms for the first window.
+                // This covers the inject + detach window where freezes occur.
+                while (System.currentTimeMillis() < deadline && unfreezeTargetPkg == packageName) {
+                    try { Shell.cmd(script).exec() } catch (_: Exception) {}
+                    try { Thread.sleep(250) } catch (_: InterruptedException) { break }
+                }
+                // Phase 2 — sustained: keep watching at a relaxed rate for as long
+                // as the script session is active, so a late detach can never leave
+                // the game frozen. Stops only when the user presses STOP
+                // stopScript clears unfreezeTargetPkg to null.
+                while (unfreezeTargetPkg == packageName) {
+                    try { Shell.cmd(script).exec() } catch (_: Exception) {}
+                    try { Thread.sleep(1000) } catch (_: InterruptedException) { break }
+                }
+            } catch (_: Exception) {}
+        }
+        t.isDaemon = true
+        unfreezeWatchdog = t
+        t.start()
+    }
+
+    private fun unfreezeNow(packageName: String?) {
+        if (packageName.isNullOrBlank()) return
+        try { Shell.cmd(buildUnfreezeScript(packageName)).exec() } catch (_: Exception) {}
     }
 
     // Resolve PID — launch app if not running, return null if still not found
