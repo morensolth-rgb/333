@@ -1060,24 +1060,35 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
         // as root, and pass args directly without any extra quoting layer.
         emitScriptLog("🖥 Direct capture (no PTY — tcgetattr warning is normal)")
 
-        // Write fi_run.sh by piping content directly via ProcessBuilder stdin → cat → file.
-        // This avoids ALL shell quoting: the .sh content is written as raw bytes, no printf/echo.
+        // Write fi_run.sh via Shell.cmd (libsu — already root, no stdin inheritance issues).
+        // Each arg is written as one line to fi_args, then a wrapper reads them into "$@".
+        // This completely avoids all shell quoting collisions and ProcessBuilder stdin failures.
         val wrapperSh = "/data/local/tmp/fi_run.sh"
-        val escapedArgs = fridaArgs.joinToString(" ") { arg ->
-            "'" + arg.replace("'", "'\"'\"'") + "'"
+        val argsFile  = "/data/local/tmp/fi_args"
+
+        // Clean up old files
+        Shell.cmd("rm -f '$argsFile' '$wrapperSh' 2>/dev/null; true").exec()
+
+        // Write one arg per line — single-quote each arg, escape inner single-quotes
+        for (arg in fridaArgs) {
+            val safe = arg.replace("'", "'\"'\"'")
+            Shell.cmd("printf '%s\\n' '$safe' >> '$argsFile'").exec()
         }
-        val shContent = "#!/bin/sh\nexec $escapedArgs\n"
-        val writeProc = ProcessBuilder("su", "-c", "cat > $wrapperSh && chmod 755 $wrapperSh")
-            .redirectErrorStream(true).start()
-        writeProc.outputStream.use { it.write(shContent.toByteArray(Charsets.UTF_8)) }
-        val writeExit = writeProc.waitFor()
-        if (writeExit != 0) {
-            promise.reject("RUN_ERROR", "Cannot write fi_run.sh (exit $writeExit)")
-            return
-        }
-        // Debug: show what was written
-        val verify = Shell.cmd("cat $wrapperSh 2>/dev/null").exec().out.joinToString(" | ")
-        emitScriptLog("▶ fi_run.sh: $verify")
+
+        // Write the wrapper script line by line
+        Shell.cmd("echo '#!/bin/sh'                         > '$wrapperSh'").exec()
+        Shell.cmd("echo 'set --'                            >> '$wrapperSh'").exec()
+        Shell.cmd("echo 'while IFS= read -r _a; do'        >> '$wrapperSh'").exec()
+        Shell.cmd("""echo '  set -- "\$@" "\$_a"'          >> '$wrapperSh'""").exec()
+        Shell.cmd("echo \"done < '$argsFile'\"              >> '$wrapperSh'").exec()
+        Shell.cmd("""echo 'exec "\$@"'                      >> '$wrapperSh'""").exec()
+        Shell.cmd("chmod 755 '$wrapperSh'").exec()
+
+        // Debug: show full script content and args
+        val verifyScript = Shell.cmd("cat '$wrapperSh' 2>/dev/null").exec().out.joinToString(" | ")
+        val verifyArgs   = Shell.cmd("cat '$argsFile'  2>/dev/null").exec().out.joinToString(" | ")
+        emitScriptLog("▶ sh: $verifyScript")
+        emitScriptLog("▶ args: $verifyArgs")
 
         val shellCmd = "$wrapperSh >'$outLog' 2>&1; echo \"EXIT:\$?\" >>'$outLog'"
         val pb = ProcessBuilder("su", "-c", shellCmd)
