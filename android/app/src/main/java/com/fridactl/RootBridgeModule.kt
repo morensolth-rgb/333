@@ -815,10 +815,9 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                         emitScriptLog("ℹ Spawn injects BEFORE app code runs — bypasses anti-tamper startup checks")
 
                         // --no-pause: resume app immediately after script loads
-                        // --eternalize: frida-inject detaches cleanly, script stays loaded in process
-                        // --runtime=qjs: QuickJS runtime — lighter, more compatible on locked-down devices
+                        // No --eternalize: keep frida-inject alive so hooks stay active and process stays resumed
                         fridaArgs = listOf(FRIDA_CLI_DEST, "-D", "local", "-f", packageName,
-                            "--script", scriptPath, "--no-pause", "--eternalize", "--runtime=qjs")
+                            "--script", scriptPath, "--no-pause")
                         modeLabel = "spawn (via server)"
                     }
                     "name" -> {
@@ -846,9 +845,9 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                             ?: packageName  // fallback to package name
                         emitScriptLog("⚙ Resolved process name: $procName (PID $cleanNamePid)")
                         // Use PID instead of name to avoid process name truncation issues (15-char limit)
-                        // --eternalize: frida-inject exits immediately but script stays loaded in process
+                        // No --eternalize: keep frida-inject alive so hooks stay active
                         fridaArgs = listOf(FRIDA_CLI_DEST, "-D", "local", "-p", cleanNamePid,
-                            "--script", scriptPath, "--eternalize")
+                            "--script", scriptPath)
                         targetPid = cleanNamePid
                         modeLabel = "name→PID $cleanNamePid ($procName)"
                     }
@@ -918,10 +917,9 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                             promise.reject("RUN_ERROR", "Invalid PID: '$pid'")
                             return@Thread
                         }
-                        // --eternalize: frida-inject detaches cleanly, script stays running inside process
-                        // This prevents ptrace-stop from freezing the game after inject exits
+                        // No --eternalize: keep frida-inject alive so process stays resumed and hooks active
                         fridaArgs = listOf(FRIDA_CLI_DEST, "-D", "local", "-p", cleanPid,
-                            "--script", scriptPath, "--eternalize")
+                            "--script", scriptPath)
                         targetPid = cleanPid
                         modeLabel = "PID $cleanPid (via server)"
                     }
@@ -1109,6 +1107,18 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
             RegexOption.IGNORE_CASE
         )
 
+        // ── Resolve promise after 3s — frida-inject stays alive (no --eternalize) ──
+        // We can't wait for exit since frida-inject runs until STOP is pressed.
+        // 3s gives Java.perform enough time to register hooks before we report success.
+        Thread {
+            Thread.sleep(3000)
+            if (!promiseResolved && proc.isAlive) {
+                promiseResolved = true
+                emitScriptLog("✅ Script running (frida-inject active)")
+                promise.resolve("running:inject")
+            }
+        }.start()
+
         // ── Stream outLog in real-time (stdout from frida-inject — console.log + send() output) ──
         Thread {
             try {
@@ -1122,6 +1132,22 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                             if (l.startsWith("EXIT:")) continue
                             if (noiseRx.containsMatchIn(l)) continue
                             emitScriptLog(l)
+                            // Resolve early if we get real output before 3s timer
+                            if (!promiseResolved) {
+                                val isFatal = l.lowercase().let { ll ->
+                                    ll.contains("unable to") || ll.contains("failed to") ||
+                                    ll.contains("permission denied") || ll.contains("no such process") ||
+                                    ll.contains("error:")
+                                }
+                                if (isFatal) {
+                                    promiseResolved = true
+                                    promise.reject("INJECT_ERROR", l)
+                                } else {
+                                    promiseResolved = true
+                                    emitScriptLog("✅ Script running (frida-inject active)")
+                                    promise.resolve("running:inject")
+                                }
+                            }
                         }
                     }
                 } catch (_: Exception) {}
@@ -1133,83 +1159,50 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
         // (when using script, errLog captures script's own stderr which is minimal)
 
         Thread {
-            // Drain the process stdout (mostly empty now since we redirect to files)
+            // Drain proc stdout (frida-inject output goes to outLog via redirect, not here)
             try { proc.inputStream.bufferedReader().readText() } catch (_: Exception) {}
 
             val exitCode = try { proc.waitFor() } catch (_: Exception) { -1 }
+            Thread.sleep(300)
 
-            // Give real-time streams a moment to flush
-            Thread.sleep(500)
-
-            // Now read the captured output files
-            val outLines = try { java.io.File(outLog).readLines() } catch (_: Exception) { emptyList() }
-            // errLog is not used separately — stderr merged into outLog via 2>&1
-            val noiseRegex = Regex(
-                "tcgetattr|isatty|not a tty|inappropriate ioctl|Script (started|done)|stty:",
-                RegexOption.IGNORE_CASE
-            )
-
-            // outLog contains both stdout + stderr (merged). Skip noise and EXIT: marker.
-            for (l in outLines) {
-                if (l.isBlank()) continue
-                if (l.startsWith("EXIT:")) continue
-                if (noiseRegex.containsMatchIn(l)) continue
-                emitScriptLog(l)
-                if (!promiseResolved) {
-                    val isFatal = l.lowercase().let { ll ->
-                        ll.contains("unable to") || ll.contains("failed to") ||
-                        ll.contains("permission denied") || ll.contains("access denied") ||
-                        ll.contains("no such process") || ll.contains("error:")
-                    }
-                    if (!isFatal) { promiseResolved = true; promise.resolve("running:inject") }
-                }
-            }
-
-            // Real exit code from the EXIT: line we appended
-            val realExit = outLines.lastOrNull { it.startsWith("EXIT:") }
-                ?.removePrefix("EXIT:")?.trim()?.toIntOrNull() ?: exitCode
+            val realExit = try {
+                java.io.File(outLog).readLines()
+                    .lastOrNull { it.startsWith("EXIT:") }
+                    ?.removePrefix("EXIT:")?.trim()?.toIntOrNull()
+            } catch (_: Exception) { null } ?: exitCode
 
             emitScriptLog("━━ exit: $realExit ━━")
 
-            // frida-server log
-            val fridaServerLog = "$filesDir/frida.log"
-            val srvLines = try { Shell.cmd("tail -5 '$fridaServerLog' 2>/dev/null").exec().out } catch (_: Exception) { emptyList() }
-            if (srvLines.isNotEmpty()) {
-                emitScriptLog("── frida-server log ──")
-                srvLines.forEach { emitScriptLog("  $it") }
+            // frida-server log on failure
+            if (realExit != 0) {
+                val fridaServerLog = "$filesDir/frida.log"
+                val srvLines = try { Shell.cmd("tail -5 '$fridaServerLog' 2>/dev/null").exec().out } catch (_: Exception) { emptyList() }
+                if (srvLines.isNotEmpty()) {
+                    emitScriptLog("── frida-server log ──")
+                    srvLines.forEach { emitScriptLog("  $it") }
+                }
             }
 
-            // Diagnosis hint for exit 4
-            if (realExit == 4) {
-                emitScriptLog("💡 exit 4 = attach rejected. Check:")
-                emitScriptLog("   • frida-server and frida-inject versions must match exactly")
-                emitScriptLog("   • Run: /data/local/tmp/frida-server --version")
-                emitScriptLog("   • Run: /data/local/tmp/frida-inject --version")
-                emitScriptLog("   • SELinux must be Permissive")
-                emitScriptLog("   • Try re-downloading both binaries from same release")
+            // Diagnosis hints
+            when (realExit) {
+                4 -> {
+                    emitScriptLog("💡 exit 4 = attach rejected. Check:")
+                    emitScriptLog("   • frida-server and frida-inject versions must match exactly")
+                    emitScriptLog("   • SELinux must be Permissive")
+                    emitScriptLog("   • Try re-downloading both binaries from same release")
+                }
             }
 
+            // If frida-inject exited before promise was resolved → it crashed/failed
             if (!promiseResolved) {
                 promiseResolved = true
-                val allEmpty = outLines.all { it.isBlank() || it.startsWith("EXIT:") || noiseRegex.containsMatchIn(it) }
-                // --eternalize: frida-inject exits 0 immediately after loading script into the process.
-                // This is NOT an error — the script is running inside the target. Treat exit 0 as success.
-                if (realExit == 0) {
-                    if (allEmpty) emitScriptLog("⚠ No output captured — check logcat for script activity")
-                    emitScriptLog("✅ Script injected and running (eternalized)")
-                    promise.resolve("running:inject")
-                } else {
-                    if (allEmpty) emitScriptLog("⚠ frida-inject produced no output (binary issue?)")
-                    val hint = when (realExit) {
-                        1    -> "exit 1 — wrong package name or binary version mismatch"
-                        4    -> "exit 4 — attach/spawn rejected (version mismatch or SELinux)"
-                        else -> "exit $realExit"
-                    }
-                    promise.reject("INJECT_ERROR", hint)
+                val hint = when (realExit) {
+                    0    -> "frida-inject exited unexpectedly (exit 0 without --eternalize)"
+                    1    -> "exit 1 — wrong package name or binary version mismatch"
+                    4    -> "exit 4 — attach/spawn rejected (version mismatch or SELinux)"
+                    else -> "exit $realExit — frida-inject failed"
                 }
-            } else {
-                if (realExit == 0) emitScriptLog("✅ Script injected and running (eternalized)")
-                else emitScriptLog("⚠ exit $realExit")
+                promise.reject("INJECT_ERROR", hint)
             }
 
             fridaScriptPid = null
