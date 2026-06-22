@@ -1043,8 +1043,8 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
         fridaScriptPid = null
 
         val filesDir  = reactApplicationContext.filesDir.absolutePath
-        val outLog    = "$filesDir/fi_out.log"
-        val errLog    = "$filesDir/fi_err.log"
+        val outLog    = "/data/local/tmp/fi_out.log"   // writable by root shell (redirect runs as root)
+        val errLog    = "/data/local/tmp/fi_err.log"
 
         Shell.cmd("rm -f '$outLog' '$errLog' 2>/dev/null; true").exec()
 
@@ -1147,12 +1147,21 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
             Thread.sleep(300)
 
             val realExit = try {
-                java.io.File(outLog).readLines()
-                    .lastOrNull { it.startsWith("EXIT:") }
+                Shell.cmd("grep '^EXIT:' '$outLog' 2>/dev/null | tail -1").exec().out
+                    .firstOrNull()
                     ?.removePrefix("EXIT:")?.trim()?.toIntOrNull()
             } catch (_: Exception) { null } ?: exitCode
 
             emitScriptLog("━━ exit: $realExit ━━")
+
+            // Always dump outLog content for diagnosis
+            val outLines = try { Shell.cmd("cat '$outLog' 2>/dev/null").exec().out } catch (_: Exception) { emptyList() }
+            if (outLines.isNotEmpty()) {
+                emitScriptLog("── inject output ──")
+                outLines.filter { !it.startsWith("EXIT:") }.forEach { emitScriptLog("  $it") }
+            } else {
+                emitScriptLog("⚠ inject output log is empty — redirect may have failed")
+            }
 
             // frida-server log on failure
             if (realExit != 0) {
