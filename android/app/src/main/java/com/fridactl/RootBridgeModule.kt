@@ -1062,40 +1062,17 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
         // as root, and pass args directly without any extra quoting layer.
         emitScriptLog("🖥 Direct capture (no PTY — tcgetattr warning is normal)")
 
-        // Write fi_run.sh via Shell.cmd (libsu — already root, no stdin inheritance issues).
-        // Each arg is written as one line to fi_args, then a wrapper reads them into "$@".
-        // This completely avoids all shell quoting collisions and ProcessBuilder stdin failures.
-        val wrapperSh = "/data/local/tmp/fi_run.sh"
-        val argsFile  = "/data/local/tmp/fi_args"
-
-        // Clean up old files
-        Shell.cmd("rm -f '$argsFile' '$wrapperSh' 2>/dev/null; true").exec()
-
-        // Write one arg per line — single-quote each arg, escape inner single-quotes
-        for (arg in fridaArgs) {
-            val safe = arg.replace("'", "'\"'\"'")
-            Shell.cmd("printf '%s\\n' '$safe' >> '$argsFile'").exec()
+        // Build shell command directly from fridaArgs — no wrapper script needed.
+        // Shell.cmd() (libsu) runs as root. We quote each arg with single-quotes.
+        val quotedArgs = fridaArgs.joinToString(" ") { arg ->
+            "'" + arg.replace("'", "'"'"'") + "'"
         }
-
-        // Write the wrapper script line by line
-        // Write wrapper script via base64 to avoid all shell/Kotlin quoting issues with $@ and $_a
-        val b64Script = "IyEvYmluL3NoCnNldCAtLQp3aGlsZSBJRlM9IHJlYWQgLXIgX2E7IGRvCiAgc2V0IC0tICIkQCIgIiRfYSIKZG9uZSA8IC9kYXRhL2xvY2FsL3RtcC9maV9hcmdzCmV4ZWMgIiRAIgo="
-        Shell.cmd("echo '$b64Script' | base64 -d > '$wrapperSh'").exec()
-        Shell.cmd("chmod 755 '$wrapperSh'").exec()
-
-        // Debug: show full script content and args
-        val verifyScript = Shell.cmd("cat '$wrapperSh' 2>/dev/null").exec().out.joinToString(" | ")
-        val verifyArgs   = Shell.cmd("cat '$argsFile'  2>/dev/null").exec().out.joinToString(" | ")
-        emitScriptLog("▶ sh: $verifyScript")
-        emitScriptLog("▶ args: $verifyArgs")
-
-        val shellCmd = "$wrapperSh >'$outLog' 2>&1; echo \"EXIT:\$?\" >>'$outLog'"
-        val pb = ProcessBuilder("su", "-c", shellCmd)
-        pb.redirectErrorStream(true)
+        val shellCmd = "$quotedArgs > '$outLog' 2>&1; echo \"EXIT:\$?\" >> '$outLog'"
+        emitScriptLog("▶ cmd: $quotedArgs")
 
         val proc: Process
         try {
-            proc = pb.start()
+            proc = ProcessBuilder("su", "-c", shellCmd).redirectErrorStream(true).start()
         } catch (e: Exception) {
             promise.reject("RUN_ERROR", "Cannot start process: ${e.message}")
             return
