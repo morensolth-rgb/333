@@ -1,6 +1,7 @@
 apply plugin: "com.android.application"
 apply plugin: "org.jetbrains.kotlin.android"
 apply plugin: "com.facebook.react"
+apply plugin: "com.chaquo.python"
 
 react {}
 
@@ -20,6 +21,16 @@ android {
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 1
         versionName "1.0"
+
+        python {
+            // Python 3.11 — matches frida-tools requirement
+            version "3.11"
+            pip {
+                install "frida==16.5.9"
+            }
+            // arm64-v8a only — matches frida-server arch
+            abiFilters "arm64-v8a"
+        }
     }
 
     signingConfigs {

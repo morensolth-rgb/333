@@ -25,6 +25,8 @@ import java.io.OutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import org.apache.commons.compress.compressors.xz.XZCompressorInputStream
+import com.chaquo.python.Python
+import com.chaquo.python.android.AndroidPlatform
 
 class RootBridgeModule(reactContext: ReactApplicationContext) :
     ReactContextBaseJavaModule(reactContext) {
@@ -636,7 +638,10 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
         Thread {
             fridaScriptPid = null
 
-            // Kill frida-inject process
+            // Stop Python frida runner (delete sentinel file → Python loop exits)
+            Shell.cmd("rm -f '/data/local/tmp/fi_out.log.run' 2>/dev/null; true").exec()
+
+            // Kill frida-inject process (legacy / fallback)
             fridaProcess?.let { p ->
                 try {
                     p.outputStream?.let { os ->
@@ -1058,110 +1063,71 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
     // targetPid: PID of the target process, used for SIGCONT after inject exits (null for spawn).
     // packageName: target app package, used to find spawned PID if targetPid is null.
     private fun runFridaProcess(fridaArgs: List<String>, targetPid: String?, packageName: String, promise: Promise) {
+        // ── Chaquopy / frida Python approach ─────────────────────────────────
+        // No frida-inject CLI. We use the frida Python library directly via
+        // Chaquopy embedded Python runtime. Zero shell quoting issues.
         fridaProcess?.destroy()
         fridaProcess = null
         fridaScriptPid = null
 
-        val filesDir  = reactApplicationContext.filesDir.absolutePath
-        val outLog    = "/data/local/tmp/fi_out.log"   // writable by root shell (redirect runs as root)
-        val errLog    = "/data/local/tmp/fi_err.log"
+        val outLog   = "/data/local/tmp/fi_out.log"
+        val sentinel = "/data/local/tmp/fi_out.log.run"
+        Shell.cmd("rm -f '$outLog' '$sentinel' 2>/dev/null; true").exec()
 
-        Shell.cmd("rm -f '$outLog' '$errLog' 2>/dev/null; true").exec()
+        // Extract scriptPath and pid from fridaArgs for Python call
+        val scriptIdx = fridaArgs.indexOf("--script")
+        val scriptPath = if (scriptIdx >= 0) fridaArgs.getOrNull(scriptIdx + 1) else null
+        val pidIdx = fridaArgs.indexOf("-p")
+        val pidStr = if (pidIdx >= 0) fridaArgs.getOrNull(pidIdx + 1) else targetPid
 
-        // Launch frida-inject directly via ProcessBuilder — no shell, no quoting, no .sh file.
-        // su -c is NOT used here because it invokes a shell which re-parses the command string.
-        // Instead: su runs the binary directly with explicit args via exec form.
-        // ProcessBuilder("su", "--", "/data/local/tmp/frida-inject", "-D", "local", ...) passes
-        // args verbatim to the kernel execve() syscall — zero quoting issues possible.
-        //
-        // stdout+stderr redirected to outLog via a minimal sh -c wrapper ONLY for the redirect,
-        // with each arg passed via "$@" (no re-parsing):
-        //   su -- sh -c 'exec "$@" >"$1_out" 2>&1' _ arg0 arg1 arg2 ...  ← complex
-        //
-        // Simplest reliable approach on Android: use Shell (Magisk/libsu) which already runs
-        // as root, and pass args directly without any extra quoting layer.
-        emitScriptLog("🖥 Direct capture (no PTY — tcgetattr warning is normal)")
-
-        // Build shell command directly from fridaArgs — no wrapper script needed.
-        // Shell.cmd() (libsu) runs as root. We quote each arg with single-quotes.
-        val quotedArgs = fridaArgs.joinToString(" ") { arg ->
-            "'" + arg.replace("'", "'\\''") + "'"
+        if (scriptPath == null) {
+            promise.reject("RUN_ERROR", "No --script path found in fridaArgs")
+            return
         }
-        val shellCmd = "$quotedArgs > '$outLog' 2>&1; echo \"EXIT:\$?\" >> '$outLog'"
-        emitScriptLog("▶ cmd: $quotedArgs")
-
-        val proc: Process
-        try {
-            proc = ProcessBuilder("su", "-c", shellCmd).redirectErrorStream(true).start()
-        } catch (e: Exception) {
-            promise.reject("RUN_ERROR", "Cannot start process: ${e.message}")
+        if (pidStr == null) {
+            promise.reject("RUN_ERROR", "No PID found in fridaArgs")
+            return
+        }
+        val pid = pidStr.toIntOrNull() ?: run {
+            promise.reject("RUN_ERROR", "Invalid PID: $pidStr")
             return
         }
 
-        fridaProcess   = proc
-        fridaScriptPid = "running"
+        emitScriptLog("🐍 Using Chaquopy frida (no CLI)")
+        emitScriptLog("▶ attach PID=$pid  script=$scriptPath")
 
-        // ── Watchdog: keep sending SIGCONT to target PID every 500ms ──────────
-        // frida attach puts process in ptrace-stop; if inject fails or exits early
-        // the process stays frozen forever. This watchdog ensures it always resumes.
-        if (targetPid != null) {
-            val watchPid = targetPid
-            Thread {
-                for (i in 0 until 20) {   // 10s total, every 500ms
-                    Thread.sleep(500)
-                    if (fridaScriptPid == null) break   // stopped by user
-                    try { Shell.cmd("kill -CONT $watchPid 2>/dev/null; true").exec() } catch (_: Exception) {}
-                }
-            }.start()
-        }
-
+        // ── Start log tail thread (reads outLog in real-time) ─────────────────
+        val noiseRx = Regex("tcgetattr|isatty|not a tty|Script (started|done)", RegexOption.IGNORE_CASE)
         var promiseResolved = false
 
-        val noiseRx = Regex(
-            "tcgetattr|isatty|not a tty|inappropriate ioctl|Script (started|done)|stty:",
-            RegexOption.IGNORE_CASE
-        )
-
-        // ── Resolve promise after 3s — frida-inject stays alive (no --eternalize) ──
-        // We can't wait for exit since frida-inject runs until STOP is pressed.
-        // 3s gives Java.perform enough time to register hooks before we report success.
+        // ── Watchdog SIGCONT — prevent ptrace freeze ──────────────────────────
         Thread {
-            Thread.sleep(3000)
-            if (!promiseResolved && proc.isAlive) {
-                promiseResolved = true
-                emitScriptLog("✅ Script running (frida-inject active)")
-                promise.resolve("running:inject")
+            for (i in 0 until 20) {
+                Thread.sleep(500)
+                if (fridaScriptPid == null) break
+                try { Shell.cmd("kill -CONT $pid 2>/dev/null; true").exec() } catch (_: Exception) {}
             }
         }.start()
 
-        // ── Stream outLog in real-time (stdout from frida-inject — console.log + send() output) ──
+        // ── Tail outLog ───────────────────────────────────────────────────────
         Thread {
             try {
                 val tailProc = ProcessBuilder("su", "-c", "tail -f '$outLog' 2>/dev/null")
                     .redirectErrorStream(true).start()
                 try {
                     tailProc.inputStream.bufferedReader().use { r ->
-                        while (fridaScriptPid != null || proc.isAlive) {
-                            val l = r.readLine() ?: break
-                            if (l.isBlank()) continue
-                            if (l.startsWith("EXIT:")) continue
-                            if (noiseRx.containsMatchIn(l)) continue
-                            emitScriptLog(l)
-                            // Resolve early if we get real output before 3s timer
+                        while (fridaScriptPid != null) {
+                            val line = r.readLine() ?: break
+                            if (line.isBlank() || noiseRx.containsMatchIn(line)) continue
+                            emitScriptLog(line)
                             if (!promiseResolved) {
-                                val isFatal = l.lowercase().let { ll ->
-                                    ll.contains("unable to") || ll.contains("failed to") ||
-                                    ll.contains("permission denied") || ll.contains("no such process") ||
-                                    ll.contains("error:")
+                                val fatal = line.lowercase().let { ll ->
+                                    ll.contains("error") || ll.contains("not running") ||
+                                    ll.contains("not found") || ll.contains("permission denied")
                                 }
-                                if (isFatal) {
-                                    promiseResolved = true
-                                    promise.reject("INJECT_ERROR", l)
-                                } else {
-                                    promiseResolved = true
-                                    emitScriptLog("✅ Script running (frida-inject active)")
-                                    promise.resolve("running:inject")
-                                }
+                                promiseResolved = true
+                                if (fatal) promise.reject("INJECT_ERROR", line)
+                                else { emitScriptLog("✅ Script running (frida Python)"); promise.resolve("running:python") }
                             }
                         }
                     }
@@ -1170,113 +1136,66 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
             } catch (_: Exception) {}
         }.start()
 
-        // errLog not streamed separately — stderr is merged into outLog via 2>&1
-        // (when using script, errLog captures script's own stderr which is minimal)
-
+        // ── Resolve promise after 4s if no output yet ─────────────────────────
         Thread {
-            // Drain proc stdout (frida-inject output goes to outLog via redirect, not here)
-            try { proc.inputStream.bufferedReader().readText() } catch (_: Exception) {}
-
-            val exitCode = try { proc.waitFor() } catch (_: Exception) { -1 }
-            Thread.sleep(300)
-
-            val realExit = try {
-                Shell.cmd("grep '^EXIT:' '$outLog' 2>/dev/null | tail -1").exec().out
-                    .firstOrNull()
-                    ?.removePrefix("EXIT:")?.trim()?.toIntOrNull()
-            } catch (_: Exception) { null } ?: exitCode
-
-            emitScriptLog("━━ exit: $realExit ━━")
-
-            // Always dump outLog content for diagnosis
-            val outLines = try { Shell.cmd("cat '$outLog' 2>/dev/null").exec().out } catch (_: Exception) { emptyList() }
-            if (outLines.isNotEmpty()) {
-                emitScriptLog("── inject output ──")
-                outLines.filter { !it.startsWith("EXIT:") }.forEach { emitScriptLog("  $it") }
-            } else {
-                emitScriptLog("⚠ inject output log is empty — redirect may have failed")
-            }
-
-            // frida-server log on failure
-            if (realExit != 0) {
-                val fridaServerLog = "$filesDir/frida.log"
-                val srvLines = try { Shell.cmd("tail -5 '$fridaServerLog' 2>/dev/null").exec().out } catch (_: Exception) { emptyList() }
-                if (srvLines.isNotEmpty()) {
-                    emitScriptLog("── frida-server log ──")
-                    srvLines.forEach { emitScriptLog("  $it") }
-                }
-            }
-
-            // Diagnosis hints
-            when (realExit) {
-                4 -> {
-                    emitScriptLog("💡 exit 4 = attach rejected. Check:")
-                    emitScriptLog("   • frida-server and frida-inject versions must match exactly")
-                    emitScriptLog("   • SELinux must be Permissive")
-                    emitScriptLog("   • Try re-downloading both binaries from same release")
-                }
-            }
-
-            // If frida-inject exited before promise was resolved → it crashed/failed
+            Thread.sleep(4000)
             if (!promiseResolved) {
                 promiseResolved = true
-                val hint = when (realExit) {
-                    0    -> "frida-inject exited unexpectedly (exit 0 without --eternalize)"
-                    1    -> "exit 1 — wrong package name or binary version mismatch"
-                    4    -> "exit 4 — attach/spawn rejected (version mismatch or SELinux)"
-                    else -> "exit $realExit — frida-inject failed"
-                }
-                promise.reject("INJECT_ERROR", hint)
+                emitScriptLog("✅ Script running (frida Python)")
+                promise.resolve("running:python")
             }
-
-            fridaScriptPid = null
-            fridaProcess   = null
-
-            // ── CRITICAL: Resume any frozen spawned/attached process ───────────
-            // After frida-inject exits, the target process may be in ptrace-stop state.
-            // Send SIGCONT to the specific target PID passed in (not broadcast kill -CONT -1).
-            if (targetPid != null) {
-                try { Shell.cmd("kill -CONT $targetPid 2>/dev/null; true").exec() } catch (_: Exception) {}
-                try { Shell.cmd("kill -CONT -$targetPid 2>/dev/null; true").exec() } catch (_: Exception) {}
-                emitScriptLog("⚙ Released ptrace-stop on PID $targetPid")
-            } else {
-                // Spawn mode: PID not known ahead of time — find newly launched process and resume
-                val spawnedPid = Shell.cmd("pidof '$packageName' 2>/dev/null | tr ' ' '\\n' | head -1")
-                    .exec().out.firstOrNull()?.trim()
-                if (!spawnedPid.isNullOrBlank()) {
-                    try { Shell.cmd("kill -CONT $spawnedPid 2>/dev/null; true").exec() } catch (_: Exception) {}
-                    try { Shell.cmd("kill -CONT -$spawnedPid 2>/dev/null; true").exec() } catch (_: Exception) {}
-                    emitScriptLog("⚙ Released ptrace-stop on spawned PID $spawnedPid")
-                }
-            }
-
-            // ── Kill frida-server after inject finishes ────────────────────────
-            // frida-server intercepts ALL process spawns system-wide via ptrace.
-            // Leaving it running causes any app launched AFTER inject to freeze on startup.
-            // Fix: kill it as soon as frida-inject exits — it's no longer needed.
-            Shell.cmd("pkill -f frida-server 2>/dev/null; true").exec()
-            emitScriptLog("⚙ frida-server stopped")
-            Thread.sleep(300)
-
-            // ── Restore SELinux AFTER killing frida-server ─────────────────────
-            if (selinuxWasEnforcing) {
-                Shell.cmd("setenforce 1 2>/dev/null; true").exec()
-                selinuxWasEnforcing = false
-                emitScriptLog("🔒 SELinux restored to Enforcing")
-            }
-            // NOTE: do NOT destroy logcatProc here — injected script inside game is still logging
         }.start()
 
-        // ── Safety timeout: 10s ───────────────────────────────────────────────
+        // ── Run frida Python in background thread ─────────────────────────────
+        val filesDir = reactApplicationContext.filesDir.absolutePath
+        fridaScriptPid = "running"
+
         Thread {
-            Thread.sleep(10000)
-            if (!promiseResolved) {
-                promiseResolved = true
-                if (fridaProcess != null) {
-                    emitScriptLog("✅ Script presumed running (timeout reached, process alive)")
-                    promise.resolve("running:timeout")
-                } else {
-                    promise.reject("INJECT_ERROR", "frida-inject did not respond within 10 seconds")
+            try {
+                if (!Python.isStarted()) {
+                    Python.start(AndroidPlatform(reactApplicationContext))
+                }
+                val py = Python.getInstance()
+                val runner = py.getModule("frida_runner")
+                val result = runner.callAttr("run",
+                    "127.0.0.1", FRIDA_PORT, pid, scriptPath, outLog
+                ).toInt()
+
+                emitScriptLog("━━ frida Python exit: $result ━━")
+
+                // Dump any remaining log
+                val lines = try { Shell.cmd("cat '$outLog' 2>/dev/null").exec().out } catch (_: Exception) { emptyList() }
+                lines.filter { !it.startsWith("EXIT:") && it.isNotBlank() }.forEach { emitScriptLog("  $it") }
+
+                if (!promiseResolved) {
+                    promiseResolved = true
+                    if (result == 0) promise.resolve("running:python")
+                    else promise.reject("INJECT_ERROR", "frida Python exit $result — check log")
+                }
+            } catch (e: Exception) {
+                emitScriptLog("❌ Chaquopy error: ${e.message}")
+                if (!promiseResolved) {
+                    promiseResolved = true
+                    promise.reject("INJECT_ERROR", "Chaquopy: ${e.message}")
+                }
+            } finally {
+                // Cleanup sentinel so Python loop exits
+                Shell.cmd("rm -f '$sentinel' 2>/dev/null; true").exec()
+                fridaScriptPid = null
+                fridaProcess   = null
+
+                // Resume process
+                try { Shell.cmd("kill -CONT $pid 2>/dev/null; true").exec() } catch (_: Exception) {}
+
+                // Kill frida-server
+                Shell.cmd("pkill -f frida-server 2>/dev/null; true").exec()
+                emitScriptLog("⚙ frida-server stopped")
+
+                // Restore SELinux
+                if (selinuxWasEnforcing) {
+                    Shell.cmd("setenforce 1 2>/dev/null; true").exec()
+                    selinuxWasEnforcing = false
+                    emitScriptLog("🔒 SELinux restored")
                 }
             }
         }.start()
