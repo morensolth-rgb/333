@@ -784,8 +784,11 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                 //
                 // All modes go through frida-server for reliability
                 //
-                val cmd: String
+                // fridaArgs: raw arg list passed directly to ProcessBuilder — NO shell, NO quoting issues.
+                // Spaces/special chars in paths/package names are handled safely by the JVM process API.
+                val fridaArgs: List<String>
                 val modeLabel: String
+                var targetPid: String? = null   // PID of the target process (for SIGCONT after inject)
 
                 when (mode) {
                     "spawn" -> {
@@ -811,11 +814,11 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                         emitScriptLog("🔄 Force-stopped $packageName — spawning with frida...")
                         emitScriptLog("ℹ Spawn injects BEFORE app code runs — bypasses anti-tamper startup checks")
 
-                        // frida-inject -D local -f <pkg> --no-pause
-                        // --no-pause: resume app immediately after script loads (don't keep paused)
-                        // WITHOUT --no-pause: app stays paused forever if frida-inject dies → freeze bug
+                        // --no-pause: resume app immediately after script loads
+                        // --eternalize: frida-inject detaches cleanly, script stays loaded in process
                         // --runtime=qjs: QuickJS runtime — lighter, more compatible on locked-down devices
-                        cmd = "$FRIDA_CLI_DEST -D local -f '$packageName' --script '$scriptPath' --no-pause --runtime=qjs"
+                        fridaArgs = listOf(FRIDA_CLI_DEST, "-D", "local", "-f", packageName,
+                            "--script", scriptPath, "--no-pause", "--eternalize", "--runtime=qjs")
                         modeLabel = "spawn (via server)"
                     }
                     "name" -> {
@@ -841,11 +844,12 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                             "cat /proc/$cleanNamePid/cmdline 2>/dev/null | tr '\\0' '\\n' | head -1"
                         ).exec().out.firstOrNull()?.trim()?.ifBlank { null }
                             ?: packageName  // fallback to package name
-                        emitScriptLog("⚙ Resolved process name: '$procName' (PID $cleanNamePid)")
+                        emitScriptLog("⚙ Resolved process name: $procName (PID $cleanNamePid)")
                         // Use PID instead of name to avoid process name truncation issues (15-char limit)
-                        // frida-inject -n can fail if process name > 15 chars (kernel truncates comm)
                         // --eternalize: frida-inject exits immediately but script stays loaded in process
-                        cmd = "$FRIDA_CLI_DEST -D local -p $cleanNamePid --script '$scriptPath' --eternalize"
+                        fridaArgs = listOf(FRIDA_CLI_DEST, "-D", "local", "-p", cleanNamePid,
+                            "--script", scriptPath, "--eternalize")
+                        targetPid = cleanNamePid
                         modeLabel = "name→PID $cleanNamePid ($procName)"
                     }
                     else -> {   // pid
@@ -916,22 +920,27 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
                         }
                         // --eternalize: frida-inject detaches cleanly, script stays running inside process
                         // This prevents ptrace-stop from freezing the game after inject exits
-                        cmd = "$FRIDA_CLI_DEST -D local -p $cleanPid --script '$scriptPath' --eternalize"
+                        fridaArgs = listOf(FRIDA_CLI_DEST, "-D", "local", "-p", cleanPid,
+                            "--script", scriptPath, "--eternalize")
+                        targetPid = cleanPid
                         modeLabel = "PID $cleanPid (via server)"
                     }
                 }
 
+                // Build display string for logs (args joined, no quotes needed for display)
+                val cmdDisplay = fridaArgs.joinToString(" ")
                 emitScriptLog("🚀 frida-inject $modeLabel...")
-                emitScriptLog("▶ $cmd")
+                emitScriptLog("▶ $cmdDisplay")
 
-                // Extract PID from cmd for logcat --pid filter (improves output on some devices)
-                val logcatPid = Regex("""-p\s+(\d+)""").find(cmd)?.groupValues?.get(1)?.toIntOrNull()
+                // Extract PID from fridaArgs for logcat --pid filter
+                val logcatPid = targetPid?.toIntOrNull()
+                    ?: fridaArgs.indexOf("-p").takeIf { it >= 0 }?.let { fridaArgs.getOrNull(it + 1)?.toIntOrNull() }
 
                 // ── 4. Start logcat BEFORE frida-inject so no output is missed ──
                 startPersistentLogcat(logcatPid)
 
                 // ── 5. Launch frida-inject ────────────────────────────────────
-                runFridaProcess(cmd, promise)
+                runFridaProcess(fridaArgs, targetPid, packageName, promise)
 
             } catch (e: Exception) {
                 promise.reject("RUN_ERROR", e.message)
@@ -1019,8 +1028,14 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
         }.also { it.isDaemon = true }.start()
     }
 
+    // Shell-quote a string for safe embedding inside single-quoted shell argument
+    private fun shellQuote(s: String): String = "'" + s.replace("'", "'\"'\"'") + "'"
+
     // Runs the frida-inject command as a root Process, streams all output → FridaScriptLog
-    private fun runFridaProcess(cmd: String, promise: Promise) {
+    // fridaArgs: raw arg list — no quoting needed; written to a sh script in /data/local/tmp.
+    // targetPid: PID of the target process, used for SIGCONT after inject exits (null for spawn).
+    // packageName: target app package, used to find spawned PID if targetPid is null.
+    private fun runFridaProcess(fridaArgs: List<String>, targetPid: String?, packageName: String, promise: Promise) {
         fridaProcess?.destroy()
         fridaProcess = null
         fridaScriptPid = null
@@ -1029,47 +1044,31 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
         val outLog    = "$filesDir/fi_out.log"
         val errLog    = "$filesDir/fi_err.log"
 
-        // frida-inject needs a TTY — piping stdout/stderr to a file breaks tcgetattr → EXIT:4
-        // Confirmed fix: setsid WITHOUT stdout/stderr redirect works (tested manually)
-        // We redirect stdin from /dev/null + capture stderr only for error diagnosis
-        // Real frida script output (console.log) goes through logcat automatically
         Shell.cmd("rm -f '$outLog' '$errLog' 2>/dev/null; true").exec()
 
-        // frida-inject writes console.log to stdout (piped mode) or PTY slave (TTY mode).
-        // setsid </dev/ptmx redirects stdin from PTY master — stdout still goes to the file correctly
-        // ONLY when the slave fd is open. Without a slave, frida detects no TTY and writes to stdout→file.
-        //
-        // CONFIRMED WORKING STRATEGY:
-        //   Run frida-inject with stdout+stderr redirected to files — no PTY wrapper.
-        //   frida-inject will print "tcgetattr: Inappropriate ioctl" to stderr (we filter it).
-        //   console.log output goes to stdout → outLog. This is the most reliable cross-device approach.
-        //
-        //   If 'script' is available, use it — it gives frida a real PTY and captures everything.
-        val hasScript = Shell.cmd("which script 2>/dev/null").exec().out.firstOrNull()?.trim()?.isNotBlank() == true
-
-        // Write cmd to a temp shell script to avoid quote-collision inside 'script -c ...'
-        // e.g. cmd contains --script '/path/to/file.js' — embedding it directly in 'script -c '...' '
-        // would break: the inner single quotes terminate the outer ones early.
-        // Fix: write cmd to a real .sh file using a FileWriter (no shell quoting involved).
-        val wrapperSh = "$filesDir/fi_run.sh"
-        try {
-            java.io.FileWriter(wrapperSh).use { it.write("#!/bin/sh\n$cmd\n") }
-            Shell.cmd("chmod 755 '$wrapperSh'").exec()
-        } catch (e: Exception) {
-            promise.reject("RUN_ERROR", "Cannot write wrapper script: ${e.message}")
+        // Write frida-inject args to /data/local/tmp/fi_run.sh — executable filesystem.
+        // Each arg is single-quote-escaped so the generated shell line is safe even if
+        // paths contain spaces or special characters (package names rarely do, but scriptPath might).
+        // /data/local/tmp is always noexec=false on Android (unlike app filesDir which varies).
+        val wrapperSh = "/data/local/tmp/fi_run.sh"
+        val escapedArgs = fridaArgs.joinToString(" ") { arg ->
+            "'" + arg.replace("'", "'\"'\"'") + "'"
+        }
+        // Write line by line using Shell.cmd to avoid any printf/heredoc quoting complexity
+        // Build the full shell command as a Kotlin string — escapedArgs already contains properly
+        // single-quoted args, so embedding in double-quoted printf is safe (no $ or ` in paths).
+        val writeResult = Shell.cmd(
+            """printf "#!/bin/sh\nexec $escapedArgs\n" > '$wrapperSh' && chmod 755 '$wrapperSh'"""
+        ).exec()
+        if (!writeResult.isSuccess) {
+            promise.reject("RUN_ERROR", "Cannot write /data/local/tmp/fi_run.sh — check storage")
             return
         }
 
-        val wrapper = if (hasScript) {
-            emitScriptLog("🖥 PTY capture via script")
-            // Execute via shell script file — no inline quoting issues
-            "script -q -c '$wrapperSh' /dev/null >'$outLog' 2>'$errLog'; echo \"EXIT:\$?\" >>'$outLog'"
-        } else {
-            emitScriptLog("🖥 Direct capture (no PTY — tcgetattr warning is normal)")
-            "$wrapperSh >'$outLog' 2>&1; echo \"EXIT:\$?\" >>'$outLog'"
-        }
-
-        val pb = ProcessBuilder("su", "-c", wrapper)
+        emitScriptLog("🖥 Direct capture (no PTY — tcgetattr warning is normal)")
+        // Execute wrapper, redirect output to log files
+        val shellCmd = "$wrapperSh >'$outLog' 2>&1; echo \"EXIT:\$?\" >>'$outLog'"
+        val pb = ProcessBuilder("su", "-c", shellCmd)
         pb.redirectErrorStream(true)
 
         val proc: Process
@@ -1197,19 +1196,21 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
             fridaProcess   = null
 
             // ── CRITICAL: Resume any frozen spawned/attached process ───────────
-            // If frida-inject exits (error or crash) while in spawn/attach mode, the target
-            // process may remain paused in ptrace state — game appears frozen.
-            // Fix: send SIGCONT ONLY to the specific target PID extracted from cmd.
-            // NEVER use kill -CONT -1 (broadcasts to ALL processes — breaks system services).
-            val targetPidForCont = Regex("""-p\s+(\d+)""").find(cmd)?.groupValues?.get(1)
-            if (targetPidForCont != null) {
-                // SIGCONT to the target PID and its entire process group
-                try { Shell.cmd("kill -CONT $targetPidForCont 2>/dev/null; true").exec() } catch (_: Exception) {}
-                // Also unfreeze any threads in the same process group
-                try { Shell.cmd("kill -CONT -$targetPidForCont 2>/dev/null; true").exec() } catch (_: Exception) {}
-                emitScriptLog("⚙ Released ptrace-stop on PID $targetPidForCont")
+            // After frida-inject exits, the target process may be in ptrace-stop state.
+            // Send SIGCONT to the specific target PID passed in (not broadcast kill -CONT -1).
+            if (targetPid != null) {
+                try { Shell.cmd("kill -CONT $targetPid 2>/dev/null; true").exec() } catch (_: Exception) {}
+                try { Shell.cmd("kill -CONT -$targetPid 2>/dev/null; true").exec() } catch (_: Exception) {}
+                emitScriptLog("⚙ Released ptrace-stop on PID $targetPid")
             } else {
-                emitScriptLog("⚙ No target PID found in cmd — skipping SIGCONT")
+                // Spawn mode: PID not known ahead of time — find newly launched process and resume
+                val spawnedPid = Shell.cmd("pidof '$packageName' 2>/dev/null | tr ' ' '\\n' | head -1")
+                    .exec().out.firstOrNull()?.trim()
+                if (!spawnedPid.isNullOrBlank()) {
+                    try { Shell.cmd("kill -CONT $spawnedPid 2>/dev/null; true").exec() } catch (_: Exception) {}
+                    try { Shell.cmd("kill -CONT -$spawnedPid 2>/dev/null; true").exec() } catch (_: Exception) {}
+                    emitScriptLog("⚙ Released ptrace-stop on spawned PID $spawnedPid")
+                }
             }
 
             // ── Kill frida-server after inject finishes ────────────────────────
