@@ -1076,12 +1076,9 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
         }
 
         // Write the wrapper script line by line
-        Shell.cmd("echo '#!/bin/sh'                         > '$wrapperSh'").exec()
-        Shell.cmd("echo 'set --'                            >> '$wrapperSh'").exec()
-        Shell.cmd("echo 'while IFS= read -r _a; do'        >> '$wrapperSh'").exec()
-        Shell.cmd("""echo '  set -- "\$@" "\$_a"'          >> '$wrapperSh'""").exec()
-        Shell.cmd("echo \"done < '$argsFile'\"              >> '$wrapperSh'").exec()
-        Shell.cmd("""echo 'exec "\$@"'                      >> '$wrapperSh'""").exec()
+        // Write wrapper script via base64 to avoid all shell/Kotlin quoting issues with $@ and $_a
+        val b64Script = "IyEvYmluL3NoCnNldCAtLQp3aGlsZSBJRlM9IHJlYWQgLXIgX2E7IGRvCiAgc2V0IC0tICIkQCIgIiRfYSIKZG9uZSA8IC9kYXRhL2xvY2FsL3RtcC9maV9hcmdzCmV4ZWMgIiRAIgo="
+        Shell.cmd("printf '%s' '$b64Script' | base64 -d > '$wrapperSh'").exec()
         Shell.cmd("chmod 755 '$wrapperSh'").exec()
 
         // Debug: show full script content and args
