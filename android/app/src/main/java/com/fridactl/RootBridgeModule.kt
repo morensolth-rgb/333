@@ -1065,7 +1065,7 @@ class RootBridgeModule(reactContext: ReactApplicationContext) :
         // Build shell command directly from fridaArgs — no wrapper script needed.
         // Shell.cmd() (libsu) runs as root. We quote each arg with single-quotes.
         val quotedArgs = fridaArgs.joinToString(" ") { arg ->
-            "'" + arg.replace("'", "'"'"'") + "'"
+            "'" + arg.replace("'", "'\\''") + "'"
         }
         val shellCmd = "$quotedArgs > '$outLog' 2>&1; echo \"EXIT:\$?\" >> '$outLog'"
         emitScriptLog("▶ cmd: $quotedArgs")
