@@ -58,7 +58,6 @@ export default function AppsScreen({navigation}: {navigation: any}) {
   const [loading, setLoading] = useState(false);
   const [selected, setSelected] = useState<string>('');
   const [filter, setFilter] = useState<FilterMode>('user');
-  const [sdkMap, setSdkMap] = useState<Record<string, string>>({});
 
   useEffect(() => {
     loadSelected();
@@ -99,27 +98,19 @@ export default function AppsScreen({navigation}: {navigation: any}) {
 
   const loadApps = async () => {
     setLoading(true);
-    setSdkMap({});
     try {
       const list = await rootBridge.getInstalledApps();
       setApps(list);
-      loadSdkLabels();
     } catch (e: any) {
       console.error('getInstalledApps error:', e);
     }
     setLoading(false);
   };
 
-  const loadSdkLabels = async () => {
-    try {
-      const map = await rootBridge.detectSdks();
-      setSdkMap(map);
-    } catch (_) {}
-  };
-
-  const selectApp = async (pkg: string) => {
+  const selectApp = async (pkg: string, name: string) => {
     setSelected(pkg);
     await AsyncStorage.setItem('selectedApp', pkg);
+    navigation.navigate('Extract', {packageName: pkg, appName: name});
   };
 
   const userCount   = apps.filter(a => !a.isSystemApp).length;
@@ -132,12 +123,11 @@ export default function AppsScreen({navigation}: {navigation: any}) {
   ];
 
   const renderItem = ({item}: {item: AppInfo}) => {
-    const sdk = sdkMap[item.packageName];
     const isSelected = selected === item.packageName;
     return (
       <TouchableOpacity
         style={[styles.cell, isSelected && styles.cellSelected]}
-        onPress={() => selectApp(item.packageName)}
+        onPress={() => selectApp(item.packageName, item.appName)}
         onLongPress={() =>
           navigation.navigate('FileBrowser', {
             path:  `/data/data/${item.packageName}/shared_prefs`,
@@ -146,7 +136,6 @@ export default function AppsScreen({navigation}: {navigation: any}) {
         }>
         <AppIcon packageName={item.packageName} />
         <Text style={styles.cellName} numberOfLines={2}>{item.appName}</Text>
-        {!!sdk && <Text style={styles.sdkLabel}>{sdk}</Text>}
         {isSelected && <View style={styles.targetDot} />}
       </TouchableOpacity>
     );
@@ -275,13 +264,6 @@ const styles = StyleSheet.create({
     marginTop: 6,
     textAlign: 'center',
     lineHeight: 15,
-  },
-  sdkLabel: {
-    color: '#0af',
-    fontSize: 9,
-    fontFamily: 'monospace',
-    marginTop: 2,
-    textAlign: 'center',
   },
   targetDot: {
     position: 'absolute',

@@ -1,7 +1,6 @@
-import {NativeModules, NativeEventEmitter} from 'react-native';
+import {NativeModules} from 'react-native';
 
-const {RootBridge, RepackModule} = NativeModules;
-export const repackEmitter = RepackModule ? new NativeEventEmitter(RepackModule) : null;
+const {RootBridge} = NativeModules;
 
 export interface AppInfo {
   packageName: string;
@@ -9,46 +8,65 @@ export interface AppInfo {
   isSystemApp: boolean;
 }
 
-export interface BinaryStatus {
-  fridaServer: boolean;
-  fridaCli:    boolean;
-  fridaServerSize: string;
-  fridaCliSize:    string;
+export interface FileEntry {
+  name: string;
+  path: string;
+  isDir: boolean;
+  size: string;
+  perms: string;
+}
+
+export interface LocateResult {
+  hasMetadata: boolean;
+  hasLib: boolean;
+  metadataPath: string;
+  libPath: string;
+  unity3d: string[];
+  isUnity: boolean;
+}
+
+export interface DumpResult {
+  success: boolean;
+  outputDir: string;
+  log: string;
+  dumpCsSize?: string;
+  dumpCsBytes?: number;
+}
+
+export interface ExtractResult {
+  success: boolean;
+  outputDir: string;
+  summary: string;
+}
+
+export interface ExtractedFile {
+  name: string;
+  path: string;
+  relative: string;
+  size: string;
+}
+
+export interface SearchMatch {
+  file: string;
+  relative: string;
+  line: number;
+  text: string;
 }
 
 export const rootBridge = {
-  checkRoot:             (): Promise<boolean>       => RootBridge.checkRoot(),
-  startFridaServer:      (): Promise<string>        => RootBridge.startFridaServer(),
-  stopFridaServer:       (): Promise<void>          => RootBridge.stopFridaServer(),
-  isFridaRunning:        (): Promise<boolean>       => RootBridge.isFridaRunning(),
-  getInstalledApps:      (): Promise<AppInfo[]>     => RootBridge.getInstalledApps(),
-  // mode: 'pid' | 'name' | 'spawn'
-  runScript:             (pkg: string, script: string, mode?: string): Promise<string> => RootBridge.runScript(pkg, script, mode ?? 'pid'),
-  stopScript:            (): Promise<string> => RootBridge.stopScript(),
-  execShell:             (cmd: string): Promise<string>  => RootBridge.execShell(cmd),
-  downloadFridaBinaries: (version: string): Promise<string> => RootBridge.downloadFridaBinaries(version),
-  checkBinaries:         (): Promise<BinaryStatus>  => RootBridge.checkBinaries(),
-  readDir:               (path: string): Promise<FileEntry[]>  => RootBridge.readDir(path),
-  readFile:              (path: string): Promise<string>       => RootBridge.readFile(path),
-  writeFile:             (path: string, content: string): Promise<string> => RootBridge.writeFile(path, content),
-  detectSdks:            (): Promise<Record<string, string>> => RootBridge.detectSdks(),
-  getAppIcon:            (packageName: string): Promise<string | null> => RootBridge.getAppIcon(packageName),
-  showFloatingLog:       (): Promise<string>   => RootBridge.showFloatingLog(),
-  hideFloatingLog:       (): Promise<void>     => RootBridge.hideFloatingLog(),
-  flushPendingLogs:      (): Promise<string[]> => RootBridge.flushPendingLogs(),
-  startMemoryOverlay:    (pkg: string): Promise<string> => RootBridge.startMemoryOverlay(pkg),
-  stopMemoryOverlay:     (): Promise<string>   => RootBridge.stopMemoryOverlay(),
-};
+  checkRoot:     (): Promise<boolean>             => RootBridge.checkRoot(),
+  execShell:     (cmd: string): Promise<string>   => RootBridge.execShell(cmd),
+  getInstalledApps: (): Promise<AppInfo[]>        => RootBridge.getInstalledApps(),
+  getAppIcon:    (pkg: string): Promise<string | null> => RootBridge.getAppIcon(pkg),
 
-export const repackBridge = {
-  repackApk: (apkPath: string, jshookApkPath: string, libfridamodPath: string): Promise<string> =>
-    RepackModule.repackApk(apkPath, jshookApkPath, libfridamodPath),
-};
+  locateUnityFiles:   (pkg: string): Promise<LocateResult>    => RootBridge.locateUnityFiles(pkg),
+  dumpIl2cpp:         (pkg: string): Promise<DumpResult>      => RootBridge.dumpIl2cpp(pkg),
+  extractUnityAssets: (pkg: string): Promise<ExtractResult>   => RootBridge.extractUnityAssets(pkg),
+  listExtracted:      (pkg: string): Promise<ExtractedFile[]> => RootBridge.listExtracted(pkg),
+  searchFiles:        (pkg: string, query: string): Promise<SearchMatch[]> => RootBridge.searchFiles(pkg, query),
 
-export interface FileEntry {
-  name:  string;
-  path:  string;
-  isDir: boolean;
-  size:  string;
-  perms: string;
-}
+  readDir:        (path: string): Promise<FileEntry[]> => RootBridge.readDir(path),
+  readFile:       (path: string): Promise<string>      => RootBridge.readFile(path),
+  writeFile:      (path: string, content: string): Promise<string> => RootBridge.writeFile(path, content),
+  getScratchRoot: (): Promise<string>                  => RootBridge.getScratchRoot(),
+};

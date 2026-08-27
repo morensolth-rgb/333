@@ -8,3 +8,5 @@ android/app/src/main/assets/frida-gadget-arm64.so
 android/app/src/main/assets/apktool.jar
 ios/
 .bundle/
+__pycache__/
+*.pyc

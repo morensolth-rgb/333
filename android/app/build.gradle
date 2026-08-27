@@ -1,6 +1,7 @@
 apply plugin: "com.android.application"
 apply plugin: "org.jetbrains.kotlin.android"
 apply plugin: "com.facebook.react"
+apply plugin: "com.chaquo.python"
 
 react {}
 
@@ -20,6 +21,15 @@ android {
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 1
         versionName "1.0"
+
+        ndk { abiFilters "arm64-v8a" }
+
+        python {
+            pip {
+                install "UnityPy==1.7.43"
+                install "tabulate"
+            }
+        }
     }
 
     signingConfigs {
@@ -41,8 +51,8 @@ android {
     }
 
     aaptOptions {
-        // gg-mem-arm64 must not be compressed so we can extract and chmod +x it
-        noCompress "frida-server-arm64", "frida-gadget-arm64.so", "apktool.jar", "uber-signer.jar", "gg-mem-arm64"
+        // il2cpp_dumper must not be compressed so we can extract and chmod +x it
+        noCompress "il2cpp_dumper-arm64"
     }
 }
 

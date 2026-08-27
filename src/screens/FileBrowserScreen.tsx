@@ -16,18 +16,10 @@ import {
 import {rootBridge, FileEntry} from '../native/RootBridge';
 
 // ─── Props ────────────────────────────────────────────────────────────────────
-interface Props {
-  navigation: any;
-  route: {
-    params: {
-      path: string;   // starting path, e.g. /data/data/com.example
-      title?: string;
-    };
-  };
-}
+// route.params: { path: string, title?: string }
 
 // ─── Component ───────────────────────────────────────────────────────────────
-export default function FileBrowserScreen({navigation, route}: Props) {
+export default function FileBrowserScreen({navigation, route}: any) {
   const startPath  = route.params.path;
   const startTitle = route.params.title ?? startPath.split('/').pop() ?? '/';
 
