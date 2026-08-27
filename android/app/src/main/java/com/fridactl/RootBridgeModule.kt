@@ -500,6 +500,163 @@ class RootBridgeModule(private val ctx: ReactApplicationContext) :
         }.start()
     }
 
+    // ─────────────────────────────────────────────
+    // analyzeFile — sniff magic bytes and, for binary content, produce a
+    // readable dump on demand (strings extraction / unity dump hint).
+    // Returns: type, label (Arabic), preview (readable text), size, path.
+    // ─────────────────────────────────────────────
+    @ReactMethod
+    fun analyzeFile(path: String, promise: Promise) {
+        Thread {
+            try {
+                val f = File(path)
+                if (!f.exists()) throw Exception("File not found")
+                val size = f.length()
+                val head = ByteArray(16)
+                val n = f.inputStream().use { it.read(head) }
+                val h = if (n > 0) head.copyOf(n) else ByteArray(0)
+
+                fun isText(): Boolean {
+                    if (size == 0L) return true
+                    val buf = ByteArray(minOf(size, 4096).toInt())
+                    val rn = f.inputStream().use { it.read(buf) }
+                    if (rn <= 0) return true
+                    val chunk = buf.copyOf(rn)
+                    if (chunk.any { it.toInt() == 0 }) return false
+                    val bad = chunk.count {
+                        val v = it.toInt() and 0xFF
+                        v < 0x80 && v !in 0x20..0x7E && v != 0x09 && v != 0x0A && v != 0x0D
+                    }
+                    return bad.toDouble() / rn < 0.05
+                }
+
+                fun stringsDump(limitBytes: Long): String {
+                    val sb = StringBuilder()
+                    val cur = StringBuilder()
+                    var read = 0L
+                    var stringCount = 0
+                    f.inputStream().buffered().use { ins ->
+                        while (read < limitBytes && stringCount < 100000) {
+                            val b = ins.read()
+                            if (b < 0) break
+                            read++
+                            val printable = b in 0x20..0x7E || b == 0x09
+                            if (printable) {
+                                cur.append(b.toChar())
+                            } else {
+                                if (cur.length >= 4) {
+                                    sb.append(cur).append('\n')
+                                    stringCount++
+                                }
+                                cur.setLength(0)
+                            }
+                            if (sb.length > 300_000) break
+                        }
+                    }
+                    if (cur.length >= 4) sb.append(cur)
+                    return sb.toString()
+                }
+
+                val map = WritableNativeMap()
+                map.putString("path", f.absolutePath)
+                map.putString("name", f.name)
+                map.putString("size", formatSize(size))
+                map.putDouble("bytes", size.toDouble())
+
+                when {
+                    // Lua bytecode: ESC "Lua"
+                    h.size >= 4 && h[0] == 0x1B.toByte() && h[1] == 'L'.code.toByte() &&
+                        h[2] == 'u'.code.toByte() && h[3] == 'a'.code.toByte() -> {
+                        map.putString("type", "lua")
+                        map.putString("label", "سكربت Lua مُجمّع (bytecode)")
+                        map.putBoolean("binary", true)
+                        map.putString(
+                            "preview",
+                            "نوع الملف: Lua bytecode مُجمّع\nالحجم: ${formatSize(size)}\n\n" +
+                                "النصوص والثوابت المستخرجة:\n─────────────────────\n" +
+                                stringsDump(minOf(size, 8L * 1024 * 1024))
+                        )
+                    }
+                    // Zip / APK / jar
+                    h.size >= 2 && h[0] == 'P'.code.toByte() && h[1] == 'K'.code.toByte() -> {
+                        map.putString("type", "zip")
+                        map.putString("label", "أرشيف ZIP/APK")
+                        map.putBoolean("binary", true)
+                        val listing = try {
+                            ZipFile(f).use { zip ->
+                                val names = zip.entries().asSequence().map { "${formatSize(it.size)}  ${it.name}" }.take(500).toList()
+                                names.joinToString("\n")
+                            }
+                        } catch (e: Exception) { "تعذر قراءة الأرشيف: ${e.message}" }
+                        map.putString("preview", "نوع الملف: أرشيف ZIP\nالحجم: ${formatSize(size)}\n\nالمحتويات:\n$listing")
+                    }
+                    // gzip
+                    h.size >= 2 && h[0] == 0x1F.toByte() && h[1] == 0x8B.toByte() -> {
+                        map.putString("type", "gzip")
+                        map.putString("label", "ملف مضغوط GZIP")
+                        map.putBoolean("binary", true)
+                        val out = Shell.cmd("gzip -dc '${f.absolutePath}' 2>/dev/null | head -c 200000").exec()
+                        map.putString("preview", "نوع الملف: GZIP\nالحجم: ${formatSize(size)}\n\nالمحتوى المفكوك (أول 200KB):\n" + out.out.joinToString("\n"))
+                    }
+                    // ELF
+                    h.size >= 4 && h[0] == 0x7F.toByte() && h[1] == 'E'.code.toByte() &&
+                        h[2] == 'L'.code.toByte() && h[3] == 'F'.code.toByte() -> {
+                        map.putString("type", "elf")
+                        map.putString("label", "مكتبة أصلية (native ELF)")
+                        map.putBoolean("binary", true)
+                        map.putString(
+                            "preview",
+                            "نوع الملف: مكتبة native (ELF)\nالحجم: ${formatSize(size)}\n\n" +
+                                "الرموز والنصوص المقروءة:\n─────────────────────\n" +
+                                stringsDump(minOf(size, 16L * 1024 * 1024))
+                        )
+                    }
+                    // Unity serialized file: big-endian version at offset 8 looks sane + "UnityFS" bundle magic
+                    h.size >= 8 && String(h.copyOfRange(0, minOf(7, h.size))).startsWith("UnityFS") -> {
+                        map.putString("type", "unity")
+                        map.putString("label", "حزمة Unity (UnityFS bundle)")
+                        map.putBoolean("binary", true)
+                        map.putString(
+                            "preview",
+                            "نوع الملف: UnityFS bundle\nالحجم: ${formatSize(size)}\n\n" +
+                                "هذا ملف أصول Unity مُجمّع — الأصول المستخرجة منه موجودة في مجلد assets/.\n\n" +
+                                "النصوص المقروءة:\n─────────────────────\n" +
+                                stringsDump(minOf(size, 8L * 1024 * 1024))
+                        )
+                    }
+                    isText() -> {
+                        map.putString("type", "text")
+                        map.putString("label", "ملف نصي")
+                        map.putBoolean("binary", false)
+                        val content = if (size > 512 * 1024) {
+                            val headText = f.bufferedReader().use { r ->
+                                val buf = CharArray(64 * 1024)
+                                val rn = r.read(buf)
+                                if (rn > 0) String(buf, 0, rn) else ""
+                            }
+                            "[ملف كبير — ${formatSize(size)} — أول 64KB]\n\n$headText"
+                        } else f.readText()
+                        map.putString("preview", content)
+                    }
+                    else -> {
+                        map.putString("type", "binary")
+                        map.putString("label", "ملف ثنائي")
+                        map.putBoolean("binary", true)
+                        map.putString(
+                            "preview",
+                            "نوع الملف: ثنائي غير معروف\nالحجم: ${formatSize(size)}\n\n" +
+                                "النصوص المقروءة بداخله:\n─────────────────────\n" +
+                                stringsDump(minOf(size, 8L * 1024 * 1024))
+                        )
+                    }
+                }
+                promise.resolve(map)
+            } catch (e: Exception) {
+                promise.reject("ANALYZE_ERROR", e.message)
+            }
+        }.start()
+    }
+
     @ReactMethod
     fun writeFile(path: String, content: String, promise: Promise) {
         Thread {

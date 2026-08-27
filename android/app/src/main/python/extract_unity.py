@@ -2,6 +2,9 @@
 # Extracts Unity assets (MonoBehaviour, TextAsset, and all other objects)
 # from staged APK files using UnityPy. Stubs out deps not available in
 # Chaquopy's wheel index (we only need MonoBehaviour/TextAsset reading).
+#
+# Binary TextAssets (Lua bytecode bundles, encrypted blobs, etc.) are saved
+# raw under raw/ AND get a readable strings-dump .txt so search + viewer work.
 
 import sys
 import types
@@ -48,12 +51,56 @@ import traceback
 import UnityPy  # noqa: E402
 from collections import Counter  # noqa: E402
 
+LUA_MAGIC = b"\x1bLua"
+PRINTABLE = set(range(0x20, 0x7F)) | {0x09, 0x0A, 0x0D}
+
 
 def _safe_name(name):
     name = str(name or "unnamed")
     for ch in ('/', '\\', ':', '*', '?', '"', '<', '>', '|'):
         name = name.replace(ch, "_")
     return name[:120]
+
+
+def _sniff(raw):
+    """Return a short content-type label from magic bytes."""
+    if raw[:4] == LUA_MAGIC:
+        return "lua-bytecode"
+    if raw[:2] == b"PK":
+        return "zip"
+    if raw[:2] == b"\x1f\x8b":
+        return "gzip"
+    if raw[:4] == b"\x7fELF":
+        return "elf"
+    if raw[:1] == b"\x78":
+        return "zlib?"
+    return "binary"
+
+
+def _is_probably_text(raw):
+    head = raw[:4096]
+    if not head:
+        return True
+    if b"\x00" in head:
+        return False
+    bad = sum(1 for b in head if b not in PRINTABLE and b < 0x80)
+    return bad / float(len(head)) < 0.05
+
+
+def _extract_strings(raw, min_len=4, limit=200000):
+    """Pull printable ASCII/UTF-8-ish runs out of binary data."""
+    out = []
+    cur = bytearray()
+    for b in raw:
+        if b in PRINTABLE and b not in (0x0A, 0x0D):
+            cur.append(b)
+        else:
+            if len(cur) >= min_len:
+                out.append(cur.decode("utf-8", errors="ignore"))
+            cur = bytearray()
+    if len(cur) >= min_len:
+        out.append(cur.decode("utf-8", errors="ignore"))
+    return out[:limit]
 
 
 def _dump_monobehaviour(obj, data, out_dir):
@@ -79,28 +126,52 @@ def _dump_monobehaviour(obj, data, out_dir):
         return None
 
 
-def _dump_textasset(obj, data, out_dir):
+def _dump_textasset(obj, data, out_dir, raw_dir):
     name = _safe_name(getattr(data, "name", obj.path_id))
-    path = os.path.join(out_dir, "TextAsset_%s.txt" % name)
     try:
         script = getattr(data, "script", None)
         if script is None:
             script = getattr(data, "m_Script", b"")
         if isinstance(script, (bytes, bytearray)):
-            text = bytes(script).decode("utf-8", errors="replace")
+            raw = bytes(script)
         else:
-            text = str(script)
+            raw = str(script).encode("utf-8", errors="ignore")
+
+        if _is_probably_text(raw):
+            path = os.path.join(out_dir, "TextAsset_%s.txt" % name)
+            with open(path, "w", encoding="utf-8", errors="ignore") as f:
+                f.write(raw.decode("utf-8", errors="replace"))
+            return path
+
+        # Binary TextAsset (Lua bytecode, encrypted blob, etc.):
+        # keep the raw bytes AND emit a readable strings dump.
+        kind = _sniff(raw)
+        raw_path = os.path.join(raw_dir, "%s.bin" % name)
+        with open(raw_path, "wb") as f:
+            f.write(raw)
+
+        path = os.path.join(out_dir, "TextAsset_%s.txt" % name)
         with open(path, "w", encoding="utf-8", errors="ignore") as f:
-            f.write(text)
+            f.write("TYPE: binary TextAsset (%s)\n" % kind)
+            f.write("NAME: %s\n" % getattr(data, "name", ""))
+            f.write("SIZE: %d bytes\n" % len(raw))
+            f.write("RAW: raw/%s.bin\n" % name)
+            if kind == "lua-bytecode":
+                f.write("NOTE: compiled Lua bytecode — strings/constants below\n")
+            f.write("\nSTRINGS:\n")
+            for s in _extract_strings(raw):
+                f.write(s + "\n")
         return path
     except Exception:
         return None
 
 
 def extract(apks_semicolon, out_dir):
-    """apks_semicolon: ';'-joined list of staged APK paths.
+    """apks_semicolon: ';'-joined list of staged APK paths (base + ALL splits).
     Returns a human-readable summary string."""
     os.makedirs(out_dir, exist_ok=True)
+    raw_dir = os.path.join(out_dir, "raw")
+    os.makedirs(raw_dir, exist_ok=True)
     counts = Counter()
     errors = []
     written = 0
@@ -123,7 +194,7 @@ def extract(apks_semicolon, out_dir):
                         written += 1
                 elif typ == "TextAsset":
                     data = obj.read()
-                    if _dump_textasset(obj, data, out_dir):
+                    if _dump_textasset(obj, data, out_dir, raw_dir):
                         written += 1
             except Exception as e:
                 errors.append((typ, getattr(obj, "path_id", "?"), repr(e)[:200]))

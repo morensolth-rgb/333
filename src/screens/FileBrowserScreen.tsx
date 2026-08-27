@@ -41,6 +41,7 @@ export default function FileBrowserScreen({navigation, route}: any) {
   const [fileError,   setFileError]   = useState('');
   const [isDirty,     setIsDirty]     = useState(false);
   const [isBinary,    setIsBinary]    = useState(false);
+  const [fileTypeLabel, setFileTypeLabel] = useState('');
 
   // ── Hardware back button ────────────────────────────────────────────────────
   useEffect(() => {
@@ -104,10 +105,12 @@ export default function FileBrowserScreen({navigation, route}: any) {
     setFileModal(true);
     setFileLoading(true);
     try {
-      const content = await rootBridge.readFile(entry.path);
-      const bin = content.startsWith('[Binary') || content.startsWith('[Binary file');
-      setIsBinary(bin);
-      setFileContent(content);
+      // analyzeFile detects type; binary files (Lua bytecode, ELF, zip...)
+      // come back as a readable strings/content dump instead of "[Binary]".
+      const a = await rootBridge.analyzeFile(entry.path);
+      setIsBinary(a.binary);
+      setFileTypeLabel(a.label);
+      setFileContent(a.binary ? a.preview : a.preview);
     } catch (e: any) {
       setFileError(e?.message ?? 'Read failed');
     }
@@ -232,6 +235,9 @@ export default function FileBrowserScreen({navigation, route}: any) {
               <Text style={s.modalBackText}>✕</Text>
             </TouchableOpacity>
             <Text style={s.modalTitle} numberOfLines={1}>{fileName}</Text>
+            {!!fileTypeLabel && (
+              <Text style={s.typeBadge} numberOfLines={1}>{fileTypeLabel}</Text>
+            )}
             {!isBinary && (
               <TouchableOpacity
                 style={[s.saveBtn, fileSaving && s.saveBtnDisabled]}
@@ -362,6 +368,7 @@ const s = StyleSheet.create({
   modalBack:     {padding: 4},
   modalBackText: {color: '#555', fontSize: 18},
   modalTitle:    {flex: 1, color: '#ccc', fontFamily: 'monospace', fontSize: 13},
+  typeBadge:     {color: '#7fd', fontFamily: 'monospace', fontSize: 9, borderWidth: 1, borderColor: '#2a5a3a', borderRadius: 3, paddingHorizontal: 6, paddingVertical: 2, marginRight: 6},
   saveBtn:       {paddingHorizontal: 14, paddingVertical: 6, backgroundColor: '#0a2a15', borderRadius: 6, borderWidth: 1, borderColor: '#00ff88'},
   saveBtnDisabled: {opacity: 0.4},
   saveBtnText:   {color: '#00ff88', fontFamily: 'monospace', fontSize: 12},

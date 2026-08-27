@@ -58,6 +58,17 @@ export interface FileRange {
   content: string;
 }
 
+export interface FileAnalysis {
+  path: string;
+  name: string;
+  size: string;
+  bytes: number;
+  type: 'lua' | 'zip' | 'gzip' | 'elf' | 'unity' | 'text' | 'binary';
+  label: string;    // Arabic human-readable type label
+  binary: boolean;
+  preview: string;  // readable content: text as-is, or strings dump for binary
+}
+
 export const rootBridge = {
   checkRoot:     (): Promise<boolean>             => RootBridge.checkRoot(),
   execShell:     (cmd: string): Promise<string>   => RootBridge.execShell(cmd),
@@ -73,6 +84,7 @@ export const rootBridge = {
 
   readDir:        (path: string): Promise<FileEntry[]> => RootBridge.readDir(path),
   readFile:       (path: string): Promise<string>      => RootBridge.readFile(path),
+  analyzeFile:    (path: string): Promise<FileAnalysis> => RootBridge.analyzeFile(path),
   readFileRange:  (path: string, startLine: number, lineCount: number): Promise<FileRange> =>
     RootBridge.readFileRange(path, startLine, lineCount),
   writeFile:      (path: string, content: string): Promise<string> => RootBridge.writeFile(path, content),

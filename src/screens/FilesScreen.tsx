@@ -14,6 +14,7 @@ import {
   rootBridge,
   ExtractedFile,
   SearchMatch,
+  FileAnalysis,
 } from '../native/RootBridge';
 
 type Mode = 'files' | 'search';
@@ -81,6 +82,7 @@ export default function FilesScreen({route}: any) {
   const [viewer, setViewer] = useState<{
     path: string; name: string; content: string;
     startLine: number; targetLine: number | null; q: string;
+    typeLabel?: string; binary?: boolean;
   } | null>(null);
   const viewerScroll = useRef<ScrollView>(null);
 
@@ -119,7 +121,9 @@ export default function FilesScreen({route}: any) {
     if (query.trim()) runSearch(sc);
   };
 
-  // Open a file; if line given, load a window around it and scroll there
+  // Open a file; if line given, load a window around it and scroll there.
+  // No line → analyzeFile: detects type and, for binary content (Lua bytecode,
+  // Unity assets, ELF, zip...), returns a readable strings/content dump.
   const openFile = async (path: string, name: string, line?: number, q?: string) => {
     try {
       if (line && line > 0) {
@@ -131,8 +135,11 @@ export default function FilesScreen({route}: any) {
         });
         setTimeout(() => viewerScroll.current?.scrollTo({y: (line - start) * 16, animated: false}), 120);
       } else {
-        const content = await rootBridge.readFile(path);
-        setViewer({path, name, content, startLine: 1, targetLine: null, q: q ?? ''});
+        const a: FileAnalysis = await rootBridge.analyzeFile(path);
+        setViewer({
+          path, name, content: a.preview, startLine: 1, targetLine: null,
+          q: q ?? '', typeLabel: a.label, binary: a.binary,
+        });
       }
     } catch (e: any) {
       setViewer({path, name, content: `Cannot read file: ${e?.message ?? e}`, startLine: 1, targetLine: null, q: ''});
@@ -284,6 +291,11 @@ export default function FilesScreen({route}: any) {
             <Text style={styles.viewerTitle} numberOfLines={1}>
               {viewer?.name}{viewer?.targetLine ? ` :${viewer.targetLine}` : ''}
             </Text>
+            {!!viewer?.typeLabel && (
+              <View style={styles.typeBadge}>
+                <Text style={styles.typeBadgeText}>{viewer.typeLabel}</Text>
+              </View>
+            )}
             {!!viewer?.q && (
               <>
                 <TouchableOpacity onPress={() => jumpTo(-1)} style={styles.navBtn}>
@@ -389,6 +401,8 @@ const styles = StyleSheet.create({
   closeBtnText: {color: '#fff', fontSize: 16},
   viewerScroll: {flex: 1, padding: 10},
   windowNote: {color: '#446', fontFamily: 'monospace', fontSize: 10, marginBottom: 6},
+  typeBadge: {backgroundColor: '#123', borderColor: '#2a5a3a', borderWidth: 1, borderRadius: 3, paddingHorizontal: 6, paddingVertical: 2},
+  typeBadgeText: {color: '#7fd', fontFamily: 'monospace', fontSize: 9},
   viewerText: {color: '#ccc', fontFamily: 'monospace', fontSize: 11, lineHeight: 16},
   lineNo: {color: '#2a4a35'},
   lineNoTarget: {color: '#004d22', fontWeight: 'bold'},
