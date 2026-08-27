@@ -31,6 +31,14 @@ def _install_stubs():
         if m not in sys.modules:
             _stub(m)
 
+    # Pillow is only used by Texture2D/Sprite export paths (which we never
+    # call for MonoBehaviour/TextAsset). Its Chaquopy wheel needs extra native
+    # packages (chaquopy-libjpeg etc.) — skip it and stub PIL instead.
+    pil = _stub("PIL")
+    _stub("PIL.Image")
+    _stub("PIL.ImageDraw")
+    pil.Image = sys.modules["PIL.Image"]
+
 
 _install_stubs()
 

@@ -33,7 +33,6 @@ android {
                 install "UnityPy==1.7.43"
                 install "lz4"
                 install "brotli"
-                install "Pillow"
                 install "tabulate"
             }
         }
