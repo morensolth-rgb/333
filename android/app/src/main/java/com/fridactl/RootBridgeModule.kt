@@ -250,11 +250,12 @@ class RootBridgeModule(private val ctx: ReactApplicationContext) :
                 // The dumper may write into a versioned subdirectory (e.g. Dump0/)
                 // — search recursively for dump.cs.
                 val dumpCs = outDir.walkTopDown().firstOrNull { it.isFile && it.name == "dump.cs" }
+                val ok = dumpCs != null && dumpCs.exists() && dumpCs.length() > 0
                 val result = WritableNativeMap()
-                result.putBoolean("success", dumpCs.exists() && dumpCs.length() > 0)
-                result.putString("outputDir", outDir.absolutePath)
+                result.putBoolean("success", ok)
+                result.putString("outputDir", dumpCs?.parent ?: outDir.absolutePath)
                 result.putString("log", r.out.takeLast(40).joinToString("\n"))
-                if (dumpCs.exists()) {
+                if (ok && dumpCs != null) {
                     result.putString("dumpCsSize", formatSize(dumpCs.length()))
                     result.putDouble("dumpCsBytes", dumpCs.length().toDouble())
                 }
