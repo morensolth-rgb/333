@@ -26,7 +26,14 @@ android {
 
         python {
             pip {
+                // texture2ddecoder / etcpak have no Chaquopy wheels — install
+                // UnityPy without deps and pull only what's available; the rest
+                // is stubbed at runtime in extract_unity.py.
+                options "--no-deps"
                 install "UnityPy==1.7.43"
+                install "lz4"
+                install "brotli"
+                install "Pillow"
                 install "tabulate"
             }
         }
