@@ -47,10 +47,15 @@ export interface ExtractedFile {
 }
 
 export interface SearchMatch {
-  file: string;
-  relative: string;
+  file: string;   // path relative to scratch root (display)
+  path: string;   // absolute path (use for opening)
   line: number;
   text: string;
+}
+
+export interface FileRange {
+  startLine: number;
+  content: string;
 }
 
 export const rootBridge = {
@@ -67,6 +72,8 @@ export const rootBridge = {
 
   readDir:        (path: string): Promise<FileEntry[]> => RootBridge.readDir(path),
   readFile:       (path: string): Promise<string>      => RootBridge.readFile(path),
+  readFileRange:  (path: string, startLine: number, lineCount: number): Promise<FileRange> =>
+    RootBridge.readFileRange(path, startLine, lineCount),
   writeFile:      (path: string, content: string): Promise<string> => RootBridge.writeFile(path, content),
   getScratchRoot: (): Promise<string>                  => RootBridge.getScratchRoot(),
 };

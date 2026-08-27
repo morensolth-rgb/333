@@ -377,6 +377,38 @@ class RootBridgeModule(private val ctx: ReactApplicationContext) :
     }
 
     // ─────────────────────────────────────────────
+    // readFileRange — read `lineCount` lines starting at `startLine` (1-based).
+    // Efficient for huge files (dump.cs) — never loads the whole file.
+    // ─────────────────────────────────────────────
+    @ReactMethod
+    fun readFileRange(path: String, startLine: Int, lineCount: Int, promise: Promise) {
+        Thread {
+            try {
+                val f = File(path)
+                if (!f.exists()) throw Exception("File not found")
+                val sb = StringBuilder()
+                var cur = 0
+                val end = startLine + lineCount
+                f.bufferedReader().useLines { lines ->
+                    val it = lines.iterator()
+                    while (it.hasNext()) {
+                        cur++
+                        val line = it.next()
+                        if (cur >= startLine) sb.append(line).append('\n')
+                        if (cur >= end) break
+                    }
+                }
+                val map = WritableNativeMap()
+                map.putInt("startLine", startLine)
+                map.putString("content", sb.toString())
+                promise.resolve(map)
+            } catch (e: Exception) {
+                promise.reject("READ_RANGE_ERROR", e.message)
+            }
+        }.start()
+    }
+
+    // ─────────────────────────────────────────────
     // File browser helpers (read-only + write for notes)
     // ─────────────────────────────────────────────
     @ReactMethod
