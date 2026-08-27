@@ -325,10 +325,13 @@ class RootBridgeModule(private val ctx: ReactApplicationContext) :
 
     // ─────────────────────────────────────────────
     // searchFiles — grep-like search inside extracted text files.
-    // Returns matches: file + line number + line content (capped).
+    // scope: "all" | "dump" | "assets" — limits which subdirectory is searched.
+    // No size limit: big files (dump.cs) are streamed line-by-line, not loaded.
+    // Binary files (null bytes in first 4KB) are skipped — matches there are noise.
+    // Returns matches: file (relative) + path (absolute) + line number + content.
     // ─────────────────────────────────────────────
     @ReactMethod
-    fun searchFiles(pkg: String, query: String, promise: Promise) {
+    fun searchFiles(pkg: String, query: String, scope: String, promise: Promise) {
         Thread {
             try {
                 if (query.isBlank()) {
@@ -336,13 +339,35 @@ class RootBridgeModule(private val ctx: ReactApplicationContext) :
                     return@Thread
                 }
                 val root = gameDir(pkg)
+                val searchRoot = when (scope) {
+                    "dump" -> File(root, "il2cpp_dump")
+                    "assets" -> File(root, "assets")
+                    else -> root
+                }
+                if (!searchRoot.exists()) {
+                    promise.resolve(WritableNativeArray())
+                    return@Thread
+                }
                 val q = query.lowercase()
                 val arr = WritableNativeArray()
                 var fileCount = 0
 
-                root.walkTopDown()
-                    .filter { it.isFile && it.length() in 1..(20L * 1024 * 1024) }
+                fun looksBinary(f: File): Boolean {
+                    return try {
+                        val buf = ByteArray(4096)
+                        val n = f.inputStream().use { it.read(buf) }
+                        if (n <= 0) false else buf.take(n).any { it.toInt() == 0 }
+                    } catch (_: Exception) { true }
+                }
+
+                searchRoot.walkTopDown()
+                    .filter { it.isFile }
                     .forEach { f ->
+                        // Never scan staged APKs or raw il2cpp binaries — pure noise
+                        val rel = f.relativeTo(root).path
+                        if (scope == "all" && (rel.startsWith("apk/") || rel.startsWith("il2cpp/"))) return@forEach
+                        if (looksBinary(f)) return@forEach
+
                         var matched = false
                         var lineNo = 0
                         var hits = 0
@@ -354,7 +379,7 @@ class RootBridgeModule(private val ctx: ReactApplicationContext) :
                                         if (!matched) { matched = true; fileCount++ }
                                         if (hits < 20) {
                                             val map = WritableNativeMap()
-                                            map.putString("file", f.relativeTo(root).path)
+                                            map.putString("file", rel)
                                             map.putString("path", f.absolutePath)
                                             map.putInt("line", lineNo)
                                             map.putString("text", line.take(300))
@@ -365,7 +390,7 @@ class RootBridgeModule(private val ctx: ReactApplicationContext) :
                                     if (fileCount > 200) return@useLines
                                 }
                             }
-                        } catch (_: Exception) { /* binary/unreadable file — skip */ }
+                        } catch (_: Exception) { /* unreadable file — skip */ }
                         if (fileCount > 200) return@forEach
                     }
 

@@ -68,7 +68,8 @@ export const rootBridge = {
   dumpIl2cpp:         (pkg: string): Promise<DumpResult>      => RootBridge.dumpIl2cpp(pkg),
   extractUnityAssets: (pkg: string): Promise<ExtractResult>   => RootBridge.extractUnityAssets(pkg),
   listExtracted:      (pkg: string): Promise<ExtractedFile[]> => RootBridge.listExtracted(pkg),
-  searchFiles:        (pkg: string, query: string): Promise<SearchMatch[]> => RootBridge.searchFiles(pkg, query),
+  searchFiles:        (pkg: string, query: string, scope: 'all' | 'dump' | 'assets' = 'all'): Promise<SearchMatch[]> =>
+    RootBridge.searchFiles(pkg, query, scope),
 
   readDir:        (path: string): Promise<FileEntry[]> => RootBridge.readDir(path),
   readFile:       (path: string): Promise<string>      => RootBridge.readFile(path),

@@ -17,6 +17,12 @@ import {
 } from '../native/RootBridge';
 
 type Mode = 'files' | 'search';
+type Scope = 'all' | 'dump' | 'assets';
+const SCOPES: {key: Scope; label: string}[] = [
+  {key: 'all', label: 'الكل'},
+  {key: 'dump', label: 'Dump'},
+  {key: 'assets', label: 'Assets'},
+];
 
 // Group matches by file so search results read as "files, with their hit lines"
 interface FileGroup {
@@ -69,6 +75,7 @@ export default function FilesScreen({route}: any) {
   const [searching, setSearching] = useState(false);
   const [fileFilter, setFileFilter] = useState('');
   const [expanded, setExpanded] = useState<string | null>(null);
+  const [scope, setScope] = useState<Scope>('all');
 
   // Viewer state — jump-aware: we load a window of lines around the target
   const [viewer, setViewer] = useState<{
@@ -91,20 +98,25 @@ export default function FilesScreen({route}: any) {
 
   useEffect(() => { loadFiles(); }, [loadFiles]);
 
-  const runSearch = async () => {
+  const runSearch = async (sc: Scope = scope) => {
     const q = query.trim();
     if (!q || !pkg) return;
     setSearching(true);
     setMode('search');
     setExpanded(null);
     try {
-      const res = await rootBridge.searchFiles(pkg, q);
+      const res = await rootBridge.searchFiles(pkg, q, sc);
       setMatches(res);
     } catch (e: any) {
       setMatches([]);
       console.error(e);
     }
     setSearching(false);
+  };
+
+  const changeScope = (sc: Scope) => {
+    setScope(sc);
+    if (query.trim()) runSearch(sc);
   };
 
   // Open a file; if line given, load a window around it and scroll there
@@ -159,11 +171,11 @@ export default function FilesScreen({route}: any) {
           placeholderTextColor="#444"
           value={query}
           onChangeText={setQuery}
-          onSubmitEditing={runSearch}
+          onSubmitEditing={() => runSearch()}
           returnKeyType="search"
           autoCapitalize="none"
         />
-        <TouchableOpacity style={styles.searchBtn} onPress={runSearch}>
+        <TouchableOpacity style={styles.searchBtn} onPress={() => runSearch()}>
           {searching ? <ActivityIndicator color="#000" size="small" /> : <Text style={styles.searchBtnText}>FIND</Text>}
         </TouchableOpacity>
       </View>
@@ -333,6 +345,14 @@ const styles = StyleSheet.create({
   modeText: {color: '#555', fontFamily: 'monospace', fontSize: 12},
   modeTextActive: {color: '#00ff88'},
   reloadBtn: {paddingHorizontal: 16, justifyContent: 'center'},
+  scopeRow: {flexDirection: 'row', gap: 6, paddingHorizontal: 10, paddingVertical: 6},
+  scopeChip: {
+    flex: 1, alignItems: 'center', paddingVertical: 5, borderRadius: 3,
+    borderWidth: 1, borderColor: '#222', backgroundColor: '#0a0a0a',
+  },
+  scopeChipActive: {borderColor: '#00ff88', backgroundColor: '#0f2418'},
+  scopeText: {color: '#555', fontFamily: 'monospace', fontSize: 11},
+  scopeTextActive: {color: '#00ff88', fontWeight: 'bold'},
   filterInput: {
     backgroundColor: '#0a0a0a', color: '#aaa', paddingHorizontal: 12, paddingVertical: 6,
     fontFamily: 'monospace', fontSize: 11, borderBottomWidth: 1, borderBottomColor: '#1a1a1a',
