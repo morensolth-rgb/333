@@ -10,6 +10,7 @@ import {
   Image,
   RefreshControl,
   Dimensions,
+  ToastAndroid,
 } from 'react-native';
 import {rootBridge, AppInfo} from '../native/RootBridge';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -122,21 +123,31 @@ export default function AppsScreen({navigation}: {navigation: any}) {
     {label: 'System', value: 'system', count: systemCount},
   ];
 
+  const openApkInspect = (item: AppInfo) => {
+    ToastAndroid.show(`APK: ${item.appName}`, ToastAndroid.SHORT);
+    navigation.navigate('ApkInspect', {
+      packageName: item.packageName,
+      appName: item.appName,
+    });
+  };
+
   const renderItem = ({item}: {item: AppInfo}) => {
     const isSelected = selected === item.packageName;
     return (
       <TouchableOpacity
         style={[styles.cell, isSelected && styles.cellSelected]}
         onPress={() => selectApp(item.packageName, item.appName)}
-        onLongPress={() =>
-          navigation.navigate('ApkInspect', {
-            packageName: item.packageName,
-            appName: item.appName,
-          })
-        }>
+        onLongPress={() => openApkInspect(item)}
+        delayLongPress={350}>
         <AppIcon packageName={item.packageName} />
         <Text style={styles.cellName} numberOfLines={2}>{item.appName}</Text>
         {isSelected && <View style={styles.targetDot} />}
+        <TouchableOpacity
+          style={styles.apkBtn}
+          hitSlop={{top: 6, bottom: 6, left: 6, right: 6}}
+          onPress={() => openApkInspect(item)}>
+          <Text style={styles.apkBtnText}>APK</Text>
+        </TouchableOpacity>
       </TouchableOpacity>
     );
   };
@@ -273,6 +284,26 @@ const styles = StyleSheet.create({
     height: 7,
     borderRadius: 4,
     backgroundColor: '#00ff88',
+  },
+  apkBtn: {
+    position: 'absolute',
+    top: 4,
+    left: 4,
+    backgroundColor: '#001a0d',
+    borderWidth: 1,
+    borderColor: '#00ff88',
+    borderRadius: 5,
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    zIndex: 10,
+    elevation: 10,
+  },
+  apkBtnText: {
+    color: '#00ff88',
+    fontSize: 9,
+    fontFamily: 'monospace',
+    fontWeight: 'bold',
+    letterSpacing: 1,
   },
 
   iconPlaceholder: {

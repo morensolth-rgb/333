@@ -70,7 +70,7 @@ export default function App() {
           }}>
           <Stack.Screen
             name="Apps" component={AppsScreen}
-            options={{title: 'IL2CPP Extractor', headerShown: true}}
+            options={{title: 'IL2CPP Extractor v1.2', headerShown: true}}
           />
           <Stack.Screen
             name="Extract" component={ExtractScreen}
