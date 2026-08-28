@@ -9,6 +9,8 @@ import {
   ActivityIndicator,
   Modal,
   ScrollView,
+  Clipboard,
+  ToastAndroid,
 } from 'react-native';
 import {rootBridge, FileAnalysis} from '../native/RootBridge';
 
@@ -395,6 +397,15 @@ export default function ApkScreen({route, navigation}: any) {
                 </TouchableOpacity>
               </>
             )}
+            <TouchableOpacity
+              onPress={() => {
+                if (!viewer) return;
+                Clipboard.setString(viewer.content);
+                ToastAndroid.show('انحفظ المحتوى بالحافظة', ToastAndroid.SHORT);
+              }}
+              style={s.copyBtn}>
+              <Text style={s.copyBtnText}>نسخ</Text>
+            </TouchableOpacity>
             <TouchableOpacity onPress={() => setViewer(null)} style={s.closeBtn}>
               <Text style={s.closeBtnText}>✕</Text>
             </TouchableOpacity>
@@ -498,6 +509,11 @@ const s = StyleSheet.create({
   typeBadgeText: {color: '#7fd', fontFamily: 'monospace', fontSize: 9},
   navBtn: {backgroundColor: '#1a3a2a', borderRadius: 3, paddingHorizontal: 14, paddingVertical: 4},
   navBtnText: {color: '#00ff88', fontSize: 18, fontWeight: 'bold'},
+  copyBtn: {
+    backgroundColor: '#0a2a18', borderColor: '#00ff88', borderWidth: 1,
+    borderRadius: 4, paddingHorizontal: 10, paddingVertical: 4,
+  },
+  copyBtnText: {color: '#00ff88', fontFamily: 'monospace', fontSize: 11, fontWeight: 'bold'},
   closeBtn: {padding: 6, paddingHorizontal: 12},
   closeBtnText: {color: '#fff', fontSize: 16},
   viewerScroll: {flex: 1, padding: 10},

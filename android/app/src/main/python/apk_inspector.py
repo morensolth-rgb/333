@@ -21,6 +21,12 @@ from collections import Counter
 
 PRINTABLE = set(range(0x20, 0x7F)) | {0x09, 0x0A, 0x0D}
 MAX_CONVERT = 64 * 1024 * 1024   # skip conversions for entries bigger than this
+MAX_DEOBFUSC = 2 * 1024 * 1024   # XOR/b64 brute-force only on small blobs
+MAX_STRINGS  = 16 * 1024 * 1024  # strings dump cap
+INSPECT_TIME_LIMIT = 10 * 60     # seconds — bail out gracefully, keep partial output
+
+import time as _time
+_deadline = [0.0]  # set by inspect(); checked inside the DFS and the entry loop
 
 # Fast helpers for the XOR brute-force (C-speed instead of Python byte loops)
 _NP = re.compile(rb'[^\x20-\x7e\t\n\r]')
@@ -699,6 +705,13 @@ def classify(name, head):
     # printable is not enough — XOR-obfuscated text with a high key also looks
     # printable. Require it to look like real language too (words/letters).
     if _looks_text(head) and _text_likelihood(head) > 0.55:
+        # A solid base64 blob (alphabet only, no spaces) is NOT text — it is
+        # an encoded payload masquerading as text. Route it through the
+        # deobfuscator; acceptance is proof-based, so real text survives.
+        stripped = head.strip()
+        if (len(stripped) >= 16 and set(stripped).issubset(_B64_CHARS)
+                and b" " not in stripped[:512] and b"\t" not in stripped[:512]):
+            return "b64ish"
         return "text"
     return "binary"
 
@@ -842,10 +855,11 @@ def inspect(apks_semicolon, out_dir):
                 except Exception:
                     pass
 
-            # Unknown/binary: deobfuscation first (it must *prove* an encoding
-            # chain by improving the content score), then protobuf (very
-            # permissive — random bytes often parse as wire format), then strings
-            if kind == "binary" and size >= 8:
+            # Unknown/binary (or base64 masquerading as text): deobfuscation
+            # first (it must *prove* an encoding chain by improving the
+            # content score), then protobuf (very permissive — random bytes
+            # often parse as wire format), then strings
+            if kind in ("binary", "b64ish") and size >= 8:
                 done = False
                 # Brute-force chains only make sense on small blobs — a 20MB
                 # asset under DFS*xor-255 costs minutes for nothing.

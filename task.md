@@ -1,18 +1,19 @@
-# Task: fix "جاري الاستخراج" hanging forever (ApkInspect)
+# Task: NameError fix + copy-all button + b64 deobfuscation
 
-## Done
-- apk_inspector.py: added MAX_DEOBFUSC (2MB), MAX_STRINGS (16MB), INSPECT_TIME_LIMIT (10min), _deadline
-- deobfuscate: depth 4→3, branches 4→3, deadline check in DFS
-- _strings: cap scan at 8MB
-- inspect(): writes _progress.txt every 10 entries + counts total entries first; sets timed_out on deadline
+## User asks
+1. Fix `NameError: name 'time' is not defined` during APK inspect
+2. Copy-all button in file viewer (both FilesScreen + ApkScreen)
 
-## Remaining
-1. inspect(): outer loop must also break on timed_out; summary must mention timeout
-2. ApkScreen.tsx: poll _progress.txt every 2s during running phase, show in log/UI (rootBridge.getScratchRoot + readFile)
-3. npx tsc --noEmit, commit (user.name/email -c flags), push origin main
-4. Poll CI (curl api.github.com/actions/runs), download artifact, verify bundle strings, cp to /home/user/IL2CPP-Extractor.apk, deliver
+## Progress
+- [x] Found: header constants block (MAX_DEOBFUSC, MAX_STRINGS, INSPECT_TIME_LIMIT, import time as _time, _deadline) was MISSING from apk_inspector.py → re-added
+- [x] Found: base64 blobs classified as "text" → never deobfuscated. classify() now returns "b64ish" for solid base64 blobs
+- [x] Conversion block condition changed to kind in ("binary","b64ish")
+- [x] Direct deobfuscate() call works: layers [base64, zlib] decode fine
+- [ ] PROBLEM: inspect() still not writing .decoded.txt — summary shows converted=0 though kind=b64ish counted. Verify edit actually in file, then debug inside inspect
+- [ ] Copy-all button: RN 0.73 core Clipboard (node_modules/react-native/Libraries/Components/Clipboard exists) — import {Clipboard} from 'react-native', add button in viewer header of FilesScreen.tsx (~line 289-313) and ApkScreen.tsx (same pattern)
+- [ ] tsc + python checks, commit, push, CI poll, artifact, verify, deliver
 
-## Key facts
-- scratch root: ctx.filesDir/extracted/<pkg>/apk_full/_progress.txt
-- remote token: git remote get-url origin | sed -E 's|https://([^@]+)@.*|\1|'
-- repo branch: main
+## Facts
+- repo /home/user/333, branch main, token via: git remote get-url origin | sed -E 's|https://([^@]+)@.*|\1|'
+- commit flags: -c user.name="morensolth-rgb" -c user.email="morensolth-rgb@users.noreply.github.com"
+- CI poll: curl -H "Authorization: token $TOKEN" https://api.github.com/repos/morensolth-rgb/333/actions/runs?per_page=1
