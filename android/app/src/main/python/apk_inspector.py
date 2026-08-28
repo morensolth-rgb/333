@@ -76,6 +76,9 @@ def _looks_text(data):
 
 
 def _strings(data, min_len=4, limit=150000):
+    # byte-loop in Python is slow on huge blobs — sample-scan up to 8MB
+    if len(data) > 8 * 1024 * 1024:
+        data = data[:8 * 1024 * 1024]
     out = []
     cur = bytearray()
     for b in data:
@@ -619,18 +622,19 @@ def _single_layer(current):
     return cands
 
 
-def deobfuscate(data, max_depth=4):
+def deobfuscate(data, max_depth=3):
     """Decode chained obfuscation (zlib/gzip/base64/XOR) via bounded DFS:
-    explores up to 4 layers and returns the chain whose final content scores
+    explores up to 3 layers and returns the chain whose final content scores
     highest (real text / known magic beats sideways junk).
-    Returns (decoded_bytes, [layer names]) or (None, [])."""
+    Returns (decoded_bytes, [layer names]) or (None, []).
+    Hard deadline: if _deadline is past, bail immediately."""
     base_score = _score(data)
 
     def search(blob, depth, layers):
         # (score, data, layers) candidates; the blob itself counts as one
         s = _score(blob)
         results = [(s, blob, layers)]
-        if depth <= 0:
+        if depth <= 0 or _time.time() > _deadline[0]:
             return results
         # Reached a final artifact (lua/dex/elf/zip/...) — decoding it further
         # is always wrong, so don't branch below it. Gzip is a container
@@ -639,7 +643,7 @@ def deobfuscate(data, max_depth=4):
         for m in _TERMINAL:
             if head.startswith(m):
                 return results
-        for name, cand in _single_layer(blob)[:4]:
+        for name, cand in _single_layer(blob)[:3]:
             if cand == blob or not cand:
                 continue
             results.extend(search(cand, depth - 1, layers + [name]))
@@ -717,12 +721,35 @@ def _convert_one(kind, data):
 
 def inspect(apks_semicolon, out_dir):
     """Extract every entry of every APK split + readable conversions.
-    Returns a summary string. Also writes _index.txt."""
+    Returns a summary string. Also writes _index.txt.
+    Writes _progress.txt continuously so the UI can show live progress,
+    and stops gracefully at the time limit keeping whatever was produced."""
     os.makedirs(out_dir, exist_ok=True)
+    _deadline[0] = _time.time() + INSPECT_TIME_LIMIT
     counts = Counter()
     errors = []
     index = []
     converted = 0
+    timed_out = False
+    done_entries = 0
+    prog_path = os.path.join(out_dir, "_progress.txt")
+
+    # total count first for a meaningful n/total in the progress line
+    total = 0
+    for apk in [a for a in apks_semicolon.split(";") if a]:
+        try:
+            with zipfile.ZipFile(apk) as zc:
+                total += sum(1 for i in zc.infolist() if not i.is_dir())
+        except Exception:
+            pass
+
+    def progress(cur):
+        try:
+            left = max(0, int(_deadline[0] - _time.time()))
+            with open(prog_path, "w", encoding="utf-8") as pf:
+                pf.write("%d/%d %s (%ds left)\n" % (done_entries, total, cur, left))
+        except Exception:
+            pass
 
     apks = [a for a in apks_semicolon.split(";") if a]
     for apk in apks:
@@ -737,6 +764,12 @@ def inspect(apks_semicolon, out_dir):
         for info in zf.infolist():
             if info.is_dir():
                 continue
+            if _time.time() > _deadline[0]:
+                timed_out = True
+                break
+            done_entries += 1
+            if done_entries % 10 == 0:
+                progress(info.filename)
             rel = _safe(info.filename)
             if not rel:
                 continue
@@ -814,43 +847,46 @@ def inspect(apks_semicolon, out_dir):
             # permissive — random bytes often parse as wire format), then strings
             if kind == "binary" and size >= 8:
                 done = False
-                try:
-                    dec, layers = deobfuscate(data)
-                    if dec is not None:
-                        dpath = dest + ".decoded"
-                        with open(dpath, "wb") as f:
-                            f.write(dec)
-                        note = "auto-decoded via: %s\noriginal: %d bytes -> decoded: %d bytes\n\n" % (
-                            " -> ".join(layers), size, len(dec))
-                        # re-classify the decoded payload: lua/dex behind XOR
-                        # deserve the real structured converters, not strings
-                        dk = classify(rel, dec[:8192])
-                        inner = None
-                        try:
-                            inner = _convert_one(dk, dec)
-                        except Exception:
+                # Brute-force chains only make sense on small blobs — a 20MB
+                # asset under DFS*xor-255 costs minutes for nothing.
+                if size <= MAX_DEOBFUSC:
+                    try:
+                        dec, layers = deobfuscate(data)
+                        if dec is not None:
+                            dpath = dest + ".decoded"
+                            with open(dpath, "wb") as f:
+                                f.write(dec)
+                            note = "auto-decoded via: %s\noriginal: %d bytes -> decoded: %d bytes\n\n" % (
+                                " -> ".join(layers), size, len(dec))
+                            # re-classify the decoded payload: lua/dex behind XOR
+                            # deserve the real structured converters, not strings
+                            dk = classify(rel, dec[:8192])
                             inner = None
-                        if inner:
-                            note += inner
-                        elif dk == "gzip":
                             try:
-                                g = zlib.decompress(dec, 31)
-                                note += ("gzip payload: %d -> %d bytes\n\n" % (len(dec), len(g))) + \
-                                    (g[:400000].decode("utf-8", errors="replace") if _looks_text(g)
-                                     else "\n".join(_strings(g)))
+                                inner = _convert_one(dk, dec)
                             except Exception:
-                                note += "\n".join(_strings(dec))
-                        elif _looks_text(dec):
-                            note += dec[:400000].decode("utf-8", errors="replace")
-                        else:
-                            note += "decoded content is still binary — strings:\n" + "\n".join(_strings(dec))
-                        with open(dest + ".decoded.txt", "w", encoding="utf-8", errors="ignore") as f:
-                            f.write(note)
-                        converted += 1
-                        done = True
-                except Exception:
-                    pass
-                if not done:
+                                inner = None
+                            if inner:
+                                note += inner
+                            elif dk == "gzip":
+                                try:
+                                    g = zlib.decompress(dec, 31)
+                                    note += ("gzip payload: %d -> %d bytes\n\n" % (len(dec), len(g))) + \
+                                        (g[:400000].decode("utf-8", errors="replace") if _looks_text(g)
+                                         else "\n".join(_strings(g)))
+                                except Exception:
+                                    note += "\n".join(_strings(dec))
+                            elif _looks_text(dec):
+                                note += dec[:400000].decode("utf-8", errors="replace")
+                            else:
+                                note += "decoded content is still binary — strings:\n" + "\n".join(_strings(dec))
+                            with open(dest + ".decoded.txt", "w", encoding="utf-8", errors="ignore") as f:
+                                f.write(note)
+                            converted += 1
+                            done = True
+                    except Exception:
+                        pass
+                if not done and size <= MAX_DEOBFUSC:
                     try:
                         text = convert_protobuf(data)
                         with open(dest + ".proto.txt", "w", encoding="utf-8", errors="ignore") as f:
@@ -859,7 +895,7 @@ def inspect(apks_semicolon, out_dir):
                         done = True
                     except Exception:
                         pass
-                if not done and size >= 16:
+                if not done and size >= 16 and size <= MAX_STRINGS:
                     try:
                         strs = _strings(data)
                         if strs:
@@ -879,6 +915,8 @@ def inspect(apks_semicolon, out_dir):
                         converted += 1
                 except Exception:
                     pass
+        if timed_out:
+            break
 
     try:
         with open(os.path.join(out_dir, "_index.txt"), "w", encoding="utf-8") as f:

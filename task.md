@@ -1,28 +1,18 @@
-# Task: Full-APK inspection feature (long-press flow)
+# Task: fix "جاري الاستخراج" hanging forever (ApkInspect)
 
-## Goal (user-confirmed)
-- Long-press app → new screen: extract button → file list + search (separate from IL2CPP dump flow)
-- Extract ALL entries from ALL splits; convert binary → readable:
-  AXML→XML, dex→strings/classes, Lua 5.1→structured dump, protobuf→text,
-  auto-deobfuscation (zlib/gzip/base64/XOR, chained), gzip→decompress,
-  nested zip→listing, elf/sqlite/unity/font→strings dump
-- Tap file → analyzeFile type detection + readable preview (done earlier)
-- Search scope "apkfull" covers everything extracted
+## Done
+- apk_inspector.py: added MAX_DEOBFUSC (2MB), MAX_STRINGS (16MB), INSPECT_TIME_LIMIT (10min), _deadline
+- deobfuscate: depth 4→3, branches 4→3, deadline check in DFS
+- _strings: cap scan at 8MB
+- inspect(): writes _progress.txt every 10 entries + counts total entries first; sets timed_out on deadline
 
-## Status
-- [x] analyzeFile native method + FileAnalysis type + viewers (built green earlier, APK delivered)
-- [x] apk_inspector.py engine written (stdlib only for Chaquopy)
-- [x] inspectApk Kotlin method + searchFiles "apkfull" scope
-- [x] ApkScreen.tsx (extract button/log → files+search+viewer)
-- [x] App.tsx nav + AppsScreen long-press → ApkInspect
-- [x] tsc clean
-- [x] deobfuscation DFS (zlib/b64/xor chains) verified: zlib/b64/xor/dbl/triple pass, random passes (None)
-- [ ] FIX IN PROGRESS: XOR'd printable-text misclassified as "text" (charset too wide) → restrict _COMMON to letters+space; add XOR magic-header scan for binary payloads
-- [ ] Final local test → commit → push → watch CI run → download APK → deliver
+## Remaining
+1. inspect(): outer loop must also break on timed_out; summary must mention timeout
+2. ApkScreen.tsx: poll _progress.txt every 2s during running phase, show in log/UI (rootBridge.getScratchRoot + readFile)
+3. npx tsc --noEmit, commit (user.name/email -c flags), push origin main
+4. Poll CI (curl api.github.com/actions/runs), download artifact, verify bundle strings, cp to /home/user/IL2CPP-Extractor.apk, deliver
 
-## Cautions
-- Chaquopy: stdlib-only python; no Pillow; UnityPy --no-deps
-- Kotlin errors only surface in CI logs — watch run till green
-- Files edited this session sometimes lost edits (sandbox weirdness) — verify with grep after each edit
-- Commit: -c user.name="morensolth-rgb" -c user.email="morensolth-rgb@users.noreply.github.com"
-- CI artifact: IL2CPP-Extractor-release (app-release.apk)
+## Key facts
+- scratch root: ctx.filesDir/extracted/<pkg>/apk_full/_progress.txt
+- remote token: git remote get-url origin | sed -E 's|https://([^@]+)@.*|\1|'
+- repo branch: main

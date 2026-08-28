@@ -1,4 +1,4 @@
-import React, {useState, useCallback, useRef, useMemo} from 'react';
+import React, {useState, useCallback, useRef, useMemo, useEffect} from 'react';
 import {
   View,
   Text,
@@ -78,6 +78,7 @@ export default function ApkScreen({route, navigation}: any) {
 
   const [phase, setPhase] = useState<'idle' | 'running' | 'done' | 'error'>('idle');
   const [log, setLog] = useState<{text: string; kind: string}[]>([]);
+  const [progress, setProgress] = useState('');
   const logScroll = useRef<ScrollView>(null);
 
   const [mode, setMode] = useState<Mode>('files');
@@ -113,13 +114,34 @@ export default function ApkScreen({route, navigation}: any) {
     }
   }, [pkg]);
 
+  // Live progress: the python inspector writes _progress.txt inside
+  // <scratch>/<pkg>/apk_full/ — poll it while running so the user sees
+  // movement instead of a frozen spinner.
+  useEffect(() => {
+    if (phase !== 'running' || !pkg) return;
+    let alive = true;
+    let timer: any = null;
+    let root = '';
+    const tick = async () => {
+      try {
+        if (!root) root = await rootBridge.getScratchRoot();
+        const p = await rootBridge.readFile(`${root}/${pkg}/apk_full/_progress.txt`);
+        if (alive && p) setProgress(p.trim());
+      } catch { /* file may not exist yet */ }
+      if (alive) timer = setTimeout(tick, 1500);
+    };
+    tick();
+    return () => { alive = false; if (timer) clearTimeout(timer); };
+  }, [phase, pkg]);
+
   const runInspect = useCallback(async () => {
     if (!pkg) return;
     setPhase('running');
     setLog([]);
+    setProgress('');
     try {
       addLog('استخراج كامل محتويات الـ APK (كل الـ splits) ...');
-      addLog('وتحويل الملفات الثنائية لنصوص مقروءة — ممكن ياخد دقايق.');
+      addLog('وتحويل الملفات الثنائية لنصوص مقروءة — حده الأقصى 10 دقايق، وبعدين بيحفظ يلي طلع.');
       const r = await rootBridge.inspectApk(pkg);
       addLog(r.summary || 'Done.', 'ok');
       const n = await loadFiles();
@@ -211,6 +233,9 @@ export default function ApkScreen({route, navigation}: any) {
           <View style={s.centerBox}>
             <ActivityIndicator color="#00ff88" size="large" />
             <Text style={s.working}>جاري الاستخراج والتحويل...</Text>
+            {!!progress && (
+              <Text style={s.progressText} numberOfLines={2}>{progress}</Text>
+            )}
           </View>
         )}
 
@@ -419,6 +444,10 @@ const s = StyleSheet.create({
   bigBtnText: {color: '#000', fontWeight: 'bold', fontSize: 16, fontFamily: 'monospace'},
   bigBtnSub: {color: '#033', fontSize: 10, fontFamily: 'monospace', marginTop: 4},
   working: {color: '#00ff88', fontFamily: 'monospace', fontSize: 12, marginTop: 14},
+  progressText: {
+    color: '#557755', fontFamily: 'monospace', fontSize: 11,
+    marginTop: 8, paddingHorizontal: 20, textAlign: 'center',
+  },
   errText: {color: '#ff6666', fontFamily: 'monospace', fontSize: 11, marginTop: 14},
   logBox: {flex: 1, margin: 10, backgroundColor: '#050505', borderWidth: 1, borderColor: '#1a1a1a'},
   logLine: {color: '#999', fontFamily: 'monospace', fontSize: 11, lineHeight: 17},
