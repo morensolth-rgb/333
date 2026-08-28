@@ -1,19 +1,22 @@
-# Task: NameError fix + copy-all button + b64 deobfuscation
+# Task — 2026-08-28
 
-## User asks
-1. Fix `NameError: name 'time' is not defined` during APK inspect
-2. Copy-all button in file viewer (both FilesScreen + ApkScreen)
+## Scope (user's last message)
+1. Verify global search covers converted files (.decoded.txt/.strings.txt under apk_full/) in BOTH screens.
+2. "كامل" full-file button in viewer header of both screens — chunked progressive load.
 
-## Progress
-- [x] Found: header constants block (MAX_DEOBFUSC, MAX_STRINGS, INSPECT_TIME_LIMIT, import time as _time, _deadline) was MISSING from apk_inspector.py → re-added
-- [x] Found: base64 blobs classified as "text" → never deobfuscated. classify() now returns "b64ish" for solid base64 blobs
-- [x] Conversion block condition changed to kind in ("binary","b64ish")
-- [x] Direct deobfuscate() call works: layers [base64, zlib] decode fine
-- [ ] PROBLEM: inspect() still not writing .decoded.txt — summary shows converted=0 though kind=b64ish counted. Verify edit actually in file, then debug inside inspect
-- [ ] Copy-all button: RN 0.73 core Clipboard (node_modules/react-native/Libraries/Components/Clipboard exists) — import {Clipboard} from 'react-native', add button in viewer header of FilesScreen.tsx (~line 289-313) and ApkScreen.tsx (same pattern)
-- [ ] tsc + python checks, commit, push, CI poll, artifact, verify, deliver
+## What was done this round
+- Kotlin searchFiles: added `"apkfull" -> File(root, "apk_full")` scope branch (ApkScreen was scanning raw apk/ + il2cpp/ dirs — noise). Scope "all" already covers apk_full (only apk/ and il2cpp/ excluded).
+- FilesScreen + ApkScreen: viewer state gains full/truncated/loadedLines; loadToken ref; fullLoading state.
+- loadFull(): streams entire file in 800-line readFileRange chunks, live counter, FULL_MAX=20000 line safety cap, renders as ONE big <Text selectable> with line-number prefixes (per-line Views would freeze UI), scrolls back to targetLine, toast on truncation.
+- closeViewer(): cancels in-flight load via loadToken++; wired to ✕ and Modal onRequestClose.
+- Viewer header: "كامل" button before "نسخ" (disabled while loading, shows جاري…); notes: truncated-cap note, window note hidden in full mode, live progress note.
+- Styles: fullText added to both StyleSheets.
+- npx tsc --noEmit: CLEAN.
 
-## Facts
-- repo /home/user/333, branch main, token via: git remote get-url origin | sed -E 's|https://([^@]+)@.*|\1|'
-- commit flags: -c user.name="morensolth-rgb" -c user.email="morensolth-rgb@users.noreply.github.com"
-- CI poll: curl -H "Authorization: token $TOKEN" https://api.github.com/repos/morensolth-rgb/333/actions/runs?per_page=1
+## Next
+- commit/push, poll CI, download artifact, verify bundle (UTF-16-LE Arabic: 'كامل'), cp to /home/user/IL2CPP-Extractor.apk, deliver, reply in Arabic.
+
+## Gotchas
+- Edit tool sometimes silently fails → grep-verify after EVERY edit (done for all edits above).
+- Arabic in Hermes bundle = UTF-16-LE.
+- TOKEN=$(git remote get-url origin | sed -E 's|https://([^@]+)@.*|\1|')

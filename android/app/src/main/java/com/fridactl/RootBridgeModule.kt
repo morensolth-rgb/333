@@ -376,6 +376,7 @@ class RootBridgeModule(private val ctx: ReactApplicationContext) :
                 val searchRoot = when (scope) {
                     "dump" -> File(root, "il2cpp_dump")
                     "assets" -> File(root, "assets")
+                    "apkfull" -> File(root, "apk_full")
                     else -> root
                 }
                 if (!searchRoot.exists()) {

@@ -86,8 +86,11 @@ export default function FilesScreen({route}: any) {
     path: string; name: string; content: string;
     startLine: number; targetLine: number | null; q: string;
     typeLabel?: string; binary?: boolean;
+    full?: boolean; truncated?: boolean; loadedLines?: number;
   } | null>(null);
   const viewerScroll = useRef<ScrollView>(null);
+  const [fullLoading, setFullLoading] = useState(false);
+  const loadToken = useRef(0);
 
   const loadFiles = useCallback(async () => {
     if (!pkg) return;
@@ -160,6 +163,56 @@ export default function FilesScreen({route}: any) {
       : ([...inFile].reverse().find(m => m.line < cur) ?? inFile[inFile.length - 1]);
     // Re-open the file at that line (window may need to move)
     await openFile(next.path, viewer.name, next.line, viewer.q);
+  };
+
+  // ── Full-file mode ────────────────────────────────────────────────────────
+  // Streams the ENTIRE file in 800-line chunks (readFileRange), showing a
+  // running line count. Rendered as ONE big <Text> (with line-number prefixes)
+  // — rendering thousands of per-line Views would freeze the UI.
+  const FULL_CHUNK = 800;
+  const FULL_MAX = 20000; // safety cap — dump.cs can be 100s of MB
+
+  const loadFull = async () => {
+    if (!viewer || fullLoading) return;
+    const v0 = viewer;
+    const token = ++loadToken.current;
+    setFullLoading(true);
+    try {
+      let raw = '';
+      let start = 1;
+      let truncated = false;
+      while (token === loadToken.current) {
+        const r = await rootBridge.readFileRange(v0.path, start, FULL_CHUNK);
+        const lines = r.content ? r.content.split('\n').length - 1 : 0;
+        if (lines <= 0) break;
+        raw += r.content;
+        const loadedLines = start - 1 + lines;
+        setViewer(v => (v && v.path === v0.path ? {...v, full: true, loadedLines} : v));
+        if (lines < FULL_CHUNK) break;          // short page = EOF
+        if (loadedLines >= FULL_MAX) { truncated = true; break; }
+        start += FULL_CHUNK;
+        await new Promise(res => setTimeout(res, 0)); // let the UI breathe
+      }
+      const numbered = raw
+        .replace(/\n$/, '')
+        .split('\n')
+        .map((ln, i) => `${i + 1}  ${ln}`)
+        .join('\n');
+      setViewer(v => (v && v.path === v0.path ? {...v, content: numbered, full: true, truncated} : v));
+      if (truncated) ToastAndroid.show(`الملف ضخم — انعرض أول ${FULL_MAX} سطر بس`, ToastAndroid.LONG);
+      if (v0.targetLine) {
+        setTimeout(() => viewerScroll.current?.scrollTo({y: (v0.targetLine! - 1) * 16, animated: false}), 150);
+      }
+    } catch (e: any) {
+      ToastAndroid.show(`خطأ بالتحميل: ${e?.message ?? e}`, ToastAndroid.SHORT);
+    }
+    setFullLoading(false);
+  };
+
+  const closeViewer = () => {
+    loadToken.current++; // cancel any in-flight full load
+    setFullLoading(false);
+    setViewer(null);
   };
 
   const groups = useMemo(() => groupByFile(matches), [matches]);
@@ -288,7 +341,7 @@ export default function FilesScreen({route}: any) {
       )}
 
       {/* Viewer modal */}
-      <Modal visible={!!viewer} animationType="slide" onRequestClose={() => setViewer(null)}>
+      <Modal visible={!!viewer} animationType="slide" onRequestClose={closeViewer}>
         <View style={styles.viewerContainer}>
           <View style={styles.viewerHeader}>
             <Text style={styles.viewerTitle} numberOfLines={1}>
@@ -309,6 +362,13 @@ export default function FilesScreen({route}: any) {
                 </TouchableOpacity>
               </>
             )}
+            <TouchableOpacity onPress={loadFull} style={styles.copyBtn} disabled={fullLoading}>
+              {fullLoading ? (
+                <Text style={styles.copyBtnText}>جاري…</Text>
+              ) : (
+                <Text style={styles.copyBtnText}>{viewer?.full ? 'كامل ✓' : 'كامل'}</Text>
+              )}
+            </TouchableOpacity>
             <TouchableOpacity
               onPress={() => {
                 if (!viewer) return;
@@ -318,16 +378,31 @@ export default function FilesScreen({route}: any) {
               style={styles.copyBtn}>
               <Text style={styles.copyBtnText}>نسخ</Text>
             </TouchableOpacity>
-            <TouchableOpacity onPress={() => setViewer(null)} style={styles.closeBtn}>
+            <TouchableOpacity onPress={closeViewer} style={styles.closeBtn}>
               <Text style={styles.closeBtnText}>✕</Text>
             </TouchableOpacity>
           </View>
           <ScrollView ref={viewerScroll} style={styles.viewerScroll}>
-            {viewer?.targetLine != null && (
+            {viewer?.full && viewer.truncated && (
+              <Text style={styles.windowNote}>
+                الملف ضخم — معروض أول {viewer.loadedLines} سطر بس
+              </Text>
+            )}
+            {!viewer?.full && viewer?.targetLine != null && (
               <Text style={styles.windowNote}>
                 showing lines {viewer.startLine}–{viewer.startLine + LINES_PER_PAGE}
               </Text>
             )}
+            {fullLoading && !!viewer?.loadedLines && (
+              <Text style={styles.windowNote}>
+                جاري تحميل الملف كامل… {viewer.loadedLines} سطر
+              </Text>
+            )}
+            {viewer?.full ? (
+              <ScrollView horizontal>
+                <Text style={styles.fullText} selectable>{viewer.content}</Text>
+              </ScrollView>
+            ) : (
             <ScrollView horizontal>
               <View>
                 {viewerLines.map((ln, i) => {
@@ -346,6 +421,7 @@ export default function FilesScreen({route}: any) {
                 })}
               </View>
             </ScrollView>
+            )}
           </ScrollView>
         </View>
       </Modal>
@@ -421,6 +497,7 @@ const styles = StyleSheet.create({
   typeBadge: {backgroundColor: '#123', borderColor: '#2a5a3a', borderWidth: 1, borderRadius: 3, paddingHorizontal: 6, paddingVertical: 2},
   typeBadgeText: {color: '#7fd', fontFamily: 'monospace', fontSize: 9},
   viewerText: {color: '#ccc', fontFamily: 'monospace', fontSize: 11, lineHeight: 16},
+  fullText: {color: '#ccc', fontFamily: 'monospace', fontSize: 11, lineHeight: 16},
   lineNo: {color: '#2a4a35'},
   lineNoTarget: {color: '#004d22', fontWeight: 'bold'},
   lineTarget: {backgroundColor: '#8fffce'},
