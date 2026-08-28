@@ -84,6 +84,10 @@ export default function App() {
             name="FileBrowser" component={FileBrowserScreen}
             options={({route}: any) => ({title: route.params?.title ?? 'Files', headerBackTitle: 'Back'})}
           />
+          <Stack.Screen
+            name="ApkInspect" component={ApkScreen}
+            options={({route}: any) => ({title: `${route.params?.appName ?? ''} — APK`})}
+          />
         </Stack.Navigator>
       </NavigationContainer>
     </SafeAreaProvider>

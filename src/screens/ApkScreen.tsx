@@ -69,7 +69,8 @@ function HighlightedText({text, q, base, hi}: {text: string; q: string; base: an
   return <Text>{parts}</Text>;
 }
 
-const LINES_PER_PAGE = 300;
+const CONTEXT_LINES = 400;    // lines shown before AND after a search hit
+const LINES_PER_PAGE = CONTEXT_LINES * 2 + 1;
 
 export default function ApkScreen({route, navigation}: any) {
   const pkg: string = route?.params?.packageName ?? '';
@@ -149,7 +150,7 @@ export default function ApkScreen({route, navigation}: any) {
   const openFile = async (path: string, name: string, line?: number, q?: string) => {
     try {
       if (line && line > 0) {
-        const start = Math.max(1, line - 40);
+        const start = Math.max(1, line - CONTEXT_LINES);
         const r = await rootBridge.readFileRange(path, start, LINES_PER_PAGE);
         setViewer({
           path, name, content: r.content, startLine: r.startLine,
