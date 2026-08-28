@@ -7,6 +7,7 @@ import {Text, View, StyleSheet, Animated, Image} from 'react-native';
 import AppsScreen        from './src/screens/AppsScreen';
 import ExtractScreen     from './src/screens/ExtractScreen';
 import FilesScreen       from './src/screens/FilesScreen';
+import ApkScreen         from './src/screens/ApkScreen';
 import FileBrowserScreen from './src/screens/FileBrowserScreen';
 
 const Stack = createNativeStackNavigator();

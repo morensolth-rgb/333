@@ -129,9 +129,9 @@ export default function AppsScreen({navigation}: {navigation: any}) {
         style={[styles.cell, isSelected && styles.cellSelected]}
         onPress={() => selectApp(item.packageName, item.appName)}
         onLongPress={() =>
-          navigation.navigate('FileBrowser', {
-            path:  `/data/data/${item.packageName}/shared_prefs`,
-            title: item.packageName.split('.').pop() ?? item.packageName,
+          navigation.navigate('ApkInspect', {
+            packageName: item.packageName,
+            appName: item.appName,
           })
         }>
         <AppIcon packageName={item.packageName} />

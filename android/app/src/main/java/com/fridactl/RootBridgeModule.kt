@@ -300,6 +300,40 @@ class RootBridgeModule(private val ctx: ReactApplicationContext) :
     }
 
     // ─────────────────────────────────────────────
+    // inspectApk — full APK inspection (the long-press flow): extracts EVERY
+    // entry of every split and converts binary formats to readable .txt
+    // (AXML/dex/Lua/protobuf/deobfuscation). Output: <scratch>/<pkg>/apk_full/
+    // ─────────────────────────────────────────────
+    @ReactMethod
+    fun inspectApk(pkg: String, promise: Promise) {
+        Thread {
+            try {
+                ensurePython(ctx)
+                val dir = stageApks(pkg)
+                val outDir = File(gameDir(pkg), "apk_full").apply {
+                    deleteRecursively(); mkdirs()
+                }
+
+                val apks = (dir.listFiles() ?: emptyArray())
+                    .filter { it.name.endsWith(".apk") }
+                    .joinToString(";") { it.absolutePath }
+
+                val py = Python.getInstance()
+                val mod = py.getModule("apk_inspector")
+                val summary = mod.callAttr("inspect", apks, outDir.absolutePath).toString()
+
+                val result = WritableNativeMap()
+                result.putBoolean("success", true)
+                result.putString("outputDir", outDir.absolutePath)
+                result.putString("summary", summary)
+                promise.resolve(result)
+            } catch (e: Exception) {
+                promise.reject("INSPECT_ERROR", e.message)
+            }
+        }.start()
+    }
+
+    // ─────────────────────────────────────────────
     // listExtracted — list all files under <scratch>/<pkg> recursively
     // ─────────────────────────────────────────────
     @ReactMethod
