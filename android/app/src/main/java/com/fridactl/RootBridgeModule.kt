@@ -229,11 +229,16 @@ class RootBridgeModule(private val ctx: ReactApplicationContext) :
                     return@Thread
                 }
 
-                // Extract the dumper binary from assets and make it executable
-                val bin = File(ctx.filesDir, "il2cpp_dumper").apply {
-                    if (!exists() || length() < 1024) {
-                        ctx.assets.open("il2cpp_dumper-arm64").use { it.copyTo(outputStream()) }
-                    }
+                // Extract the dumper binary from assets and make it executable.
+                // NOTE: the output stream MUST be closed before exec — running a
+                // binary that is still open for writing fails with ETXTBSY
+                // ("Text file busy"). Also kill any leftover dumper process:
+                // overwriting a running binary's file hits the same error.
+                val bin = File(ctx.filesDir, "il2cpp_dumper")
+                val assetBytes = ctx.assets.open("il2cpp_dumper-arm64").use { it.readBytes() }
+                Shell.cmd("pkill -f il2cpp_dumper 2>/dev/null; true").exec()
+                if (!bin.exists() || bin.length() != assetBytes.size.toLong()) {
+                    bin.outputStream().use { it.write(assetBytes) }
                 }
                 Shell.cmd("chmod 755 '${bin.absolutePath}'").exec()
 

@@ -1,22 +1,16 @@
-# Task — 2026-08-28
+# Task — 2026-08-28 — DONE & DELIVERED
 
-## Scope (user's last message)
-1. Verify global search covers converted files (.decoded.txt/.strings.txt under apk_full/) in BOTH screens.
-2. "كامل" full-file button in viewer header of both screens — chunked progressive load.
+## Delivered build
+- Commit c6e88b7, CI run 33146656534 (success), artifact 9676125567
+- /home/user/IL2CPP-Extractor.apk (48.5 MB) — zip OK, bundle verified:
+  'كامل'/'جاري تحميل الملف كامل'/'الملف ضخم'/'نسخ' UTF-16LE ✓, loadFull/readFileRange ASCII ✓
 
-## What was done this round
-- Kotlin searchFiles: added `"apkfull" -> File(root, "apk_full")` scope branch (ApkScreen was scanning raw apk/ + il2cpp/ dirs — noise). Scope "all" already covers apk_full (only apk/ and il2cpp/ excluded).
-- FilesScreen + ApkScreen: viewer state gains full/truncated/loadedLines; loadToken ref; fullLoading state.
-- loadFull(): streams entire file in 800-line readFileRange chunks, live counter, FULL_MAX=20000 line safety cap, renders as ONE big <Text selectable> with line-number prefixes (per-line Views would freeze UI), scrolls back to targetLine, toast on truncation.
-- closeViewer(): cancels in-flight load via loadToken++; wired to ✕ and Modal onRequestClose.
-- Viewer header: "كامل" button before "نسخ" (disabled while loading, shows جاري…); notes: truncated-cap note, window note hidden in full mode, live progress note.
-- Styles: fullText added to both StyleSheets.
-- npx tsc --noEmit: CLEAN.
+## Changes
+1. Kotlin searchFiles: "apkfull" scope → apk_full/ only (was falling through to root, grepping raw apk/ + il2cpp/ noise). Scope "all" already covers apk_full/.
+2. Both screens: "كامل" button in viewer header — streams whole file in 800-line readFileRange chunks, live counter, 20000-line cap + truncation note, ONE big selectable Text (not per-line Views), scrolls back to search hit, closeViewer cancels in-flight load (✕ + back button).
 
-## Next
-- commit/push, poll CI, download artifact, verify bundle (UTF-16-LE Arabic: 'كامل'), cp to /home/user/IL2CPP-Extractor.apk, deliver, reply in Arabic.
+## Answer to user (search coverage)
+- شاشة الملفات "الكل": نعم، الملفات المحوّلة مشمولة (يستثني بس apk/ و il2cpp/).
+- شاشة APK: كان في مشكلة (بيفتش الخام) → صار محصور بـ apk_full/.
 
-## Gotchas
-- Edit tool sometimes silently fails → grep-verify after EVERY edit (done for all edits above).
-- Arabic in Hermes bundle = UTF-16-LE.
-- TOKEN=$(git remote get-url origin | sed -E 's|https://([^@]+)@.*|\1|')
+## Reply in Arabic — done in chat
