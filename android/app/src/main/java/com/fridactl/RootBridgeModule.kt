@@ -138,10 +138,13 @@ class RootBridgeModule(private val ctx: ReactApplicationContext) :
     // ─────────────────────────────────────────────
     private fun stageApks(pkg: String): File {
         val dir = File(gameDir(pkg), "apk").apply { mkdirs() }
-        // Copy all apk files of the package (base + splits). Path pattern is stable.
+        // Copy all apk files of the package (base + splits) AND any OBB files
+        // (many games keep their Unity asset bundles in /sdcard/Android/obb/<pkg>/).
         Shell.cmd(
             "for p in \$(pm path $pkg 2>/dev/null | sed 's/^package://'); do " +
-            "cp \"\$p\" '${dir.absolutePath}/' 2>/dev/null; done"
+            "cp \"\$p\" '${dir.absolutePath}/' 2>/dev/null; done; " +
+            "for o in /sdcard/Android/obb/$pkg/*.obb; do " +
+            "[ -f \"\$o\" ] && cp \"\$o\" '${dir.absolutePath}/' 2>/dev/null; done; true"
         ).exec()
         if (dir.listFiles().isNullOrEmpty()) {
             throw Exception("Could not stage APK for $pkg (root copy failed)")
@@ -165,7 +168,7 @@ class RootBridgeModule(private val ctx: ReactApplicationContext) :
                 val unity3dFiles = WritableNativeArray()
 
                 for (apk in dir.listFiles() ?: emptyArray()) {
-                    if (!apk.name.endsWith(".apk")) continue
+                    if (!apk.name.endsWith(".apk") && !apk.name.endsWith(".obb")) continue
                     try {
                         ZipFile(apk).use { zip ->
                             val entries = zip.entries()
@@ -177,17 +180,17 @@ class RootBridgeModule(private val ctx: ReactApplicationContext) :
                                     // prefer arm64 libil2cpp
                                     lower.endsWith("libil2cpp.so") && name.contains("arm64") -> {
                                         val f = File(outDir, "libil2cpp.so")
-                                        zip.getInputStream(e).use { it.copyTo(f.outputStream()) }
+                                        zip.getInputStream(e).use { ins -> f.outputStream().use { out -> ins.copyTo(out) } }
                                         lib = f
                                     }
                                     lower.endsWith("libil2cpp.so") && lib == null -> {
                                         val f = File(outDir, "libil2cpp.so")
-                                        zip.getInputStream(e).use { it.copyTo(f.outputStream()) }
+                                        zip.getInputStream(e).use { ins -> f.outputStream().use { out -> ins.copyTo(out) } }
                                         lib = f
                                     }
                                     lower.endsWith("global-metadata.dat") -> {
                                         val f = File(outDir, "global-metadata.dat")
-                                        zip.getInputStream(e).use { it.copyTo(f.outputStream()) }
+                                        zip.getInputStream(e).use { ins -> f.outputStream().use { out -> ins.copyTo(out) } }
                                         metadata = f
                                     }
                                     lower.endsWith(".unity3d") || lower.endsWith(".assets") || lower.endsWith(".unitypackage") -> {
@@ -252,6 +255,13 @@ class RootBridgeModule(private val ctx: ReactApplicationContext) :
                     "--output '${outDir.absolutePath}' 2>&1"
                 ).exec()
 
+                // Also dump global-metadata.dat's raw strings as a searchable .txt
+                // — il2cpp games embed tokens/URLs/keys in the metadata string heap,
+                // and the search scope only indexes text files.
+                Shell.cmd(
+                    "strings -n 6 '${meta.absolutePath}' > '${outDir.absolutePath}/metadata_strings.txt' 2>/dev/null; true"
+                ).exec()
+
                 // The dumper may write into a versioned subdirectory (e.g. Dump0/)
                 // — search recursively for dump.cs.
                 val dumpCs = outDir.walkTopDown().firstOrNull { it.isFile && it.name == "dump.cs" }
@@ -286,7 +296,7 @@ class RootBridgeModule(private val ctx: ReactApplicationContext) :
                 }
 
                 val apks = (dir.listFiles() ?: emptyArray())
-                    .filter { it.name.endsWith(".apk") }
+                    .filter { it.name.endsWith(".apk") || it.name.endsWith(".obb") }
                     .joinToString(";") { it.absolutePath }
 
                 val py = Python.getInstance()
@@ -320,7 +330,7 @@ class RootBridgeModule(private val ctx: ReactApplicationContext) :
                 }
 
                 val apks = (dir.listFiles() ?: emptyArray())
-                    .filter { it.name.endsWith(".apk") }
+                    .filter { it.name.endsWith(".apk") || it.name.endsWith(".obb") }
                     .joinToString(";") { it.absolutePath }
 
                 val py = Python.getInstance()

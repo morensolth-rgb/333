@@ -1,16 +1,31 @@
-# Task — 2026-08-28 — DONE & DELIVERED
+# Task — 2026-08-29 — token-in-unity-files gap
 
-## Delivered build
-- Commit c6e88b7, CI run 33146656534 (success), artifact 9676125567
-- /home/user/IL2CPP-Extractor.apk (48.5 MB) — zip OK, bundle verified:
-  'كامل'/'جاري تحميل الملف كامل'/'الملف ضخم'/'نسخ' UTF-16LE ✓, loadFull/readFileRange ASCII ✓
+## Problem (user report)
+Token seen inside a Unity file of game "Crossword Challenge" wasn't found by
+app search after dump+assets extraction. Root causes found in code:
+1. extract_unity.py only dumps MonoBehaviour + TextAsset — objects UnityPy
+   can't parse (new Unity version, encrypted bundles, other types) never land
+   on disk → not searchable.
+2. OBB files (/sdcard/Android/obb/<pkg>/*.obb) were never staged — assets
+   outside the APK were invisible.
+3. global-metadata.dat strings (where il2cpp games keep tokens/keys) were
+   never saved as searchable text.
 
-## Changes
-1. Kotlin searchFiles: "apkfull" scope → apk_full/ only (was falling through to root, grepping raw apk/ + il2cpp/ noise). Scope "all" already covers apk_full/.
-2. Both screens: "كامل" button in viewer header — streams whole file in 800-line readFileRange chunks, live counter, 20000-line cap + truncation note, ONE big selectable Text (not per-line Views), scrolls back to search hit, closeViewer cancels in-flight load (✕ + back button).
+## Fixes applied
+- Kotlin stageApks: also stage OBB files.
+- Kotlin locateUnityFiles/extractUnityAssets/inspectApk: accept .obb.
+- Kotlin locateUnityFiles zip copies: streams now properly closed (same
+  ETXTBSY class of bug as the dumper fix).
+- Kotlin dumpIl2cpp: writes metadata_strings.txt (strings -n 6 of
+  global-metadata.dat) into il2cpp_dump/ → covered by "Dump"/"all" search.
+- extract_unity.py: raw strings safety-net sweep — every assets/*.unity3d/
+  .assets/.bundle/.dat/.resS... entry (and whole OBB files that aren't zips,
+  32MB cap) gets a RAWSTRINGS_<name>.txt regardless of UnityPy parsing.
+  Summary now reports sweep=N.
+- Smoke test PASSED: token inside an unparseable .unity3d found in
+  RAWSTRINGS_*.txt; py syntax OK.
 
-## Answer to user (search coverage)
-- شاشة الملفات "الكل": نعم، الملفات المحوّلة مشمولة (يستثني بس apk/ و il2cpp/).
-- شاشة APK: كان في مشكلة (بيفتش الخام) → صار محصور بـ apk_full/.
-
-## Reply in Arabic — done in chat
+## Next
+commit/push → poll CI → artifact → verify (RAWSTRINGS in app.imy pyc,
+metadata_strings in dex) → cp to /home/user/IL2CPP-Extractor.apk → deliver →
+reply in Arabic.

@@ -46,7 +46,9 @@ def _install_stubs():
 _install_stubs()
 
 import os
+import re
 import traceback
+import zipfile
 
 import UnityPy  # noqa: E402
 from collections import Counter  # noqa: E402
@@ -199,6 +201,61 @@ def extract(apks_semicolon, out_dir):
             except Exception as e:
                 errors.append((typ, getattr(obj, "path_id", "?"), repr(e)[:200]))
 
+    # ── Safety net ────────────────────────────────────────────────────────
+    # MonoBehaviour/TextAsset dumps only cover what UnityPy can parse. A
+    # token can hide in an object type we skip, an unreadable/encrypted
+    # bundle, or an OBB. So ALSO run a raw strings sweep over EVERY Unity
+    # asset file inside the staged APK/OBBs and save one searchable .txt
+    # per file — regardless of whether UnityPy understood it.
+    swept = 0
+    sweep_errors = 0
+    UNITY_EXTS = (".assets", ".unity3d", ".unitypackage", ".resS", ".resource", ".dat", ".bundle")
+    for apk in apks:
+        try:
+            zf = zipfile.ZipFile(apk)
+        except Exception:
+            # Not a zip (raw OBB/obb-mount): sweep the file itself.
+            try:
+                with open(apk, "rb") as fh:
+                    raw = fh.read(32 * 1024 * 1024)
+                strs = _extract_strings(raw)
+                if strs:
+                    name = _safe_name(os.path.basename(apk))
+                    with open(os.path.join(out_dir, "RAWSTRINGS_%s.txt" % name), "w", encoding="utf-8", errors="ignore") as f:
+                        f.write("RAW STRINGS SWEEP: %s (whole file, first 32MB)\n\n" % os.path.basename(apk))
+                        f.write("\n".join(strs))
+                    swept += 1
+            except Exception:
+                sweep_errors += 1
+            continue
+        try:
+            for info in zf.infolist():
+                low = info.filename.lower()
+                if not ("assets/" in low and (low.endswith(UNITY_EXTS) or ".bundle" in low)):
+                    continue
+                if info.file_size > 32 * 1024 * 1024:
+                    continue
+                try:
+                    raw = zf.read(info)
+                except Exception:
+                    sweep_errors += 1
+                    continue
+                strs = _extract_strings(raw)
+                if not strs:
+                    continue
+                rel = _safe_name(os.path.basename(apk) + "__" + info.filename.replace("/", "_"))
+                with open(os.path.join(out_dir, "RAWSTRINGS_%s.txt" % rel), "w", encoding="utf-8", errors="ignore") as f:
+                    f.write("RAW STRINGS SWEEP: %s!%s\n\n" % (os.path.basename(apk), info.filename))
+                    f.write("\n".join(strs))
+                swept += 1
+        except Exception:
+            sweep_errors += 1
+        finally:
+            try:
+                zf.close()
+            except Exception:
+                pass
+
     # Write a type summary + errors file
     try:
         with open(os.path.join(out_dir, "_summary.txt"), "w", encoding="utf-8") as f:
@@ -215,11 +272,13 @@ def extract(apks_semicolon, out_dir):
         pass
 
     top = ", ".join("%s:%d" % kv for kv in counts.most_common(6))
-    return "written=%d types=%d%s%s" % (
+    return "written=%d types=%d%s%s sweep=%d%s" % (
         written,
         sum(counts.values()),
         (" [" + top + "]") if top else "",
         (" errors=%d" % len(errors)) if errors else "",
+        swept,
+        (" sweep_err=%d" % sweep_errors) if sweep_errors else "",
     )
 
 
