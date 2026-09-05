@@ -88,6 +88,22 @@ export default function HuntFileScreen({navigation}: any) {
     setStep('token');
   };
 
+  // Direct path input — for files the browser can't reach (Android/data,
+  // Termux home, etc.). Accepts a file path (→ pick) or a dir path (→ browse).
+  const [directPath, setDirectPath] = useState('');
+
+  const goDirectPath = () => {
+    const p = directPath.trim();
+    if (!p) return;
+    const name = p.split('/').filter(Boolean).pop() ?? p;
+    if (isUnityFile(name)) {
+      setPicked({path: p, name});
+      setStep('token');
+    } else {
+      setPathStack([p]);
+    }
+  };
+
   const runHunt = async () => {
     const t = token.trim();
     if (!t || !picked || hunting) return;
@@ -149,6 +165,24 @@ export default function HuntFileScreen({navigation}: any) {
           <Text style={s.backText}>←</Text>
         </TouchableOpacity>
         <Text style={s.pathText} numberOfLines={1} ellipsizeMode="middle">{currentPath}</Text>
+      </View>
+
+      {/* direct path — paste full path if the file doesn't show in the browser */}
+      <View style={s.directRow}>
+        <TextInput
+          style={s.directInput}
+          placeholder="أو الصق المسار الكامل هون: /sdcard/.../data.unity3d"
+          placeholderTextColor="#444"
+          value={directPath}
+          onChangeText={setDirectPath}
+          onSubmitEditing={goDirectPath}
+          returnKeyType="go"
+          autoCapitalize="none"
+          autoCorrect={false}
+        />
+        <TouchableOpacity style={s.directBtn} onPress={goDirectPath}>
+          <Text style={s.directBtnText}>GO</Text>
+        </TouchableOpacity>
       </View>
 
       {loadingDir ? (
@@ -341,6 +375,16 @@ const s = StyleSheet.create({
   backBtn: {paddingHorizontal: 8, paddingVertical: 2},
   backText: {color: '#00ff88', fontSize: 16, fontWeight: 'bold'},
   pathText: {flex: 1, color: '#666', fontFamily: 'monospace', fontSize: 10},
+  directRow: {flexDirection: 'row', gap: 8, paddingHorizontal: 12, paddingVertical: 8},
+  directInput: {
+    flex: 1, backgroundColor: '#111', color: '#00ff88', borderWidth: 1, borderColor: '#1e3a2a',
+    paddingHorizontal: 10, paddingVertical: 8, fontFamily: 'monospace', fontSize: 11, borderRadius: 3,
+  },
+  directBtn: {
+    backgroundColor: '#0a2a18', borderWidth: 1, borderColor: '#00ff88',
+    justifyContent: 'center', paddingHorizontal: 16, borderRadius: 3,
+  },
+  directBtnText: {color: '#00ff88', fontWeight: 'bold', fontFamily: 'monospace', fontSize: 12},
   entry: {
     flexDirection: 'row', alignItems: 'center', paddingHorizontal: 12, paddingVertical: 10,
     borderBottomWidth: 1, borderBottomColor: '#151515',

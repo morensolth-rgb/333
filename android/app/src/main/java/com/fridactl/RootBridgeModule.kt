@@ -567,26 +567,41 @@ class RootBridgeModule(private val ctx: ReactApplicationContext) :
             try {
                 val dir = File(path)
                 val arr = WritableNativeArray()
-                val entries = if (dir.canRead()) {
-                    dir.listFiles()?.toList()
-                } else {
-                    // root fallback
-                    val r = Shell.cmd("ls -la '$path' 2>/dev/null").exec()
-                    r.out.drop(2).mapNotNull { line ->
-                        val parts = line.split(Regex("\\s+"))
-                        if (parts.size < 8) return@mapNotNull null
-                        val name = parts.drop(7).joinToString(" ")
-                        if (name == "." || name == "..") return@mapNotNull null
-                        File("$path/$name")
+                val direct = try { dir.listFiles()?.toList() } catch (_: Exception) { null }
+                if (!direct.isNullOrEmpty()) {
+                    direct.sortedWith(compareBy({ !it.isDirectory }, { it.name.lowercase() })).forEach { f ->
+                        val map = WritableNativeMap()
+                        map.putString("name", f.name)
+                        map.putString("path", f.absolutePath)
+                        map.putBoolean("isDir", f.isDirectory)
+                        map.putString("size", if (f.isDirectory) "" else formatSize(f.length()))
+                        arr.pushMap(map)
                     }
-                }
-                entries?.sortedWith(compareBy({ !it.isDirectory }, { it.name.lowercase() }))?.forEach { f ->
-                    val map = WritableNativeMap()
-                    map.putString("name", f.name)
-                    map.putString("path", f.absolutePath)
-                    map.putBoolean("isDir", f.isDirectory)
-                    map.putString("size", if (f.isDirectory) "" else formatSize(f.length()))
-                    arr.pushMap(map)
+                } else {
+                    // Root fallback — machine-readable "d|size|name" per line.
+                    // Java File can't stat root-only paths (isDirectory/length
+                    // silently return false/0), so dir-ness and size come from
+                    // the shell itself. Handles scoped-storage dirs too
+                    // (/sdcard/Android/data) where listFiles() returns empty.
+                    val r = Shell.cmd(
+                        "cd '$path' 2>/dev/null && ls -1A 2>/dev/null | while IFS= read -r f; do " +
+                        "if [ -d \"\$f\" ]; then printf 'd|0|%s\\n' \"\$f\"; " +
+                        "else printf 'f|%s|%s\\n' \"\$(stat -c %s \"\$f\" 2>/dev/null || echo 0)\" \"\$f\"; fi; done"
+                    ).exec()
+                    for (line in r.out) {
+                        val p = line.split("|", limit = 3)
+                        if (p.size < 3) continue
+                        val isDir = p[0] == "d"
+                        val size = p[1].toLongOrNull() ?: 0L
+                        val name = p[2]
+                        if (name.isBlank()) continue
+                        val map = WritableNativeMap()
+                        map.putString("name", name)
+                        map.putString("path", "$path/$name")
+                        map.putBoolean("isDir", isDir)
+                        map.putString("size", if (isDir) "" else formatSize(size))
+                        arr.pushMap(map)
+                    }
                 }
                 promise.resolve(arr)
             } catch (e: Exception) {

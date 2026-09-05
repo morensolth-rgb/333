@@ -100,3 +100,26 @@ object's raw bytes → each hit extracted as {Type}_{path_id}_full.txt, tap to v
 ## Next
 commit/push → poll CI → artifact → verify (hunt_token_in_file in app.imy,
 HuntFile in bundle, huntTokenInFile in dex) → cp to /home/user/IL2CPP-Extractor.apk → deliver → reply Arabic.
+
+---
+# 2026-09-05 part 3 — data.unity3d not showing in hunt browser (user report)
+
+## Problem
+User's data.unity3d exists on device but didn't appear in the hunt file browser.
+Root cause: readDir's Java listFiles() returns null/empty on scoped-storage or
+root-only dirs (Android/data, Termux home), and the old root fallback parsed
+`ls -la` output where File.isDirectory()/length() silently fail on root-only
+paths — dirs showed as files, sizes as 0, or nothing at all.
+
+## Fixes
+- RootBridgeModule.kt readDir: root fallback now emits machine-readable
+  "d|size|name" lines (dir-ness + size from shell stat, not Java File).
+  Also triggers when listFiles() returns EMPTY (scoped storage), not just null.
+- HuntFileScreen.tsx: direct-path input row — paste the full path to the file
+  (e.g. /sdcard/.../data.unity3d) → GO picks it directly; a dir path browses it.
+
+## Verified
+- npx tsc --noEmit OK.
+
+## Next
+commit/push → poll CI → artifact → verify → cp to /home/user/IL2CPP-Extractor.apk → deliver → reply Arabic.
