@@ -123,3 +123,26 @@ paths — dirs showed as files, sizes as 0, or nothing at all.
 
 ## Next
 commit/push → poll CI → artifact → verify → cp to /home/user/IL2CPP-Extractor.apk → deliver → reply Arabic.
+
+---
+# 2026-09-05 part 4 — token found in raw file but hunt said 0 results (user report)
+
+## Problem
+User hunted token "gccekseplj40" in a data.unity3d — app said no results, but
+the token is plainly visible in the file bytes (file browser showed it).
+Root cause: hunt_token_in_file only scanned objects UnityPy could parse. This
+game's bundle uses a new/non-standard Unity format UnityPy can't decompose,
+so zero objects → zero matches, even though the token sits in the raw bytes.
+
+## Fix — hunt now scans 3 layers (extract_unity.py hunt_token_in_file)
+1. Parsed objects (as before) → {Type}_{path_id}_full.txt
+2. Decompressed container entries via env.file.files → BLOB_<name>.txt
+3. Raw file sweep: find token in file bytes, save strings of 64KB window
+   around the hit → RAW_<name>_hit.txt (type RawFile)
+Also returns "note" when UnityPy load failed; HuntFileScreen shows it.
+
+## Verified
+- py_compile OK; tsc --noEmit OK.
+
+## Next
+commit/push → poll CI → artifact → verify → cp to /home/user/IL2CPP-Extractor.apk → deliver → reply Arabic.

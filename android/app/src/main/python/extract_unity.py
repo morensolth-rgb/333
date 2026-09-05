@@ -337,42 +337,138 @@ def hunt_token(apks_semicolon, out_dir, token):
 
 
 def hunt_token_in_file(src_path, out_dir, token):
-    """Same as hunt_token but for ONE user-picked Unity file
-    (.unity3d/.assets/.bundle/...). Scans every object's raw bytes
-    (case-insensitive) and saves each hit as {Type}_{path_id}_full.txt.
-    Returns JSON: {"count": N, "matches": [{index,type,path_id,size,file,path}]}"""
+    """Hunt a token inside ONE user-picked Unity file — 3 layers, nothing hides:
+
+    1. OBJECTS  — UnityPy parses the bundle; every object's raw bytes are
+       scanned and each hit saved as {Type}_{path_id}_full.txt.
+    2. DECOMPRESSED — UnityPy opened the container but some entries failed to
+       parse (new Unity version / non-standard header): scan env.file.files
+       (decompressed CAB/serialized/resS blobs) directly.
+    3. RAW FILE — UnityPy couldn't even open it (or found nothing): scan the
+       file bytes as-is. If the token sits in an uncompressed region it is
+       found, and the region around it is saved as RAW_<name>_hit.txt.
+
+    Returns JSON: {"count": N, "matches": [...], "note": ...}"""
     os.makedirs(out_dir, exist_ok=True)
     needle = (token or "").encode("utf-8", errors="ignore").lower()
     if not needle:
         return json.dumps({"count": 0, "matches": []})
 
+    matches = []
+
+    def _save(fname, raw, entry):
+        fpath = os.path.join(out_dir, fname)
+        try:
+            with open(fpath, "wb") as f:
+                f.write(raw)
+        except Exception:
+            return
+        entry["file"] = fname
+        entry["path"] = fpath
+        matches.append(entry)
+
+    # ── Layer 1+2: UnityPy ──────────────────────────────────────────────
+    env = None
+    load_err = None
     try:
         env = UnityPy.load(src_path)
     except Exception as e:
-        return json.dumps({"count": 0, "matches": [], "error": "load failed: %r" % (e,)})
+        load_err = repr(e)
 
-    matches = []
-    for i, obj in enumerate(env.objects):
+    if env is not None:
+        # Layer 1 — parsed objects
         try:
-            raw = obj.get_raw_data()
+            for i, obj in enumerate(env.objects):
+                try:
+                    raw = obj.get_raw_data()
+                except Exception:
+                    continue
+                if needle in raw.lower():
+                    _save(
+                        "%s_%s_full.txt" % (obj.type.name, obj.path_id),
+                        raw,
+                        {
+                            "index": i,
+                            "type": obj.type.name,
+                            "path_id": str(obj.path_id),
+                            "size": len(raw),
+                        },
+                    )
+                if len(matches) >= 500:
+                    break
         except Exception:
-            continue
-        if needle in raw.lower():
-            fname = "%s_%s_full.txt" % (obj.type.name, obj.path_id)
-            fpath = os.path.join(out_dir, fname)
+            pass
+
+        # Layer 2 — decompressed container entries (catches objects that
+        # failed to parse into env.objects on new/odd Unity formats)
+        if not matches:
             try:
-                with open(fpath, "wb") as f:
-                    f.write(raw)
+                inner = getattr(env, "file", None)
+                inner_files = getattr(inner, "files", None) or {}
+                for name, blob in inner_files.items():
+                    try:
+                        if isinstance(blob, (bytes, bytearray)):
+                            data = bytes(blob)
+                        else:
+                            data = blob.read() if hasattr(blob, "read") else None
+                        if not data:
+                            continue
+                        if needle in data.lower():
+                            _save(
+                                "BLOB_%s.txt" % _safe_name(name),
+                                data,
+                                {
+                                    "index": -1,
+                                    "type": "RawBlob",
+                                    "path_id": "-",
+                                    "size": len(data),
+                                },
+                            )
+                    except Exception:
+                        continue
+                    if len(matches) >= 500:
+                        break
             except Exception:
-                continue
-            matches.append({
-                "index": i,
-                "type": obj.type.name,
-                "path_id": str(obj.path_id),
-                "file": fname,
-                "path": fpath,
-                "size": len(raw),
-            })
-        if len(matches) >= 500:
-            break
-    return json.dumps({"count": len(matches), "matches": matches})
+                pass
+
+    # ── Layer 3: raw file sweep — always runs when nothing was found ────
+    if not matches:
+        try:
+            with open(src_path, "rb") as fh:
+                raw = fh.read()
+            pos = raw.lower().find(needle)
+            if pos >= 0:
+                # Save a readable window around the hit (strings of the whole
+                # file would be huge — 64KB around the token is plenty).
+                lo = max(0, pos - 32 * 1024)
+                hi = min(len(raw), pos + 32 * 1024)
+                window = raw[lo:hi]
+                base = _safe_name(os.path.basename(src_path))
+                fname = "RAW_%s_hit.txt" % base
+                fpath = os.path.join(out_dir, fname)
+                with open(fpath, "w", encoding="utf-8", errors="ignore") as f:
+                    f.write("RAW HIT in %s @ offset %d (0x%x)\n" % (os.path.basename(src_path), pos, pos))
+                    f.write("Token found in the raw file bytes — UnityPy could not parse this object.\n")
+                    f.write("Showing printable strings of %d bytes around the hit:\n\n" % len(window))
+                    f.write("\n".join(_extract_strings(window)))
+                matches.append({
+                    "index": -1,
+                    "type": "RawFile",
+                    "path_id": "-",
+                    "file": fname,
+                    "path": fpath,
+                    "size": len(raw),
+                })
+        except Exception:
+            pass
+
+    note = None
+    if load_err and not matches:
+        note = "UnityPy load failed: %s — raw sweep also found nothing" % load_err
+    elif load_err:
+        note = "UnityPy load failed (%s) — result came from the raw sweep" % load_err
+
+    out = {"count": len(matches), "matches": matches}
+    if note:
+        out["note"] = note
+    return json.dumps(out)

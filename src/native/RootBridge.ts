@@ -90,7 +90,7 @@ export const rootBridge = {
   inspectApk:         (pkg: string): Promise<ExtractResult>   => RootBridge.inspectApk(pkg),
   huntToken:          async (pkg: string, token: string): Promise<{count: number; matches: TokenMatch[]}> =>
     JSON.parse(await RootBridge.huntToken(pkg, token)),
-  huntTokenInFile:    async (srcPath: string, token: string): Promise<{count: number; matches: TokenMatch[]; error?: string}> =>
+  huntTokenInFile:    async (srcPath: string, token: string): Promise<{count: number; matches: TokenMatch[]; error?: string; note?: string}> =>
     JSON.parse(await RootBridge.huntTokenInFile(srcPath, token)),
   listExtracted:      (pkg: string): Promise<ExtractedFile[]> => RootBridge.listExtracted(pkg),
   searchFiles:        (pkg: string, query: string, scope: 'all' | 'dump' | 'assets' | 'apkfull' = 'all'): Promise<SearchMatch[]> =>
