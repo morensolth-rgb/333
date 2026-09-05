@@ -177,6 +177,13 @@ export default function AppsScreen({navigation}: {navigation: any}) {
         onChangeText={setSearch}
       />
 
+      {/* Token hunt on a user-picked Unity file */}
+      <TouchableOpacity
+        style={styles.huntFileBtn}
+        onPress={() => navigation.navigate('HuntFile')}>
+        <Text style={styles.huntFileBtnText}>🎯 TOKEN HUNT — اختار ملف يونتي ودوّر على توكن</Text>
+      </TouchableOpacity>
+
       {loading ? (
         <View style={styles.center}>
           <ActivityIndicator color="#00ff88" size="large" />
@@ -232,6 +239,24 @@ const styles = StyleSheet.create({
   tabText:       {color: '#555', fontSize: 12, fontFamily: 'monospace'},
   tabTextActive: {color: '#00ff88'},
   tabCount:      {color: '#333', fontSize: 11},
+
+  huntFileBtn: {
+    marginHorizontal: 10,
+    marginBottom: 8,
+    backgroundColor: '#0a2a18',
+    borderWidth: 1,
+    borderColor: '#00ff88',
+    borderRadius: 3,
+    padding: 12,
+    alignItems: 'center',
+  },
+  huntFileBtnText: {
+    color: '#00ff88',
+    fontFamily: 'monospace',
+    fontWeight: 'bold',
+    fontSize: 12,
+    letterSpacing: 1,
+  },
 
   search: {
     marginHorizontal: 10,

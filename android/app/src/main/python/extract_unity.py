@@ -334,3 +334,45 @@ def hunt_token(apks_semicolon, out_dir, token):
         if len(matches) >= 500:
             break
     return json.dumps({"count": len(matches), "matches": matches})
+
+
+def hunt_token_in_file(src_path, out_dir, token):
+    """Same as hunt_token but for ONE user-picked Unity file
+    (.unity3d/.assets/.bundle/...). Scans every object's raw bytes
+    (case-insensitive) and saves each hit as {Type}_{path_id}_full.txt.
+    Returns JSON: {"count": N, "matches": [{index,type,path_id,size,file,path}]}"""
+    os.makedirs(out_dir, exist_ok=True)
+    needle = (token or "").encode("utf-8", errors="ignore").lower()
+    if not needle:
+        return json.dumps({"count": 0, "matches": []})
+
+    try:
+        env = UnityPy.load(src_path)
+    except Exception as e:
+        return json.dumps({"count": 0, "matches": [], "error": "load failed: %r" % (e,)})
+
+    matches = []
+    for i, obj in enumerate(env.objects):
+        try:
+            raw = obj.get_raw_data()
+        except Exception:
+            continue
+        if needle in raw.lower():
+            fname = "%s_%s_full.txt" % (obj.type.name, obj.path_id)
+            fpath = os.path.join(out_dir, fname)
+            try:
+                with open(fpath, "wb") as f:
+                    f.write(raw)
+            except Exception:
+                continue
+            matches.append({
+                "index": i,
+                "type": obj.type.name,
+                "path_id": str(obj.path_id),
+                "file": fname,
+                "path": fpath,
+                "size": len(raw),
+            })
+        if len(matches) >= 500:
+            break
+    return json.dumps({"count": len(matches), "matches": matches})

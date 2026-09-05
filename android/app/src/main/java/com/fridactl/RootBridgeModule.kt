@@ -349,6 +349,47 @@ class RootBridgeModule(private val ctx: ReactApplicationContext) :
     }
 
     // ─────────────────────────────────────────────
+    // huntTokenInFile — user picks ONE Unity file (any path, incl. /sdcard),
+    // we scan every object's raw bytes for the token and save each hit as
+    // {Type}_{path_id}_full.txt under <scratch>/token_hunt_files/<name>/.
+    // Returns JSON string: {"count": N, "matches": [...]}.
+    // ─────────────────────────────────────────────
+    @ReactMethod
+    fun huntTokenInFile(srcPath: String, token: String, promise: Promise) {
+        Thread {
+            try {
+                if (token.isBlank()) {
+                    promise.resolve("{\"count\":0,\"matches\":[]}")
+                    return@Thread
+                }
+                ensurePython(ctx)
+
+                // Stage the picked file into app-private storage first —
+                // /sdcard paths may need root to read.
+                val staging = File(scratchRoot(), "token_hunt_files/staged").apply { mkdirs() }
+                val srcName = File(srcPath).name
+                val staged = File(staging, srcName)
+                val cp = Shell.cmd("cp '$srcPath' '${staged.absolutePath}' 2>/dev/null; chmod 644 '${staged.absolutePath}' 2>/dev/null; true").exec()
+                if (!staged.exists() || staged.length() == 0L) {
+                    promise.reject("HUNT_ERROR", "Cannot read file: $srcPath")
+                    return@Thread
+                }
+
+                val outDir = File(scratchRoot(), "token_hunt_files/${srcName}_hunt").apply {
+                    deleteRecursively(); mkdirs()
+                }
+
+                val py = Python.getInstance()
+                val mod = py.getModule("extract_unity")
+                val json = mod.callAttr("hunt_token_in_file", staged.absolutePath, outDir.absolutePath, token).toString()
+                promise.resolve(json)
+            } catch (e: Exception) {
+                promise.reject("HUNT_ERROR", e.message)
+            }
+        }.start()
+    }
+
+    // ─────────────────────────────────────────────
     // inspectApk — full APK inspection (the long-press flow): extracts EVERY
     // entry of every split and converts binary formats to readable .txt
     // (AXML/dex/Lua/protobuf/deobfuscation). Output: <scratch>/<pkg>/apk_full/

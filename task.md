@@ -78,3 +78,25 @@ Merged the desktop search+extract UnityPy script into the app itself:
 
 ## Next
 commit/push → poll CI → artifact → cp to /home/user/IL2CPP-Extractor.apk → deliver → reply Arabic.
+
+---
+# 2026-09-05 part 2 — token hunt on a user-picked Unity file (user request)
+
+## What
+New standalone flow: pick a Unity file yourself → enter token → scan every
+object's raw bytes → each hit extracted as {Type}_{path_id}_full.txt, tap to view.
+- extract_unity.py: hunt_token_in_file(src_path, out_dir, token) — same logic
+  as the desktop script, returns JSON with index/type/path_id/size/file/path.
+- RootBridgeModule.kt: huntTokenInFile(srcPath, token) — stages the picked file
+  via root cp into scratch/token_hunt_files/staged, output to <name>_hunt/.
+- RootBridge.ts: huntTokenInFile wrapper.
+- HuntFileScreen.tsx: 3-step wizard (browse fs → enter token → results+viewer).
+  Unity extensions highlighted (.unity3d/.assets/.bundle/.dat/.resS...).
+- App.tsx: registered HuntFile route. AppsScreen: 🎯 entry button.
+
+## Verified
+- python3 -m py_compile OK; npx tsc --noEmit OK.
+
+## Next
+commit/push → poll CI → artifact → verify (hunt_token_in_file in app.imy,
+HuntFile in bundle, huntTokenInFile in dex) → cp to /home/user/IL2CPP-Extractor.apk → deliver → reply Arabic.

@@ -9,6 +9,7 @@ import ExtractScreen     from './src/screens/ExtractScreen';
 import FilesScreen       from './src/screens/FilesScreen';
 import ApkScreen         from './src/screens/ApkScreen';
 import FileBrowserScreen from './src/screens/FileBrowserScreen';
+import HuntFileScreen    from './src/screens/HuntFileScreen';
 
 const Stack = createNativeStackNavigator();
 
@@ -87,6 +88,10 @@ export default function App() {
           <Stack.Screen
             name="ApkInspect" component={ApkScreen}
             options={({route}: any) => ({title: `${route.params?.appName ?? ''} — APK`})}
+          />
+          <Stack.Screen
+            name="HuntFile" component={HuntFileScreen}
+            options={{title: 'Token Hunt — ملف يونتي'}}
           />
         </Stack.Navigator>
       </NavigationContainer>
