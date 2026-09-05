@@ -315,6 +315,40 @@ class RootBridgeModule(private val ctx: ReactApplicationContext) :
     }
 
     // ─────────────────────────────────────────────
+    // huntToken — scan EVERY object of the staged Unity bundles for a token
+    // (case-insensitive on raw bytes via UnityPy). Each hit is saved raw as
+    // {Type}_{path_id}_full.txt under <scratch>/<pkg>/token_hunt/.
+    // Returns a JSON string: {"count": N, "matches": [...]}.
+    // ─────────────────────────────────────────────
+    @ReactMethod
+    fun huntToken(pkg: String, token: String, promise: Promise) {
+        Thread {
+            try {
+                if (token.isBlank()) {
+                    promise.resolve("{\"count\":0,\"matches\":[]}")
+                    return@Thread
+                }
+                ensurePython(ctx)
+                val dir = stageApks(pkg)
+                val outDir = File(gameDir(pkg), "token_hunt").apply {
+                    deleteRecursively(); mkdirs()
+                }
+
+                val apks = (dir.listFiles() ?: emptyArray())
+                    .filter { it.name.endsWith(".apk") || it.name.endsWith(".obb") }
+                    .joinToString(";") { it.absolutePath }
+
+                val py = Python.getInstance()
+                val mod = py.getModule("extract_unity")
+                val json = mod.callAttr("hunt_token", apks, outDir.absolutePath, token).toString()
+                promise.resolve(json)
+            } catch (e: Exception) {
+                promise.reject("HUNT_ERROR", e.message)
+            }
+        }.start()
+    }
+
+    // ─────────────────────────────────────────────
     // inspectApk — full APK inspection (the long-press flow): extracts EVERY
     // entry of every split and converts binary formats to readable .txt
     // (AXML/dex/Lua/protobuf/deobfuscation). Output: <scratch>/<pkg>/apk_full/

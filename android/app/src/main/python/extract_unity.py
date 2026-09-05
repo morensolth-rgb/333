@@ -284,3 +284,53 @@ def extract(apks_semicolon, out_dir):
 
 def _test():  # not used on device
     print(extract(sys.argv[1], sys.argv[2]))
+
+
+# ── Token hunt ─────────────────────────────────────────────────────────
+# Scans EVERY object of the staged Unity bundles for a token
+# (case-insensitive on raw bytes). Each hit is saved raw as
+# {Type}_{path_id}_full.txt — same convention as the desktop script.
+# Returns a JSON string: {"count": N, "matches": [...]}
+
+import json  # noqa: E402
+
+
+def hunt_token(apks_semicolon, out_dir, token):
+    os.makedirs(out_dir, exist_ok=True)
+    needle = (token or "").encode("utf-8", errors="ignore").lower()
+    if not needle:
+        return json.dumps({"count": 0, "matches": []})
+
+    matches = []
+    apks = [a for a in apks_semicolon.split(";") if a]
+    for apk in apks:
+        try:
+            env = UnityPy.load(apk)
+        except Exception:
+            continue
+        for i, obj in enumerate(env.objects):
+            try:
+                raw = obj.get_raw_data()
+            except Exception:
+                continue
+            if needle in raw.lower():
+                fname = "%s_%s_full.txt" % (obj.type.name, obj.path_id)
+                fpath = os.path.join(out_dir, fname)
+                try:
+                    with open(fpath, "wb") as f:
+                        f.write(raw)
+                except Exception:
+                    continue
+                matches.append({
+                    "apk": os.path.basename(apk),
+                    "type": obj.type.name,
+                    "path_id": str(obj.path_id),
+                    "file": fname,
+                    "path": fpath,
+                    "size": len(raw),
+                })
+            if len(matches) >= 500:
+                break
+        if len(matches) >= 500:
+            break
+    return json.dumps({"count": len(matches), "matches": matches})

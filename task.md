@@ -29,3 +29,52 @@ app search after dump+assets extraction. Root causes found in code:
 commit/push → poll CI → artifact → verify (RAWSTRINGS in app.imy pyc,
 metadata_strings in dex) → cp to /home/user/IL2CPP-Extractor.apk → deliver →
 reply in Arabic.
+
+---
+# 2026-08-29 part 2 — .unity3d readability (user: "download it yourself, figure out the format")
+
+## Findings (Crossword Challenge = com.nocturnal.crossword, APK 205MB from apkpure)
+- assets/bin/Data/data.unity3d: standard UnityFS, Unity 6000.5.7f1 — UnityPy parses OK
+  (MonoBehaviour 1473, TextAsset 10, etc.)
+- assets/aa/Android/*.bundle (Addressables, 62MB defaultlocalgroup is the big one):
+  UnityPy FAILS twice:
+  1. UnityFS format 8 flags 0x243: new 0x200 flag (blockinfo+data 32-byte aligned).
+     UnityPy aligns blockinfo to 16 only and data to 16 -> misaligned reads.
+     Manual parser works: align blockinfo start AND data start to 32 when flags&0x200,
+     lz4.block decompress each block. Blocks 965 -> 126MB, dirs: CAB-*.serialized + .resS.
+  2. Decompressed CAB serialized file (version 23) has NON-STANDARD header:
+     bytes 0..16 = legacy header (meta/filesize/dataoffset zeroed, version=23),
+     bytes 16..48 = three big-endian u64 (metadata_size, file_size, data_offset) + u64 unknown.
+     NO endian+reserved bytes, and metadata_size is u64 not u32 -> UnityPy reads
+     file_size/data_offset garbage -> typetree blob parse explodes
+     ("iterative unpacking requires a buffer of a multiple of 32 bytes").
+  FIX: rebuild header = raw[0:16] + b'\0'*4 + LE u32 meta + LE i64 filesize + LE i64 dataoff
+  + LE i64 0 + raw[48:] -> feed UnityPy BytesIO. (TESTING NOW)
+- Token 'kihgyc' very likely inside defaultlocalgroup bundle (word dictionaries).
+
+## Plan
+1. Verify normalized CAB parses with UnityPy + find token in extracted text.
+2. extract_unity.py: add UnityFS fallback parser (pure python, lz4 via UnityPy dep or
+   pure-python lz4 block decoder if Chaquopy lacks lz4 wheel — CHECK build.gradle),
+   header normalization, and dump ALL object types via read_typetree -> JSON
+   (not just MonoBehaviour/TextAsset). Keep RAWSTRINGS sweep as fallback.
+3. Local smoke test with real APK -> commit/push -> CI -> verify APK -> deliver.
+
+---
+# 2026-09-05 — token hunt inside the app (user request)
+
+## What
+Merged the desktop search+extract UnityPy script into the app itself:
+- extract_unity.py: new hunt_token(apks, out_dir, token) — scans EVERY object's
+  raw bytes (case-insensitive), saves hits as {Type}_{path_id}_full.txt, returns JSON.
+- RootBridgeModule.kt: new @ReactMethod huntToken(pkg, token) → <scratch>/<pkg>/token_hunt/.
+- RootBridge.ts: TokenMatch type + huntToken wrapper (JSON.parse).
+- FilesScreen.tsx: HUNT button next to FIND + "Hunt" tab listing matches
+  (type · path_id · size · apk), tap opens saved file in viewer.
+
+## Verified
+- python3 -m py_compile extract_unity.py OK
+- npx tsc --noEmit OK
+
+## Next
+commit/push → poll CI → artifact → cp to /home/user/IL2CPP-Extractor.apk → deliver → reply Arabic.

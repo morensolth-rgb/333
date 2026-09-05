@@ -17,9 +17,10 @@ import {
   ExtractedFile,
   SearchMatch,
   FileAnalysis,
+  TokenMatch,
 } from '../native/RootBridge';
 
-type Mode = 'files' | 'search';
+type Mode = 'files' | 'search' | 'hunt';
 type Scope = 'all' | 'dump' | 'assets';
 const SCOPES: {key: Scope; label: string}[] = [
   {key: 'all', label: 'الكل'},
@@ -67,6 +68,12 @@ function HighlightedText({text, q, base, hi}: {text: string; q: string; base: an
 const CONTEXT_LINES = 400;    // lines shown before AND after a search hit
 const LINES_PER_PAGE = CONTEXT_LINES * 2 + 1; // 400 before + hit + 400 after
 
+function formatBytes(n: number): string {
+  if (n >= 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)}MB`;
+  if (n >= 1024) return `${(n / 1024).toFixed(1)}KB`;
+  return `${n}B`;
+}
+
 export default function FilesScreen({route}: any) {
   const pkg: string = route?.params?.packageName ?? '';
   const appName: string = route?.params?.appName ?? pkg;
@@ -80,6 +87,11 @@ export default function FilesScreen({route}: any) {
   const [fileFilter, setFileFilter] = useState('');
   const [expanded, setExpanded] = useState<string | null>(null);
   const [scope, setScope] = useState<Scope>('all');
+
+  // Token hunt state — raw-object scan of Unity bundles (UnityPy), saves
+  // each hit as {Type}_{path_id}_full.txt under token_hunt/
+  const [hunting, setHunting] = useState(false);
+  const [huntMatches, setHuntMatches] = useState<TokenMatch[]>([]);
 
   // Viewer state — jump-aware: we load a window of lines around the target
   const [viewer, setViewer] = useState<{
@@ -125,6 +137,24 @@ export default function FilesScreen({route}: any) {
   const changeScope = (sc: Scope) => {
     setScope(sc);
     if (query.trim()) runSearch(sc);
+  };
+
+  // Token hunt — scan EVERY raw object of the Unity bundles (not just the
+  // extracted text files). Hits land on disk as {Type}_{path_id}_full.txt.
+  const runHunt = async () => {
+    const q = query.trim();
+    if (!q || !pkg || hunting) return;
+    setHunting(true);
+    setMode('hunt');
+    setHuntMatches([]);
+    try {
+      const res = await rootBridge.huntToken(pkg, q);
+      setHuntMatches(res.matches ?? []);
+    } catch (e: any) {
+      ToastAndroid.show(`Hunt error: ${e?.message ?? e}`, ToastAndroid.LONG);
+      setHuntMatches([]);
+    }
+    setHunting(false);
   };
 
   // Open a file; if line given, load a window around it and scroll there.
@@ -241,6 +271,12 @@ export default function FilesScreen({route}: any) {
         <TouchableOpacity style={styles.searchBtn} onPress={() => runSearch()}>
           {searching ? <ActivityIndicator color="#000" size="small" /> : <Text style={styles.searchBtnText}>FIND</Text>}
         </TouchableOpacity>
+        <TouchableOpacity
+          style={[styles.searchBtn, styles.huntBtn]}
+          onPress={runHunt}
+          disabled={hunting}>
+          {hunting ? <ActivityIndicator color="#00ff88" size="small" /> : <Text style={styles.huntBtnText}>HUNT</Text>}
+        </TouchableOpacity>
       </View>
 
       {/* Mode tabs */}
@@ -251,6 +287,11 @@ export default function FilesScreen({route}: any) {
         <TouchableOpacity onPress={() => setMode('search')} style={[styles.modeTab, mode === 'search' && styles.modeTabActive]}>
           <Text style={[styles.modeText, mode === 'search' && styles.modeTextActive]}>
             Matches ({groups.length} files)
+          </Text>
+        </TouchableOpacity>
+        <TouchableOpacity onPress={() => setMode('hunt')} style={[styles.modeTab, mode === 'hunt' && styles.modeTabActive]}>
+          <Text style={[styles.modeText, mode === 'hunt' && styles.modeTextActive]}>
+            Hunt ({huntMatches.length})
           </Text>
         </TouchableOpacity>
         <TouchableOpacity onPress={loadFiles} style={styles.reloadBtn}>
@@ -336,6 +377,43 @@ export default function FilesScreen({route}: any) {
             <Text style={styles.empty}>
               {searching ? 'Searching…' : query ? `No matches for "${query}"` : 'Type a word and hit FIND'}
             </Text>
+          }
+        />
+      )}
+
+      {mode === 'hunt' && (
+        <FlatList
+          data={huntMatches}
+          keyExtractor={m => m.path}
+          initialNumToRender={25}
+          renderItem={({item: m}) => (
+            <TouchableOpacity style={styles.fileRow} onPress={() => openFile(m.path, m.file)}>
+              <View style={{flex: 1}}>
+                <Text style={styles.huntTitle} numberOfLines={1}>
+                  {m.type} · path_id {m.path_id}
+                </Text>
+                <Text style={styles.fileSize}>
+                  {m.file} · {formatBytes(m.size)} · {m.apk}
+                </Text>
+              </View>
+              <Text style={styles.chevron}>›</Text>
+            </TouchableOpacity>
+          )}
+          ListEmptyComponent={
+            <Text style={styles.empty}>
+              {hunting
+                ? 'جاري مسح كل الـ objects بالـ Unity bundles…'
+                : query
+                  ? `ما في object فيه "${query}" — جرّب FIND للبحث بالملفات المستخرجة`
+                  : 'اكتب التوكن فوق واضغط HUNT — بيفحص كل object بالـ bundle وبيحفظ يلي بيطابق'}
+            </Text>
+          }
+          ListHeaderComponent={
+            huntMatches.length > 0 ? (
+              <Text style={styles.huntHeader}>
+                {huntMatches.length} object(s) matched — saved to token_hunt/
+              </Text>
+            ) : null
           }
         />
       )}
@@ -439,6 +517,10 @@ const styles = StyleSheet.create({
   },
   searchBtn: {backgroundColor: '#00ff88', justifyContent: 'center', paddingHorizontal: 16, borderRadius: 3, minWidth: 60, alignItems: 'center'},
   searchBtnText: {color: '#000', fontWeight: 'bold', fontFamily: 'monospace', fontSize: 12},
+  huntBtn: {backgroundColor: '#0a2a18', borderWidth: 1, borderColor: '#00ff88'},
+  huntBtnText: {color: '#00ff88', fontWeight: 'bold', fontFamily: 'monospace', fontSize: 12},
+  huntTitle: {color: '#00ff88', fontFamily: 'monospace', fontSize: 12, fontWeight: 'bold'},
+  huntHeader: {color: '#557755', fontFamily: 'monospace', fontSize: 11, paddingHorizontal: 12, paddingVertical: 8},
   modeRow: {flexDirection: 'row', borderBottomWidth: 1, borderBottomColor: '#1a1a1a'},
   modeTab: {flex: 1, paddingVertical: 10, alignItems: 'center'},
   modeTabActive: {borderBottomWidth: 2, borderBottomColor: '#00ff88'},

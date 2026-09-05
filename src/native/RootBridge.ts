@@ -58,6 +58,15 @@ export interface FileRange {
   content: string;
 }
 
+export interface TokenMatch {
+  apk: string;
+  type: string;
+  path_id: string;
+  file: string;
+  path: string;
+  size: number;
+}
+
 export interface FileAnalysis {
   path: string;
   name: string;
@@ -79,6 +88,8 @@ export const rootBridge = {
   dumpIl2cpp:         (pkg: string): Promise<DumpResult>      => RootBridge.dumpIl2cpp(pkg),
   extractUnityAssets: (pkg: string): Promise<ExtractResult>   => RootBridge.extractUnityAssets(pkg),
   inspectApk:         (pkg: string): Promise<ExtractResult>   => RootBridge.inspectApk(pkg),
+  huntToken:          async (pkg: string, token: string): Promise<{count: number; matches: TokenMatch[]}> =>
+    JSON.parse(await RootBridge.huntToken(pkg, token)),
   listExtracted:      (pkg: string): Promise<ExtractedFile[]> => RootBridge.listExtracted(pkg),
   searchFiles:        (pkg: string, query: string, scope: 'all' | 'dump' | 'assets' | 'apkfull' = 'all'): Promise<SearchMatch[]> =>
     RootBridge.searchFiles(pkg, query, scope),
